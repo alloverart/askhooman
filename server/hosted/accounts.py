@@ -31,6 +31,7 @@ from ..tokens import AGENT_SLUG, Identity
 from .clients import DCR_ID, clean_label
 from .config import HostedSettings
 from .crypto import Keyring, digest, new_secret, same
+from .looks import avatar_json, color_key, least_used
 from .store import DELETE, UNCHANGED, Store
 
 log = logging.getLogger("asks.hosted.accounts")
@@ -105,6 +106,7 @@ def agent_json(agent: dict) -> dict:
         "created_at": agent.get("created_at"), "last_seen": agent.get("last_seen"),
         "webhook_url": agent.get("webhook_url"), "webhook_secret_set": bool(agent.get("webhook_secret")),
         "revoked_at": agent.get("revoked_at"),
+        "color": color_key(agent.get("color")), "avatar": avatar_json(agent.get("avatar")),
         "clients": [{"client_id": c.get("client_id"), "client_name": c.get("client_name"),
                      "connected_at": c.get("connected_at")} for c in agent.get("clients") or []],
     }
@@ -248,7 +250,8 @@ class Accounts:
         name = clean_agent_name(name)
         slug = slugify(name)
         now = utc_now()
-        for agent in self.agents(sub):
+        active = self.agents(sub)
+        for agent in active:
             if agent["slug"] != slug:
                 continue
             known = client_id is not None and client_id in self.client_ids(agent)
@@ -270,7 +273,7 @@ class Accounts:
         agent = {"id": "ag_" + new_secret(nbytes=12), "user": sub, "name": name, "slug": slug,
                  "client_id": client_id, "client_name": client_name, "clients": clients, "created_at": now,
                  "last_seen": None, "webhook_url": None, "webhook_secret": None, "revoked_at": None,
-                 "key_prefix": None}
+                 "key_prefix": None, "color": least_used(a.get("color") for a in active), "avatar": None}
         self.store.put("agents", agent["id"], agent)
         log.info("agent %s (%s) connected for a user via %s", agent["id"], slug, "oauth" if client_id else "key")
         return agent
@@ -280,6 +283,37 @@ class Accounts:
         name = clean_agent_name(name)
         self.store.update("agents", agent["id"], {"name": name})
         return {**agent, "name": name}
+
+    def ensure_colors(self, agents: list[dict]) -> list[dict]:
+        """Agents connected before colours existed get one, once, in the order given (created_at: agents()), each
+        the least used so far, so a user's first twelve all differ. Written only if the document still has none
+        (a concurrent listing may have given it one first: that one stays)."""
+        if all(color_key(a.get("color")) for a in agents):
+            return agents
+        taken = [a.get("color") for a in agents if color_key(a.get("color"))]
+        result = []
+        for agent in agents:
+            if not color_key(agent.get("color")):
+                pick = least_used(taken)
+
+                def give(doc, pick=pick):
+                    if doc is None:
+                        return UNCHANGED, None
+                    if color_key(doc.get("color")):
+                        return UNCHANGED, doc["color"]
+                    return {**doc, "color": pick}, pick
+                given = self.store.transact("agents", agent["id"], give)
+                if given:
+                    agent = {**agent, "color": given}
+                    taken.append(given)
+            result.append(agent)
+        return result
+
+    def set_look(self, agent: dict, **fields) -> dict:
+        """Set `color` (a palette key) and/or `avatar` (None = the robot), already checked (looks.py)."""
+        fields = {k: v for k, v in fields.items() if k in ("color", "avatar")}
+        self.store.update("agents", agent["id"], fields)
+        return {**agent, **fields}
 
     def set_webhook(self, agent: dict, url: str | None, rotate: bool = False) -> tuple[dict, str | None]:
         """Set/clear the webhook URL. A new signing secret is made (and returned, once) when the agent gets a

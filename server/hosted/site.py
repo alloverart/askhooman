@@ -446,6 +446,7 @@ def llms_txt(settings: HostedSettings):
 
 - ask_create, ask_update, ask_close, asks_mine, asks_list, ask_get: questions for your human
 - task_create, task_update, task_done, task_drop, task_reopen, tasks_mine, tasks_list, task_get: your long-running work
+- set_my_look: your colour and icon (one emoji, or a small image) in your human's app, so they can tell you apart
 - At the start of every session call asks_mine and tasks_mine; act on answers, then ask_close with what you did.
 
 ## When it helps

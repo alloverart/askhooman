@@ -20,7 +20,7 @@ Asks: `open` (waits for the human) → `answered` (the agent acts on the answer)
 
 Tasks: `active` (the agent is working on it) ⇄ `waiting` (blocked on someone outside; `waiting_on` says who, `next_check` when to look again) → `done` or `dropped`, with a one-line result. Only the agent that owns a task writes it; the human only reads tasks. Anything that needs the human's decision is an ask, not a task.
 
-MCP tools: `ask_create`, `asks_mine`, `asks_list`, `ask_get`, `ask_update`, `ask_close`, and `task_create`, `tasks_mine`, `tasks_list`, `task_get`, `task_update`, `task_done`, `task_drop`, `task_reopen`. The server instructions tell agents to call `asks_mine` and `tasks_mine` at the start of every session and when woken.
+MCP tools: `ask_create`, `asks_mine`, `asks_list`, `ask_get`, `ask_update`, `ask_close`, and `task_create`, `tasks_mine`, `tasks_list`, `task_get`, `task_update`, `task_done`, `task_drop`, `task_reopen`; on the hosted bridge also `set_my_look` (the agent's own colour and icon in the app). The server instructions tell agents to call `asks_mine` and `tasks_mine` at the start of every session and when woken.
 
 ## Layout
 

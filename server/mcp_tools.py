@@ -5,6 +5,7 @@ into the ASGI scope; the tools read it back through the request context.
 """
 
 import logging
+from dataclasses import dataclass
 from string import Template
 from typing import Annotated, Any, Callable, Literal
 
@@ -122,11 +123,20 @@ def run_hosted(action, *args):
 Services = Callable[[Identity], tuple[AskService, TaskService]]
 
 
+@dataclass(frozen=True)
+class LookTool:
+    """set_my_look (hosted only: the single-tenant bridge has no agent registry). change(identity, {color, emoji,
+    image_url, robot}) changes the calling agent's own look and returns it; colors: the palette keys."""
+    colors: tuple[str, ...]
+    change: Callable[[Identity, dict], dict]
+
+
 def build_mcp(service: AskService | None = None, tasks: TaskService | None = None, *,
-              services: Services | None = None, hosted: bool = False) -> MCPServer:
+              services: Services | None = None, hosted: bool = False, look: LookTool | None = None) -> MCPServer:
     """The MCP server. Single-tenant: one AskService/TaskService for everyone. Hosted: `services(identity)`
     returns the services of the caller's user (their Drive), the wording speaks of "your user" instead of
-    "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app)."""
+    "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app).
+    `look`: adds set_my_look (hosted)."""
     if services is None:
         def services(who: Identity):
             return service, tasks
@@ -340,5 +350,31 @@ ${mine_tasks_note}"""
         """Reopen your done or dropped task: back to active (the old resolution stays in its history)."""
         who = caller(ctx)
         return call(task_service(who).reopen, who, id)
+
+    # ---------- the agent's look in the app (hosted) ----------
+
+    if look is not None:
+        Color = Annotated[Literal[look.colors], Field(  # noqa: N806
+            description="Your colour in the app: " + ", ".join(look.colors))]
+        Emoji = Annotated[str, Field(  # noqa: N806
+            description="Exactly one emoji as your icon, e.g. '🦊' (≤16 bytes)")]
+        ImageUrl = Annotated[str, Field(  # noqa: N806
+            description="https URL of a PNG, WebP or JPEG, at most 256×256 px and 48 KB, used as your icon")]
+
+        @tool("Set my look")
+        def set_my_look(
+            ctx: Context,
+            color: Color | None = None,
+            emoji: Emoji | None = None,
+            image_url: ImageUrl | None = None,
+            robot: Annotated[bool, Field(description="true: back to the default robot icon")] = False,
+        ) -> dict[str, Any]:
+            """Change how YOU look in ${humans} app, so they can tell you apart from their other agents: your colour
+            and your icon (the default robot, one emoji, or a small image). Only your own look changes. Pass only
+            what to change, and at most one of emoji, image_url, robot; call it without arguments to see your
+            current look. image_url is fetched once by the server (https, public host, no redirects, 5 s); it must
+            already be small. Returns {name, color, avatar}."""
+            who = caller(ctx)
+            return call(look.change, who, {"color": color, "emoji": emoji, "image_url": image_url, "robot": robot})
 
     return mcp

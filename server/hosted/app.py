@@ -24,7 +24,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from ..app import RequestGuard, add_api_routes, add_error_handlers, setup_logging
-from ..mcp_tools import IDENTITY_SCOPE_KEY, build_mcp
+from ..mcp_tools import IDENTITY_SCOPE_KEY, LookTool, build_mcp
 from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
@@ -33,6 +33,7 @@ from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
 from .google import GoogleError, GoogleOAuth
+from .looks import AGENT_COLORS, own_look
 from .oauth import AuthServer
 from .ratelimit import RateLimiter, client_ip
 from .records import DrivePool, HostedAsks, HostedTasks
@@ -144,7 +145,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         records = pool.records(who.user)
         return HostedAsks(records), HostedTasks(records)
 
-    mcp = build_mcp(services=services, hosted=True)
+    look = LookTool(AGENT_COLORS, lambda who, changes: own_look(accounts, public_http, limiter, who, changes))
+    mcp = build_mcp(services=services, hosted=True, look=look)
     mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,
