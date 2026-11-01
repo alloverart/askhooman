@@ -3,7 +3,9 @@ name: tests
 on:
   pull_request:
   push:
-    branches: [main]
+    # allen/*: pushed with a deploy key; a PR the bot opens needs a manual
+    # approval to run in a public repo, the push run covers the same commit
+    branches: [main, "allen/**"]
   workflow_call:
 
 permissions:
