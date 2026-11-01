@@ -303,10 +303,15 @@ def test_landing_page_and_icons(hosted):
     assert f"askhooman {RESOURCE}" in llms.text and "asks_mine" in llms.text and f"{PUBLIC}/privacy" in llms.text
     for path, kind in (("/favicon.ico", "image/x-icon"), ("/favicon.svg", "image/svg+xml"),
                        ("/apple-touch-icon.png", "image/png"), ("/site.webmanifest", "application/manifest+json"),
-                       ("/og-image-1200x630.png", "image/png"), ("/icon-maskable-512x512.png", "image/png")):
+                       ("/og-image-1200x630.png", "image/png"), ("/icon-maskable-512x512.png", "image/png"),
+                       ("/ds/tokens.css", "text/css"), ("/ds/components.css", "text/css"),
+                       ("/ds/fonts/inter-latin-wght-normal.woff2", "font/woff2")):
         response = hosted.get(path)
         assert response.status_code == 200 and response.headers["content-type"].startswith(kind) and response.content
         assert "default-src 'none'" in response.headers["content-security-policy"]
+    # the design system's stylesheets and Inter come from our own origin, nothing else
+    assert 'href="/ds/tokens.css"' in landing.text and 'class="ds"' in landing.text
+    assert "font-src 'self'" in landing.headers["content-security-policy"]
     error = hosted.get("/oauth/consent")
     assert "noindex" in error.text and "/favicon.svg" in error.text  # every page carries the icons, only / is indexed
 

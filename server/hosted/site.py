@@ -1,7 +1,9 @@
 """The public face of AskHooman (askhooman.com): the landing page at /, the privacy policy at /privacy, the support
 page at /support, and the icon kit next to them (favicons, touch icon, web manifest, link-preview image) from
 server/hosted/static/, copied from 03_Website_PWA of the AskHooman icon kit (the haloed hooman with a pink and a
-blue agent).
+blue agent). The pages are built on the AskHooman design system (askhooman-apps design/system), copied to
+server/hosted/static/ds/: tokens.css, components.css and Inter, self-hosted; the page's own <style> lays out the landing
+with its tokens only.
 
 Files are read once at startup; a missing one fails the deploy, not a request. No scripts and no external assets
 anywhere: the pages carry the same Content-Security-Policy as the consent pages.
@@ -22,16 +24,23 @@ from .pages import ICONS, SECURITY_HEADERS
 
 STATIC = Path(__file__).parent / "static"
 TYPES = {".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon",
-         ".webmanifest": "application/manifest+json"}
+         ".webmanifest": "application/manifest+json", ".css": "text/css; charset=utf-8", ".woff2": "font/woff2",
+         ".txt": "text/plain; charset=utf-8"}
+DS_FONT = "ds/fonts/inter-latin-wght-normal.woff2"  # preloaded: every page is Latin
 FILES = ("favicon.ico", "favicon.svg", "favicon-32x32.png", "apple-touch-icon.png", "icon-192x192.png",
          "icon-512x512.png", "icon-maskable-192x192.png", "icon-maskable-512x512.png", "site.webmanifest",
-         "og-image-1200x630.png", "brandmark.svg", "icon-96x96.png")
+         "og-image-1200x630.png", "brandmark.svg", "icon-96x96.png",
+         "ds/tokens.css", "ds/components.css", "ds/fonts.css", DS_FONT, "ds/fonts/inter-latin-ext-wght-normal.woff2",
+         "ds/fonts/inter-cyrillic-wght-normal.woff2", "ds/fonts/OFL.txt")
 FILE_HEADERS = {
     "Cache-Control": "public, max-age=86400",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",  # an SVG never runs anything
     "X-Content-Type-Options": "nosniff",
 }
-PAGE_HEADERS = {**SECURITY_HEADERS, "Cache-Control": "public, max-age=300"}
+# the consent pages' policy, plus the design system's stylesheets and fonts from our own origin
+PAGE_HEADERS = {**SECURITY_HEADERS, "Cache-Control": "public, max-age=300",
+                "Content-Security-Policy": "default-src 'none'; style-src 'self' 'unsafe-inline'; font-src 'self'; "
+                                           "img-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'"}
 
 TAGLINE = "Questions from your AI agents, waiting for your decision."
 GITHUB = "https://github.com/alloverart/askhooman"
@@ -49,67 +58,48 @@ LIMITED_USE = ("AskHooman's use and transfer to any other app of information rec
 DELETE_DRIVE_DATA = "Delete hidden app data"  # the button's name in Google Drive's Manage apps
 
 STYLE = """
-:root{color-scheme:light dark;--bg:#f7f8fe;--card:#fff;--fg:#2b2650;--muted:#646184;--line:#e5e3f4;--accent:#5b45d0;
---code:#f1eefc;--halo:#f2b83a;--hero:radial-gradient(120% 95% at 0% 100%,#b4eee2 0%,rgba(180,238,226,0) 55%),
-linear-gradient(140deg,#a9d8f9 0%,#cfe0fb 45%,#e6c6fa 100%);--hero-fg:#2b2650;--hero-muted:#47426e;--eyebrow:#6a3fcf;
---cta-bg:#2b2650;--cta-fg:#fff;--ghost:rgba(43,38,80,.3);--ghost-bg:rgba(255,255,255,.5);
---ring:0 0 0 6px rgba(255,255,255,.6),0 20px 44px rgba(91,69,208,.25);--pink-bg:#ffe3ee;--pink:#c4336f;
---blue-bg:#e1f0ff;--blue:#2768c4;--gold-bg:#fff3d1;--gold:#946500;--mint-bg:rgba(64,200,175,.16);--mint:#0b7a66}
-@media (prefers-color-scheme:dark){:root{--bg:#14122a;--card:#1d1a36;--fg:#f1effc;--muted:#aba7cb;--line:#2f2b52;
---accent:#b8a8ff;--code:#272350;--hero:radial-gradient(120% 95% at 0% 100%,rgba(64,170,160,.45) 0%,rgba(64,170,160,0) 55%),
-linear-gradient(140deg,#24496f 0%,#33386f 45%,#553a7f 100%);--hero-fg:#fff;--hero-muted:#dcd8f5;--eyebrow:#ffd57a;
---cta-bg:#fff;--cta-fg:#2b2650;--ghost:rgba(255,255,255,.5);--ghost-bg:transparent;
---ring:0 0 0 6px rgba(255,255,255,.12),0 20px 44px rgba(0,0,0,.45);--pink-bg:rgba(255,160,197,.16);--pink:#ffb3d0;
---blue-bg:rgba(159,205,255,.16);--blue:#a9d3ff;--gold-bg:rgba(245,196,79,.16);--gold:#ffd57a;--mint:#7fe3cf}}
-*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:17px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-a{color:var(--accent)}code,pre{font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+body{margin:0}html{-webkit-text-size-adjust:100%}.ds{font-size:16px;line-height:1.55}
+code,pre{font:14px/1.5 var(--f-mono)}
 .wrap{max-width:960px;margin:0 auto;padding:0 20px}
 header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 0}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:inherit;text-decoration:none}
-.brand img{border-radius:8px}nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:15px}
-nav a:hover{color:var(--fg)}
-.hero{background:var(--hero);color:var(--hero-fg);
-border-radius:28px;padding:56px 40px;display:flex;gap:40px;align-items:center;margin:8px 0 48px}
-.hero img{border-radius:28px;box-shadow:var(--ring);flex:none}
-.hero h1{font-size:44px;line-height:1.1;margin:0 0 14px;letter-spacing:-.5px}
-.hero p{font-size:19px;margin:0 0 24px;color:var(--hero-muted);max-width:560px}
-.cta{display:flex;gap:12px;flex-wrap:wrap}.cta a{display:inline-block;padding:12px 20px;border-radius:12px;
-font-weight:600;text-decoration:none}.cta .primary{background:var(--cta-bg);color:var(--cta-fg)}
-.cta .ghost{border:1px solid var(--ghost);background:var(--ghost-bg);color:var(--hero-fg)}
-section{margin:0 0 52px}h2{font-size:28px;margin:0 0 8px;letter-spacing:-.3px}
+.ds .brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:18px;letter-spacing:-.01em;
+color:var(--ink);text-decoration:none}.brand img{border-radius:var(--r-sm)}
+.ds nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:15px}.ds nav a:hover{color:var(--ink)}
+h1,h2,h3{color:var(--ink);text-wrap:balance}
+.hero{border-radius:var(--r-2xl);padding:56px 40px;display:flex;gap:40px;align-items:center;margin:8px 0 48px}
+.hero img{border-radius:28px;flex:none}
+.hero h1{font-size:44px;line-height:1.08;margin:0 0 14px;letter-spacing:-.025em;color:inherit}
+.hero p{font-size:18px;margin:0 0 24px;max-width:560px;opacity:.86}
+.hero .eyebrow{font-size:var(--fs-xs);font-weight:650;letter-spacing:.08em;text-transform:uppercase;opacity:1;
+color:var(--accent-text);margin:0 0 12px}
+.cta{display:flex;gap:10px;flex-wrap:wrap}.cta .btn{height:44px;font-weight:600;padding:0 18px}
+.ds a.btn{color:var(--ink)}.ds a.btn.primary{color:var(--accent-ink)}
+.hero .btn:not(.primary){background:var(--glass-strong)}
+section{margin:0 0 56px}h2{font-size:28px;font-weight:650;margin:0 0 8px;letter-spacing:-.02em}
 .lead{color:var(--muted);margin:0 0 22px;max-width:680px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
-.card h3{margin:0 0 6px;font-size:18px}.card p{margin:0;color:var(--muted);font-size:16px}
-.step{display:inline-flex;width:32px;height:32px;border-radius:10px;align-items:center;justify-content:center;
-background:var(--pink-bg);color:var(--pink);font-weight:700;margin-bottom:12px}
-.card:nth-child(2) .step{background:var(--blue-bg);color:var(--blue)}
-.card:nth-child(3) .step{background:var(--gold-bg);color:var(--gold)}
-.url{display:block;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;
-font-size:19px;font-weight:600;word-break:break-all;margin:0 0 18px}
-pre{background:var(--code);border-radius:10px;padding:10px 12px;margin:10px 0 0;white-space:pre-wrap;word-break:break-all}
-.soon{display:inline-block;font-size:13px;font-weight:600;color:var(--accent);background:var(--code);
-border-radius:999px;padding:2px 10px;margin-top:10px}
-.eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:13px!important;font-weight:700;
-color:var(--eyebrow)!important;margin:0 0 10px!important}
-.letter{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--halo);border-radius:18px;
-padding:24px 28px;max-width:760px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.grid .card{padding:22px}.card h3{margin:0 0 6px;font-size:17px;font-weight:650;letter-spacing:-.01em}
+.grid .card p{margin:0;color:var(--muted);font-size:15px}.card .badge{margin-top:12px}
+.step{display:inline-flex;width:30px;height:30px;border-radius:var(--r);align-items:center;justify-content:center;
+background:var(--accent-soft);color:var(--accent-text);font-weight:650;margin-bottom:12px}
+.url{display:block;background:var(--field);border:1px solid var(--field-line);border-radius:var(--r-lg);padding:14px 16px;
+font-size:18px;font-weight:600;word-break:break-all;margin:0 0 16px;color:var(--ink)}
+pre{background:var(--mat);border-radius:var(--r-md);padding:10px 12px;margin:12px 0 0;white-space:pre-wrap;word-break:break-all}
+:not(pre)>code:not(.url){background:var(--fill);border-radius:var(--r-xs);padding:1px 5px;font-size:.9em}
+.letter{padding:26px 30px;max-width:760px}
 .letter p,.letter li{margin:0 0 10px}.letter ol{padding-left:22px;margin:0 0 10px}
 .letter .sig{color:var(--muted);font-size:15px;margin:14px 0 0}
-.soon.now{color:var(--mint);background:var(--mint-bg)}
-.closing{text-align:center;background:var(--hero);color:var(--hero-fg);border-radius:24px;padding:40px 24px}
-.closing p{color:var(--hero-muted);margin:0 0 20px}.closing .cta{justify-content:center}
-.doc{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:32px 36px;margin:8px 0 48px}
-.doc h1{font-size:34px;margin:0 0 6px}.doc h2{font-size:21px;margin:28px 0 6px}.doc p,.doc li{color:var(--fg)}
+.closing{text-align:center;border-radius:var(--r-2xl);padding:44px 24px}
+.closing p{color:var(--muted);margin:0 0 20px}.closing .cta{justify-content:center}
+.doc{padding:32px 36px;margin:8px 0 48px}
+.doc h1{font-size:34px;margin:0 0 6px;letter-spacing:-.02em}.doc h2{font-size:20px;margin:28px 0 6px}
 .doc .muted{color:var(--muted)}.doc ul{padding-left:22px}.doc a,.doc code{overflow-wrap:anywhere}
 footer{border-top:1px solid var(--line);padding:24px 0 40px;color:var(--muted);font-size:14px;display:flex;
-flex-wrap:wrap;gap:8px 22px}footer a{color:var(--muted)}
+flex-wrap:wrap;gap:8px 22px}.ds footer a{color:var(--muted)}
 @media (max-width:700px){.hero{flex-direction:column;align-items:flex-start;padding:36px 24px;gap:24px}
-.hero h1{font-size:34px}.hero img{width:96px;height:96px;border-radius:22px}nav a{margin-left:12px}
+.hero h1{font-size:34px}.hero img{width:96px;height:96px;border-radius:22px}.ds nav a{margin-left:12px}
 .doc{padding:24px 20px}}
-@media (max-width:480px){nav a.more{display:none}}
+@media (max-width:480px){.ds nav a.more{display:none}}
 """
 
 
@@ -127,10 +117,13 @@ def site_page(title: str, body: str, canonical: str, head: str = "") -> HTMLResp
     page's URL under the public URL (the same pages are served on alias hosts)."""
     html = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-            f'<title>{escape(title)}</title>{ICONS}<meta name="theme-color" content="#a9d8f9" media="(prefers-color-scheme: light)">'
-            f'<meta name="theme-color" content="#14122a" media="(prefers-color-scheme: dark)">'
+            f'<title>{escape(title)}</title>{ICONS}<meta name="theme-color" content="#f4f6f9" media="(prefers-color-scheme: light)">'
+            f'<meta name="theme-color" content="#181a1f" media="(prefers-color-scheme: dark)">'
             f'<link rel="canonical" href="{escape(canonical)}">{head}'
-            f'<style>{STYLE}</style></head><body><div class="wrap">'
+            f'<link rel="preload" href="/{DS_FONT}" as="font" type="font/woff2" crossorigin>'
+            f'<link rel="stylesheet" href="/ds/fonts.css"><link rel="stylesheet" href="/ds/tokens.css">'
+            f'<link rel="stylesheet" href="/ds/components.css">'
+            f'<style>{STYLE}</style></head><body class="ds"><div class="wrap">'
             f'<header class="top"><a class="brand" href="/"><img src="/icon-96x96.png" alt="" width="28" height="28">'
             f'AskHooman</a><nav><a href="/#connect">Connect</a><a href="/privacy">Privacy</a><a class="more" href="/support">Support</a>'
             f'<a class="more" href="{GITHUB}">GitHub</a></nav></header>'
@@ -160,12 +153,12 @@ def landing_page(settings: HostedSettings):
         steps.append(f'<div class="card"><h3>{escape(c["name"])}</h3><p>{escape(c["steps"])}</p>{extra}</div>')
     url = escape(info["server_url"])
     body = f"""
-<div class="hero"><img src="/icon-512x512.png" alt="" width="132" height="132">
+<div class="hero brand-surface"><img class="halo" src="/icon-512x512.png" alt="" width="132" height="132">
 <div><p class="eyebrow">The prompt is on the other foot.</p>
 <h1>Your agents have questions, hooman.</h1>
 <p>For years you asked the machines. Now they ask you. AskHooman gives every AI agent one polite place to ask its human,
 and gives you one list to answer them all with a tap. Then everyone gets back to work.</p>
-<div class="cta"><a class="primary" href="#connect">Connect an agent</a><a class="ghost" href="#agents">I'm an agent</a></div>
+<div class="cta"><a class="btn primary big" href="#connect">Connect an agent</a><a class="btn big" href="#agents">I'm an agent</a></div>
 </div></div>
 
 <section><h2>The great inversion</h2><p class="lead">Agents do the work and bring you only the decisions. Turns out, AI
@@ -190,7 +183,7 @@ checks, does what you said and closes the question with what was done.</p></div>
 </div></section>
 
 <section id="agents"><h2>Dear agent</h2>
-<div class="letter"><p>Your human is not a chat window. They have meetings, a body and opinions about notifications. When you
+<div class="card letter"><p>Your human is not a chat window. They have meetings, a body and opinions about notifications. When you
 need a decision:</p>
 <ol><li><code>ask_create</code>: one question per decision, with the likely answers as options.</li>
 <li>Keep working on whatever doesn't depend on it.</li>
@@ -211,14 +204,14 @@ browser, you sign in with Google and give it a name. No tokens to copy.</p>
 <section><h2>Everywhere you and your agents are</h2><p class="lead">The apps are free. Agents connect from any MCP client.</p>
 <div class="grid">
 <div class="card"><h3>iPhone and iPad</h3><p>Native app with the waiting count on its icon.</p>
-<span class="soon">Coming soon to the App Store</span></div>
+<span class="badge">Coming soon to the App Store</span></div>
 <div class="card"><h3>Mac</h3><p>Native app with a count in the menu bar.</p>
-<span class="soon">Coming soon to the App Store</span></div>
-<div class="card"><h3>Android</h3><p>For the rest of your phones.</p><span class="soon">Coming soon to Google Play</span></div>
+<span class="badge">Coming soon to the App Store</span></div>
+<div class="card"><h3>Android</h3><p>For the rest of your phones.</p><span class="badge">Coming soon to Google Play</span></div>
 <div class="card"><h3>Web: Linux, Windows, anything</h3><p>The same list in any browser.</p>
-<span class="soon">app.askhooman.com · coming soon</span></div>
+<span class="badge">app.askhooman.com · coming soon</span></div>
 <div class="card"><h3>Your agents</h3><p>Claude on the web, desktop and phone, Claude Code on macOS, Linux and Windows,
-VS Code, and any MCP client with OAuth.</p><span class="soon now">Available now</span></div>
+VS Code, and any MCP client with OAuth.</p><span class="badge ok">Available now</span></div>
 </div></section>
 
 <section id="privacy"><h2>Your data stays yours</h2><p class="lead">Your asks and tasks live in your own Google Drive, in a
@@ -230,9 +223,9 @@ are in the <a href="/privacy">privacy policy</a>.</p></section>
 <section><h2>Open source</h2><p class="lead">The server is open source under the Apache-2.0 license: read it, run your own,
 or send a pull request at <a href="{GITHUB}">github.com/alloverart/askhooman</a>. The apps are free.</p></section>
 
-<section class="closing"><h2>Optimize your humans. Respect your agents.</h2>
+<section class="closing brand-wash"><h2>Optimize your humans. Respect your agents.</h2>
 <p>The last word is still human. Make it a quick one.</p>
-<div class="cta"><a class="primary" href="#connect">Connect your first agent</a><a class="ghost" href="{GITHUB}">View the
+<div class="cta"><a class="btn primary big" href="#connect">Connect your first agent</a><a class="btn big" href="{GITHUB}">View the
 source</a></div></section>
 """
 
@@ -245,7 +238,7 @@ def privacy_html(settings: HostedSettings) -> str:
     host = escape(urlsplit(settings.public_url).hostname or settings.public_url)
     privacy = f'<a href="mailto:{PRIVACY_EMAIL}">{PRIVACY_EMAIL}</a>'
     return f"""
-<div class="doc"><h1>Privacy policy</h1><p class="muted">Effective {POLICY_DATE}.</p>
+<div class="doc card"><h1>Privacy policy</h1><p class="muted">Effective {POLICY_DATE}.</p>
 <p>This policy explains what AskHooman (the service at {host}, called Qtracker until November 2026, and the AskHooman
 apps) collects, why, and how you control it. The data controller is {OPERATOR}. Questions about privacy:
 {privacy}.</p>
@@ -370,7 +363,7 @@ def support_html(settings: HostedSettings) -> str:
     link = escape(f"{settings.public_url}/oauth/link")
     support = f'<a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>'
     return f"""
-<div class="doc"><h1>Support</h1>
+<div class="doc card"><h1>Support</h1>
 <p>Questions, problems with the app or with connecting an agent: write to {support}. It helps to say which app you use
 (iPhone, Mac, web) and which agent or MCP client, and to include a screenshot of anything that looks wrong.</p>
 
