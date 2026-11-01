@@ -8,6 +8,10 @@
   GET    /api/connect-info       the MCP URL and per-client setup snippets
   POST   /api/events             {ask_id, kind: answered|closed|reopened} after the user acted in the app
                                  -> the asking agent's webhook is called (webhooks.py)
+  DELETE /api/me                 Delete Account: revoke the bridge's Google grant (best effort), delete everything
+                                 the server keeps for the user -> 204; nothing left to delete -> 404.
+                                 The asks and tasks in the user's Drive stay (they are the user's files).
+                                 (GET /api/me is the agents' REST: who the agent token belongs to.)
 """
 
 import logging
@@ -16,6 +20,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict
 
 from ..db import utc_now
@@ -23,6 +28,8 @@ from ..mcp_tools import IDENTITY_SCOPE_KEY
 from ..rules import Conflict, Invalid, NotFound
 from .accounts import Accounts, NameTaken, agent_json
 from .config import HostedSettings
+from .crypto import CryptoError
+from .google import GoogleOAuth
 from .ratelimit import RateLimiter
 from .records import DrivePool, HostedAsks
 from .webhooks import WebhookSender, check_webhook_url
@@ -39,8 +46,14 @@ class AppUser:
     email: str | None = None
 
 
-def is_app_path(path: str) -> bool:
-    return path == "/api/agents" or path.startswith("/api/agents/") or path in ("/api/connect-info", "/api/events")
+def is_app_path(path: str, method: str = "GET") -> bool:
+    """App API requests (Google ID tokens); the other /api/* are the agents' (OAuth access tokens, agent keys)."""
+    return (path == "/api/agents" or path.startswith("/api/agents/") or path in ("/api/connect-info", "/api/events")
+            or is_account_deletion(path, method))
+
+
+def is_account_deletion(path: str, method: str) -> bool:
+    return path == "/api/me" and method == "DELETE"
 
 
 class AgentPatch(BaseModel):
@@ -87,7 +100,7 @@ def connect_info(settings: HostedSettings, drive_linked: bool) -> dict:
 
 
 def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool: DrivePool,
-                webhooks: WebhookSender, limiter: RateLimiter) -> None:
+                webhooks: WebhookSender, limiter: RateLimiter, google: GoogleOAuth) -> None:
 
     def app_user(request: Request) -> AppUser:
         user = request.scope.get(IDENTITY_SCOPE_KEY)  # set by RequestGuard from the ID token
@@ -171,3 +184,19 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             webhooks.send(agent["webhook_url"], secret, payload["type"], delivery, {**payload, "delivery_id": delivery})
             queued += 1
         return {"queued": queued}
+
+    @app.delete("/api/me", status_code=204, response_class=Response)
+    def delete_account(user: AppUser = Depends(app_user)):
+        """Delete Account. Google first (so the bridge loses Drive access even if the store fails halfway; a retry
+        finds the account again), then everything in the store, then the Drive client cached in this instance."""
+        try:
+            refresh = accounts.google_refresh(user.sub)
+        except CryptoError:  # sealed with a key that is no longer configured: nothing usable to revoke
+            refresh = None
+        if refresh and not google.revoke(refresh):
+            log.warning("Google did not confirm revoking a deleted account's grant (unreachable or already revoked)")
+        found = accounts.delete_user(user.sub)
+        pool.forget(user.sub)
+        if not found:
+            raise NotFound("no account to delete: it was already deleted")
+        return Response(status_code=204)
