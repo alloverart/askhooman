@@ -1,5 +1,5 @@
 """Fake Google for the hosted bridge: the OAuth token endpoint (sign-in codes and refreshes for the Web client),
-the signing keys (JWKS), ID tokens, and one FakeDrive per Google account — all behind httpx.MockTransport.
+token revocation, the signing keys (JWKS), ID tokens, and one FakeDrive per Google account — all behind httpx.MockTransport.
 `public_transport()` serves client metadata documents and records webhook calls (the bridge's "internet").
 
 sign_in() plays the user in the browser at accounts.google.com: it reads the bridge's authorization URL and
@@ -43,6 +43,8 @@ class FakeGoogle:
         self.refresh_tokens: dict[str, str] = {}  # refresh token -> sub
         self.access_tokens: dict[str, str] = {}  # access token -> sub
         self.revoked_refresh: set[str] = set()
+        self.revocations: list[str] = []  # every token the bridge asked Google to revoke
+        self.revoke_status: int | None = None  # set to make the revocation endpoint fail (e.g. 503)
         self.auth_requests: list[dict] = []  # params of every authorization URL the bridge sent a user to
         self.lock = threading.RLock()
         # the public internet seen by the bridge (CIMD documents, webhook receivers)
@@ -100,6 +102,8 @@ class FakeGoogle:
         url = request.url
         if url.host == "oauth2.googleapis.com" and url.path == "/token":
             return self._token(request)
+        if url.host == "oauth2.googleapis.com" and url.path == "/revoke" and request.method == "POST":
+            return self._revoke(request)
         if url.host == "www.googleapis.com" and url.path == "/oauth2/v3/certs":
             jwk = json.loads(RSAAlgorithm.to_jwk(self.key.public_key()))
             jwk.update(kid=self.kid, alg="RS256", use="sig")
@@ -142,6 +146,18 @@ class FakeGoogle:
                 return httpx.Response(200, json={"access_token": self._access(sub), "expires_in": 3599,
                                                  "token_type": "Bearer", "scope": DRIVE_SCOPE})
         return httpx.Response(400, json={"error": "unsupported_grant_type"})
+
+    def _revoke(self, request: httpx.Request) -> httpx.Response:
+        """Like Google: 200 for a live refresh token (the grant ends: it refreshes no more), 400 otherwise."""
+        token = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}.get("token", "")
+        with self.lock:
+            self.revocations.append(token)
+            if self.revoke_status is not None:
+                return httpx.Response(self.revoke_status, json={"error": "backend_error"})
+            if token in self.refresh_tokens and token not in self.revoked_refresh:
+                self.revoked_refresh.add(token)
+                return httpx.Response(200, json={})
+        return httpx.Response(400, json={"error": "invalid_token", "error_description": "Token expired or revoked"})
 
     def _access(self, sub: str) -> str:
         token = "ya29." + secrets.token_urlsafe(16)

@@ -129,9 +129,9 @@ class RequestGuard:
     upload. Checks the bearer token on /api/* and caps every request body at MAX_BODY.
     (/mcp checks its token itself in MCPEndpoint, also before the body is read.)
 
-    authenticate(path, headers, client) -> identity (raising HTTPException) replaces the tokens-file check; the
-    hosted bridge uses it (its lookups block on the metadata store, so they run in a worker thread); `client` is
-    the ASGI (host, port) of the peer."""
+    authenticate(path, headers, client, method) -> identity (raising HTTPException) replaces the tokens-file check;
+    the hosted bridge uses it (its lookups block on the metadata store, so they run in a worker thread); `client`
+    is the ASGI (host, port) of the peer, `method` the HTTP method (DELETE /api/me is the app's, not an agent's)."""
 
     def __init__(self, app, tokens: TokenStore | None = None, max_body: int = MAX_BODY, authenticate=None):
         self.app = app
@@ -139,10 +139,10 @@ class RequestGuard:
         self.max_body = max_body
         self.authenticate = authenticate
 
-    async def _identify(self, path: str, headers: Headers, client):
+    async def _identify(self, path: str, headers: Headers, client, method: str):
         if self.authenticate is None:
             return _resolve(self.tokens, headers.get("authorization"))
-        return await anyio.to_thread.run_sync(self.authenticate, path, headers, client)
+        return await anyio.to_thread.run_sync(self.authenticate, path, headers, client, method)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -151,7 +151,8 @@ class RequestGuard:
         headers = Headers(scope=scope)
         if scope["path"].startswith("/api/"):
             try:
-                scope[IDENTITY_SCOPE_KEY] = await self._identify(scope["path"], headers, scope.get("client"))
+                scope[IDENTITY_SCOPE_KEY] = await self._identify(scope["path"], headers, scope.get("client"),
+                                                                 scope["method"])
             except HTTPException as exc:
                 await _error(exc.status_code, exc.detail, exc.headers)(scope, receive, send)
                 return

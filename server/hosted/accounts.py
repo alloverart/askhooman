@@ -158,6 +158,35 @@ class Accounts:
         """Google said the refresh token is dead (revoked by the user): forget it, so the app can ask to relink."""
         self.store.update("users", sub, {"google_refresh": None})
 
+    def delete_user(self, sub: str) -> bool:
+        """Delete Account: forget the user and everything kept for them here: their agents (names, clients,
+        webhooks and encrypted webhook secrets), OAuth access and refresh tokens, unredeemed authorization codes,
+        agent keys, pending sign-ins, and last the user document (email, encrypted Google refresh token, id
+        counters). False if there was nothing to delete. The asks and tasks in their Drive are not touched: they
+        are the user's files. Revoking the Google grant is the caller's job (read google_refresh first).
+
+        The token families are marked revoked before anything is deleted and the agents go first, so a code
+        exchange or refresh racing with this fails; the user document goes last, so a retry after a failure
+        halfway still finds the account. Registrations of OAuth clients (clients/…) belong to no user and stay."""
+        found = self.user(sub) is not None
+        grants = self.store.find("tokens", "user", sub) + self.store.find("codes", "user", sub)
+        families = sorted({doc["family"] for _, doc in grants if doc.get("family")})
+        for family in families:
+            self.store.put("families", family, {"revoked": True, "revoked_at": utc_now(),
+                                                "expires_at": self.clock() + self.settings.refresh_ttl})
+        removed: dict[str, int] = {}
+        for collection in ("agents", "tokens", "codes", "keys", "requests"):
+            for key, _ in self.store.find(collection, "user", sub):
+                self.store.delete(collection, key)
+                removed[collection] = removed.get(collection, 0) + 1
+                if collection == "agents":
+                    with self._seen_lock:
+                        self._seen.pop(key, None)
+        self.store.delete("users", sub)
+        if found or removed:
+            log.info("account deleted: %s", ", ".join(f"{n} {c}" for c, n in removed.items()) or "no agents")
+        return found or bool(removed)
+
     # ---------- per-user id counters (new ask/task ids) ----------
 
     def has_counter(self, sub: str, kind: str) -> bool:

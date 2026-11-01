@@ -2,6 +2,7 @@
 
 - The bridge's sign-in leg (SPEC v4 "Login = Google as the upstream IdP"): the project's Web application client,
   authorization code + PKCE + state + nonce, scopes openid email drive.appdata, access_type=offline.
+- Revocation of the refresh token the bridge holds for a user, when they delete their account (best effort).
 - Google ID tokens: signature (RS256, Google's published keys, cached per Cache-Control), iss, aud, exp, iat;
   used both for the sign-in leg (aud = the Web client) and for the App API (aud = the iOS client).
 No token or secret appears in an error message or log line.
@@ -17,6 +18,8 @@ from jwt import PyJWK
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+REVOKE_TIMEOUT = 5.0  # seconds: revocation is best effort and must not hold up an account deletion
 CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 ISSUERS = ("https://accounts.google.com", "accounts.google.com")
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
@@ -98,6 +101,15 @@ class GoogleOAuth:
             error = str(body.get("error", "")) if isinstance(body, dict) else ""
             raise GoogleError(f"Google refused the sign-in code (HTTP {response.status_code} {error})")
         return body
+
+    def revoke(self, token: str) -> bool:
+        """Revoke a refresh (or access) token at Google, which ends the grant it belongs to. Best effort: False when
+        Google was unreachable or refused (an already revoked token is refused too); never raises."""
+        try:
+            response = self.http.post(REVOKE_URL, data={"token": token}, timeout=REVOKE_TIMEOUT)
+        except httpx.HTTPError:
+            return False
+        return response.status_code == 200
 
     # ---------- ID tokens ----------
 

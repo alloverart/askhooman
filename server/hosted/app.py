@@ -2,7 +2,7 @@
 
   /mcp                  MCP (streamable HTTP, stateless) for agents: OAuth access tokens or agent keys
   /api/asks, /api/tasks the same REST as the single-tenant bridge, for agents (same tokens as /mcp)
-  /api/agents…, /api/connect-info, /api/events   the App API (Google ID tokens), app_api.py
+  /api/agents…, /api/connect-info, /api/events, DELETE /api/me   the App API (Google ID tokens), app_api.py
   /authorize, /token, /register, /revoke, /oauth/…, /.well-known/…   the authorization server, oauth.py
   /healthz
 
@@ -26,7 +26,7 @@ from ..mcp_tools import IDENTITY_SCOPE_KEY, build_mcp
 from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
-from .app_api import AppUser, add_app_api, is_app_path
+from .app_api import AppUser, add_app_api, is_account_deletion, is_app_path
 from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
@@ -150,9 +150,10 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
-    def authenticate(path: str, headers, client=None) -> HostedIdentity | AppUser:
-        """RequestGuard's check for /api/*: Google ID tokens on the App API, agent bearer tokens elsewhere."""
-        if not is_app_path(path):
+    def authenticate(path: str, headers, client=None, method: str = "GET") -> HostedIdentity | AppUser:
+        """RequestGuard's check for /api/*: Google ID tokens on the App API, agent bearer tokens elsewhere. The first
+        App API call of a Google account creates its user, except Delete Account (nothing to create it for)."""
+        if not is_app_path(path, method):
             ip = client_ip(headers, (client or (None,))[0], settings.trust_forwarded)
             return resource_auth.identify(headers.get("authorization"), ip, headers.get("host"))
         token = bearer_token(headers.get("authorization"))
@@ -163,7 +164,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         except GoogleError as exc:
             raise HTTPException(401, exc.public, headers={"WWW-Authenticate": 'Bearer error="invalid_token"'}) from None
         try:
-            if accounts.user(claims["sub"]) is None:
+            if accounts.user(claims["sub"]) is None and not is_account_deletion(path, method):
                 accounts.touch_user(claims["sub"], claims.get("email"))
         except Exception as exc:
             log.exception("app user lookup failed: %s", type(exc).__name__)
@@ -197,9 +198,9 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         return {"ok": True}
 
     add_api_routes(app, services)
-    add_app_api(app, settings, accounts, pool, webhooks, limiter)
+    add_app_api(app, settings, accounts, pool, webhooks, limiter, google)
     app.router.routes.extend(auth_server.routes())
-    app.router.routes.extend(site.routes(settings.public_url))
+    app.router.routes.extend(site.routes(settings))
     app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, settings.trust_forwarded),
                                    include_in_schema=False))
     app.add_middleware(RequestGuard, authenticate=authenticate)

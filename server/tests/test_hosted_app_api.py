@@ -160,6 +160,21 @@ def test_landing_page_and_icons(hosted):
     assert landing.status_code == 200 and "Questions from your AI agents" in landing.text
     assert f'property="og:image" content="{PUBLIC}/og-image-1200x630.png"' in landing.text
     assert "noindex" not in landing.text and 'href="/favicon.ico"' in landing.text
+    # the connect steps are the app's (connect-info), with the public URL
+    assert f"claude mcp add --transport http askhooman {RESOURCE}" in landing.text and f">{RESOURCE}<" in landing.text
+    assert "https://github.com/alloverart/askhooman" in landing.text and "coming soon" in landing.text.lower()
+    for path, words in (("/privacy", ("appDataFolder", "drive.appdata", "Delete hidden app data", "support@allover.art",
+                                      "encrypted", "one-way hashes", "within 30")),
+                        ("/support", ("support@allover.art", "security@allover.art", "/issues"))):
+        page = hosted.get(path)
+        assert page.status_code == 200 and "noindex" not in page.text, path
+        assert all(w in page.text for w in words), path
+        assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    for link in ('href="/privacy"', 'href="/support"'):  # in every public page's footer
+        assert link in landing.text
+    llms = hosted.get("/llms.txt")  # for agents reading the site
+    assert llms.status_code == 200 and llms.headers["content-type"].startswith("text/plain")
+    assert f"askhooman {RESOURCE}" in llms.text and "asks_mine" in llms.text and f"{PUBLIC}/privacy" in llms.text
     for path, kind in (("/favicon.ico", "image/x-icon"), ("/favicon.svg", "image/svg+xml"),
                        ("/apple-touch-icon.png", "image/png"), ("/site.webmanifest", "application/manifest+json"),
                        ("/og-image-1200x630.png", "image/png"), ("/icon-maskable-512x512.png", "image/png")):
@@ -168,3 +183,37 @@ def test_landing_page_and_icons(hosted):
         assert "default-src 'none'" in response.headers["content-security-policy"]
     error = hosted.get("/oauth/consent")
     assert "noindex" in error.text and "/favicon.svg" in error.text  # every page carries the icons, only / is indexed
+
+
+def test_store_pages(hosted):
+    """What App Store review and Google's OAuth verification look for: what the app does, how to connect, the privacy
+    policy (Limited Use for drive.appdata, deletion), support contacts, all linked from every page."""
+    pages = {path: hosted.get(path) for path in ("/", "/privacy", "/support")}
+    for path, page in pages.items():
+        assert page.status_code == 200 and page.headers["content-type"].startswith("text/html"), path
+        assert "<script" not in page.text and "default-src 'none'" in page.headers["content-security-policy"], path
+        assert f'<link rel="canonical" href="{PUBLIC}{path}">' in page.text, path
+        for link in ('href="/privacy"', 'href="/support"', 'href="https://github.com/alloverart/askhooman"'):
+            assert link in page.text, (path, link)
+    landing, privacy, support = (" ".join(pages[p].text.split()) for p in ("/", "/privacy", "/support"))  # as rendered
+    assert f"<code class=\"url\">{RESOURCE}</code>" in landing
+    assert "Add custom connector" in landing and f"claude mcp add --transport http askhooman {RESOURCE}" in landing
+    for words in ("Coming soon to the App Store", "Coming soon to Google Play", "app.askhooman.com · coming soon",
+                  "Apache-2.0", "drive.appdata",
+                  "We keep only your account email, an encrypted Google token and your agents' names and keys"):
+        assert words in landing, words
+    for words in ("Effective 1 November 2026", "Allover Studio, LLC", "mailto:privacy@allover.art", "qtracker.test",
+                  "will adhere to the <a href=\"https://developers.google.com/terms/api-services-user-data-policy\">"
+                  "Google API Services User Data Policy</a>, including the Limited Use requirements",
+                  "drive.appdata", "appDataFolder", "never copied to our database", "Google Cloud",
+                  "Settings → Delete account", "revokes", "stay in your Google Drive", "Delete hidden app data",
+                  "Third-party apps", "Children", "Changes", "no ads", "never sell"):
+        assert words in privacy, words
+    for words in ("mailto:support@allover.art", "mailto:privacy@allover.art", "mailto:security@allover.art",
+                  f"claude mcp add --transport http askhooman {RESOURCE}", "Add custom connector",
+                  f'href="{PUBLIC}/oauth/link"', "Settings → Delete account", "Delete hidden app data",
+                  'href="/privacy"'):
+        assert words in support, words
+    # the old domain serves the same pages, pointing at the public URL
+    alias = hosted.get("/privacy", headers={"Host": "old.qtracker.test"})
+    assert alias.status_code == 200 and f'<link rel="canonical" href="{PUBLIC}/privacy">' in alias.text

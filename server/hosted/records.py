@@ -131,6 +131,11 @@ class DrivePool:
             raise DriveError("this account has not allowed AskHooman to use its Google Drive yet", reason="not_linked")
         return self.client_id, self.client_secret, refresh
 
+    def forget(self, sub: str) -> None:
+        """Drop the user's Drive client and the Google access token it holds (their account was deleted)."""
+        with self._lock:
+            self._clients.pop(sub, None)
+
     def records(self, sub: str) -> "UserRecords":
         return UserRecords(self, sub)
 
