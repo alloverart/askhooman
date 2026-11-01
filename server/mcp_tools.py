@@ -32,7 +32,7 @@ their decision is an ask."""
 
 # Hosted mode (SPEC "Hosted bridge … (v4)"): many users, each connects their own agents.
 HOSTED_INSTRUCTIONS = """\
-Qtracker is the queue of decisions waiting for the person who connected you; they answer from the Qtracker
+AskHooman is the queue of decisions waiting for the person who connected you; they answer from the AskHooman
 app on their phone or Mac. At the start of every session, and whenever you are woken, call asks_mine and
 tasks_mine first: asks_mine returns your questions with their answers, tasks_mine your long-running work.
 Instead of asking them in a chat, create an ask (ask_create): one decision per ask. Act on an answer, then
@@ -137,7 +137,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     # advertise listChanged, and Claude Code then holds a listen POST open until the request timeout (300 s on
     # Cloud Run) and re-listens, for as long as it stays connected.
     if hosted:
-        mcp = MCPServer("qtracker", version="0.4.0", instructions=HOSTED_INSTRUCTIONS, subscriptions=False)
+        mcp = MCPServer("askhooman", version="0.4.0", instructions=HOSTED_INSTRUCTIONS, subscriptions=False)
     else:
         mcp = MCPServer("asks", version="0.1.0", instructions=INSTRUCTIONS, subscriptions=False)
 

@@ -25,15 +25,15 @@ DENIS_SUB, DENIS_EMAIL = "1001", "owner@example.com"
 OLGA_SUB, OLGA_EMAIL = "2002", "olga@example.com"
 
 
-def settings_for(public: str = PUBLIC) -> HostedSettings:
+def settings_for(public: str = PUBLIC, aliases: tuple[str, ...] = ()) -> HostedSettings:
     return HostedSettings(public_url=public, web_client_id=WEB_CLIENT_ID, web_client_secret=WEB_CLIENT_SECRET,
-                          app_client_ids=(IOS_CLIENT_ID,), encryption_keys=KEY, store="memory")
+                          app_client_ids=(IOS_CLIENT_ID,), encryption_keys=KEY, store="memory", aliases=aliases)
 
 
-def build(google: FakeGoogle, public: str = PUBLIC):
+def build(google: FakeGoogle, public: str = PUBLIC, aliases: tuple[str, ...] = ()):
     store = MemoryStore()
     public_http = httpx.Client(transport=google.public_transport())
-    app = create_hosted_app(settings_for(public), store=store, http=httpx.Client(transport=google.transport()),
+    app = create_hosted_app(settings_for(public, aliases), store=store, http=httpx.Client(transport=google.transport()),
                             public_http=public_http,
                             webhooks=WebhookSender(public_http, retry_delays=(0.01, 0.01)))
     return app, store
@@ -112,18 +112,20 @@ def consent(client, consent_url: str, agent_name: str = "Allen", action: str = "
 
 
 def connect(client, google: FakeGoogle, client_id: str, redirect_uri: str = LOOPBACK, agent: str = "Allen",
-            sub: str = DENIS_SUB, email: str = DENIS_EMAIL, secret: str | None = None) -> dict:
-    """The whole OAuth flow for one agent; returns the token response."""
+            sub: str = DENIS_SUB, email: str = DENIS_EMAIL, secret: str | None = None, origin: str = PUBLIC) -> dict:
+    """The whole OAuth flow for one agent; returns the token response. origin: the one `client` talks to (the
+    public URL or an alias), which is the issuer and the resource's base."""
     verifier, challenge = pkce()
-    consent_url = to_consent(client, google, authorize(client, client_id, challenge, redirect_uri), sub, email)
+    consent_url = to_consent(client, google, authorize(client, client_id, challenge, redirect_uri,
+                                                       resource=f"{origin}/mcp"), sub, email)
     response = consent(client, consent_url, agent)
     assert response.status_code == 303, response.text
     location = response.headers["location"]
     assert location.startswith(redirect_uri.split("?")[0])
     params = query(location)
-    assert params["state"] == "st-1" and params["iss"] == PUBLIC
+    assert params["state"] == "st-1" and params["iss"] == origin
     form = {"grant_type": "authorization_code", "code": params["code"], "redirect_uri": redirect_uri,
-            "client_id": client_id, "code_verifier": verifier, "resource": RESOURCE}
+            "client_id": client_id, "code_verifier": verifier, "resource": f"{origin}/mcp"}
     if secret:
         form["client_secret"] = secret
     tokens = client.post("/token", data=form)

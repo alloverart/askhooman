@@ -1,8 +1,8 @@
-# Qtracker hosted bridge on Cloud Run
+# AskHooman hosted bridge on Cloud Run
 
 The multi-tenant bridge (SPEC.md, section "Hosted bridge and agent connection (v4)"): the same `server/` package, switched on with `ASKS_MODE=hosted`. Asks and tasks live in each user's Google Drive appDataFolder; everything else (users, agents, OAuth clients, tokens, keys) lives in Firestore. There is no local state, so any number of instances can run.
 
-Placeholders used below: `<PROJECT_ID>` (your Google Cloud project), `<REGION>` (e.g. `europe-west1`; it needs Firestore and Cloud Run domain mappings), `<PUBLIC_HOST>` (the hostname the service is reached at, e.g. `qtracker.example.com`). MCP is then at `https://<PUBLIC_HOST>/mcp`.
+Placeholders used below: `<PROJECT_ID>` (your Google Cloud project), `<REGION>` (e.g. `europe-west1`; it needs Firestore and Cloud Run domain mappings), `<PUBLIC_HOST>` (the hostname the service is reached at, e.g. `askhooman.example.com`). MCP is then at `https://<PUBLIC_HOST>/mcp`.
 
 Files here:
 
@@ -17,12 +17,12 @@ cloudbuild.yaml   builds the image into Artifact Registry of the project the bui
 
 ## Your own Google Cloud project
 
-A self-hosted server needs its own project and its own OAuth clients. Drive's appDataFolder is scoped to one Google Cloud project: files the bridge writes there are visible only to clients of the same project. So the official Qtracker apps (which belong to the official project) cannot see data written by your server; you need your own client app (or your own build of one) registered in your project.
+A self-hosted server needs its own project and its own OAuth clients. Drive's appDataFolder is scoped to one Google Cloud project: files the bridge writes there are visible only to clients of the same project. So the official AskHooman apps (which belong to the official project) cannot see data written by your server; you need your own client app (or your own build of one) registered in your project.
 
 Create in the Google Cloud console:
 
 - OAuth consent screen with the scopes `openid`, `email` and `https://www.googleapis.com/auth/drive.appdata`. While it is in testing (or Internal for a Workspace organization), only listed or organization accounts can sign in; `drive.appdata` needs Google's verification for a public External app.
-- OAuth client of type **Web application** with the single redirect URI `https://<PUBLIC_HOST>/oauth/google/callback`. Its JSON (`{"web": {"client_id", "client_secret", ...}}` as the console downloads it, or a flat `{"client_id", "client_secret"}`) goes into Secret Manager, step 4 below.
+- OAuth client of type **Web application** with the redirect URI `https://<PUBLIC_HOST>/oauth/google/callback` (and the same path on every host in `ASKS_PUBLIC_URL_ALIASES`). Its JSON (`{"web": {"client_id", "client_secret", ...}}` as the console downloads it, or a flat `{"client_id", "client_secret"}`) goes into Secret Manager, step 4 below.
 - The OAuth client(s) of your app (e.g. an iOS client): their client ids are the accepted audiences of the app's Google ID tokens for the App API (`ASKS_GOOGLE_APP_CLIENT_IDS`).
 
 ## First deploy
@@ -91,7 +91,7 @@ If `gcloud builds submit` fails on permissions: the build service account (in ne
 ```bash
 curl -s https://<PUBLIC_HOST>/.well-known/oauth-authorization-server   # issuer, endpoints, S256, CIMD
 curl -si -X POST https://<PUBLIC_HOST>/mcp | grep -i www-authenticate   # resource_metadata=...
-claude mcp add --transport http qtracker https://<PUBLIC_HOST>/mcp      # then /mcp → qtracker → Authenticate
+claude mcp add --transport http askhooman https://<PUBLIC_HOST>/mcp     # then /mcp → askhooman → Authenticate
 ```
 
 (`/healthz` works locally, but Cloud Run's frontend reserves paths ending in `z` and answers 404 there.)
@@ -118,7 +118,8 @@ Logs: `gcloud run services logs read qtracker --region=$REGION --limit=100`. Tok
 | variable | value |
 |---|---|
 | `ASKS_MODE` | `hosted` (already set in the Dockerfile) |
-| `ASKS_PUBLIC_URL` | `https://<PUBLIC_HOST>`: the OAuth issuer; token audience = `<it>/mcp`; Google redirect = `<it>/oauth/google/callback` |
+| `ASKS_PUBLIC_URL` | `https://<PUBLIC_HOST>` (default `https://askhooman.com`): the OAuth issuer; token audience = `<it>/mcp`; Google redirect = `<it>/oauth/google/callback` |
+| `ASKS_PUBLIC_URL_ALIASES` | optional, comma-separated: more hosts of the same service, e.g. the old domain after a rename. Each keeps its own issuer and token audience, so agents connected there keep working; map the domain to the service and add `<alias>/oauth/google/callback` to the Web client's redirect URIs |
 | `ASKS_GOOGLE_WEB_CLIENT` | secret `qtracker-google-web-client`: JSON with `client_id`/`client_secret` (the value or a path to the file) |
 | `ASKS_GOOGLE_APP_CLIENT_IDS` | client id(s) of your app's OAuth client(s), comma-separated |
 | `ASKS_ENCRYPTION_KEY` | secret `qtracker-encryption-key`: base64 of 32 bytes; to rotate, `k2:<new>,k1:<old>` (the first encrypts, all decrypt) |

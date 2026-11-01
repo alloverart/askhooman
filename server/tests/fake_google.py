@@ -33,8 +33,9 @@ def s256(verifier: str) -> str:
 
 
 class FakeGoogle:
-    def __init__(self, redirect_uri: str):
+    def __init__(self, redirect_uri: str, *more_redirect_uris: str):
         self.redirect_uri = redirect_uri
+        self.redirect_uris = {redirect_uri, *more_redirect_uris}  # the Web client's authorized redirect URIs
         self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.kid = "fake-kid-1"
         self.drives: dict[str, FakeDrive] = {}
@@ -71,11 +72,11 @@ class FakeGoogle:
         assert f"{parts.scheme}://{parts.netloc}{parts.path}" == "https://accounts.google.com/o/oauth2/v2/auth"
         params = {k: v[0] for k, v in parse_qs(parts.query).items()}
         self.auth_requests.append(params)
-        assert params["client_id"] == WEB_CLIENT_ID and params["redirect_uri"] == self.redirect_uri
+        assert params["client_id"] == WEB_CLIENT_ID and params["redirect_uri"] in self.redirect_uris
         assert params["response_type"] == "code" and params["code_challenge_method"] == "S256"
         assert params["access_type"] == "offline" and params["state"] and params["nonce"]
         assert set(params["scope"].split()) == {"openid", "email", DRIVE_SCOPE}
-        callback = urlsplit(self.redirect_uri).path
+        callback = urlsplit(params["redirect_uri"]).path
         if deny:
             return f"{callback}?{urlencode({'error': 'access_denied', 'state': params['state']})}"
         if give_refresh is None:  # Google issues a refresh token on the consent screen (first time or forced)
@@ -83,7 +84,8 @@ class FakeGoogle:
         code = "4/0A" + secrets.token_urlsafe(24)
         with self.lock:
             self.codes[code] = {"sub": sub, "email": email, "challenge": params["code_challenge"],
-                                "nonce": params["nonce"], "drive": grant_drive, "refresh": give_refresh}
+                                "nonce": params["nonce"], "drive": grant_drive, "refresh": give_refresh,
+                                "redirect_uri": params["redirect_uri"]}
         return f"{callback}?{urlencode({'code': code, 'state': params['state'], 'scope': params['scope']})}"
 
     def drive_linked_before(self, sub: str) -> bool:
@@ -118,7 +120,7 @@ class FakeGoogle:
         with self.lock:
             if form.get("grant_type") == "authorization_code":
                 grant = self.codes.pop(form.get("code", ""), None)
-                if grant is None or form.get("redirect_uri") != self.redirect_uri \
+                if grant is None or form.get("redirect_uri") != grant["redirect_uri"] \
                         or s256(form.get("code_verifier", "")) != grant["challenge"]:
                     return httpx.Response(400, json={"error": "invalid_grant"})
                 sub = grant["sub"]

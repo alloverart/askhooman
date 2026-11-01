@@ -53,31 +53,33 @@ class ResourceAuth:
         self.settings = settings
         self.accounts = accounts
         self.limiter = limiter
-        self.metadata_url = f"{settings.public_url}/.well-known/oauth-protected-resource/mcp"
 
-    def challenge(self, error: str | None = None, description: str | None = None) -> str:
-        parts = [f'resource_metadata="{self.metadata_url}"', f'scope="{SCOPE}"']
+    def challenge(self, origin: str, error: str | None = None, description: str | None = None) -> str:
+        parts = [f'resource_metadata="{origin}/.well-known/oauth-protected-resource/mcp"', f'scope="{SCOPE}"']
         if error:
             parts.append(f'error="{error}"')
         if description:
             parts.append(f'error_description="{description}"')
         return "Bearer " + ", ".join(parts)
 
-    def identify(self, authorization: str | None, ip: str = "unknown") -> HostedIdentity:
+    def identify(self, authorization: str | None, ip: str = "unknown", host: str | None = None) -> HostedIdentity:
+        """host: the request's Host header. A token is valid only on the origin it was issued for (its audience):
+        the public URL, or an alias such as the domain before a rename."""
+        origin = self.settings.origin(host)
         token = bearer_token(authorization)
         if token is None:
-            raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": self.challenge()})
+            raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": self.challenge(origin)})
         if self.limiter.blocked("bearer_fail", ip):
             raise HTTPException(429, "too many invalid tokens from this address", headers={"Retry-After": "60"})
         try:
-            identity = self.accounts.identify(token, self.settings.resource)
+            identity = self.accounts.identify(token, self.settings.resource_for(origin))
         except Exception as exc:  # the metadata store is down: say so, as JSON, without details
             log.exception("bearer check failed: %s", type(exc).__name__)
             raise HTTPException(503, "temporarily unavailable, try again", headers={"Retry-After": "5"}) from None
         if identity is None:
             self.limiter.allow("bearer_fail", ip)
-            raise HTTPException(401, "invalid token", headers={
-                "WWW-Authenticate": self.challenge("invalid_token", "the token is invalid, expired or revoked")})
+            raise HTTPException(401, "invalid token", headers={"WWW-Authenticate": self.challenge(
+                origin, "invalid_token", "the token is invalid, expired or revoked")})
         if not self.limiter.allow("agent", identity.agent_id) or not self.limiter.allow("user", identity.user):
             raise HTTPException(429, "too many requests", headers={"Retry-After": "60"})
         return identity
@@ -95,7 +97,8 @@ class HostedMCPEndpoint:
         headers = Headers(scope=scope)
         ip = client_ip(headers, (scope.get("client") or (None,))[0], self.trust_forwarded)
         try:
-            identity = await anyio.to_thread.run_sync(self.auth.identify, headers.get("authorization"), ip)
+            identity = await anyio.to_thread.run_sync(self.auth.identify, headers.get("authorization"), ip,
+                                                      headers.get("host"))
         except HTTPException as exc:
             await JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)(
                 scope, receive, send)
@@ -151,7 +154,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         """RequestGuard's check for /api/*: Google ID tokens on the App API, agent bearer tokens elsewhere."""
         if not is_app_path(path):
             ip = client_ip(headers, (client or (None,))[0], settings.trust_forwarded)
-            return resource_auth.identify(headers.get("authorization"), ip)
+            return resource_auth.identify(headers.get("authorization"), ip, headers.get("host"))
         token = bearer_token(headers.get("authorization"))
         if token is None:
             raise HTTPException(401, "sign in with Google", headers={"WWW-Authenticate": "Bearer"})
@@ -169,13 +172,14 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        log.info("qtracker hosted bridge: %s (store=%s)", settings.public_url, settings.store)
+        log.info("AskHooman hosted bridge: %s (aliases: %s, store=%s)", settings.public_url,
+                 ", ".join(settings.aliases) or "none", settings.store)
         async with mcp.session_manager.run():
             yield
         await anyio.to_thread.run_sync(webhooks.flush, 5.0)
         pool.close()
 
-    app = FastAPI(title="Qtracker", version="0.4.0", lifespan=lifespan, docs_url=None, redoc_url=None,
+    app = FastAPI(title="AskHooman", version="0.4.0", lifespan=lifespan, docs_url=None, redoc_url=None,
                   openapi_url=None)
     app.state.settings = settings
     app.state.tokens = None

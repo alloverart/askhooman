@@ -178,7 +178,7 @@ class PublicOnlyTransport(httpx.HTTPTransport):
 def public_client(timeout: float = 5.0, transport: httpx.BaseTransport | None = None) -> httpx.Client:
     """An HTTP client for user-chosen URLs. `transport` replaces the safe one in tests (no network there)."""
     return httpx.Client(transport=transport or PublicOnlyTransport(), timeout=timeout, follow_redirects=False,
-                        trust_env=False, headers={"User-Agent": "Qtracker/0.4 (+https://qtracker.allover.art)",
+                        trust_env=False, headers={"User-Agent": "AskHooman/0.4 (+https://askhooman.com)",
                                                   "Accept-Encoding": "identity"})
 
 

@@ -94,7 +94,7 @@ def test_connect_info(hosted, google):
     ids = [c["id"] for c in info["clients"]]
     assert "claude" in ids and "claude-code" in ids and "agent-key" in ids
     code = next(c for c in info["clients"] if c["id"] == "claude-code")
-    assert code["command"] == f"claude mcp add --transport http qtracker {RESOURCE}"
+    assert code["command"] == f"claude mcp add --transport http askhooman {RESOURCE}"
 
 
 def test_events_call_the_agents_webhook_signed_and_retried(hosted, google):
@@ -120,15 +120,18 @@ def test_events_call_the_agents_webhook_signed_and_retried(hosted, google):
     assert len(google.webhook_calls) == 2
     call = google.webhook_calls[-1]
     assert str(call.url) == "https://hooks.example/qt?k=1"
-    assert verify(secret, call.content, call.headers["qtracker-signature"])
-    assert not verify("whsec_wrong", call.content, call.headers["qtracker-signature"])
-    assert not verify(secret, call.content, call.headers["qtracker-signature"], now=time.time() + 3600)
+    assert verify(secret, call.content, call.headers["askhooman-signature"])
+    assert not verify("whsec_wrong", call.content, call.headers["askhooman-signature"])
+    assert not verify(secret, call.content, call.headers["askhooman-signature"], now=time.time() + 3600)
+    # receivers written before the rename read the Qtracker-* names: the same values go out under them too
+    for name in ("signature", "event", "delivery"):
+        assert call.headers[f"qtracker-{name}"] == call.headers[f"askhooman-{name}"]
     payload = json.loads(call.content)
     assert payload["type"] == "ask.answered" and payload["answer"] == "Yes, ship"
     assert (payload["ask"]["id"], payload["ask"]["status"]) == (ask["id"], "answered")
     assert "events" not in payload["ask"]
-    assert payload["event"]["id"] == 2 and call.headers["qtracker-event"] == "ask.answered"
-    assert call.headers["qtracker-delivery"] == payload["delivery_id"]
+    assert payload["event"]["id"] == 2 and call.headers["askhooman-event"] == "ask.answered"
+    assert call.headers["askhooman-delivery"] == payload["delivery_id"]
     # an event that doesn't match the file is refused; another user's ask is not found
     wrong = hosted.post("/api/events", json={"ask_id": ask["id"], "kind": "closed"}, headers=id_token(google))
     assert wrong.status_code == 409

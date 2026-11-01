@@ -1,4 +1,4 @@
-# Qtracker hosted bridge (SPEC.md v4) for Google Cloud Run.
+# AskHooman hosted bridge (SPEC.md v4) for Google Cloud Run.
 # Build context: the repository root (see cloudbuild.yaml); only server/ and deploy/hosted/ are uploaded.
 FROM python:3.11-slim
 
@@ -15,8 +15,8 @@ RUN pip install -r deploy/hosted/requirements.txt
 
 COPY server/ server/
 RUN rm -rf server/tests && find server -name __pycache__ -prune -exec rm -rf {} + \
-    && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin qtracker
-USER qtracker
+    && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin askhooman
+USER askhooman
 
 # Cloud Run sets $PORT. No access log: Cloud Run logs every request itself, and uvicorn's lines would repeat
 # URLs (with OAuth state/code parameters) a second time.

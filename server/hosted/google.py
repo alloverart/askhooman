@@ -58,10 +58,11 @@ class GoogleOAuth:
     # ---------- sign-in leg ----------
 
     def auth_url(self, state: str, nonce: str, code_challenge: str, login_hint: str | None = None,
-                 force_consent: bool = False) -> str:
+                 force_consent: bool = False, redirect_uri: str | None = None) -> str:
+        """redirect_uri: the callback on the origin the sign-in started on (default: the public URL's)."""
         params = {
             "client_id": self.client_id,
-            "redirect_uri": self.redirect_uri,
+            "redirect_uri": redirect_uri or self.redirect_uri,
             "response_type": "code",
             "scope": " ".join(SCOPES),
             "access_type": "offline",
@@ -78,10 +79,12 @@ class GoogleOAuth:
             params["login_hint"] = login_hint
         return f"{AUTH_URL}?{urlencode(params)}"
 
-    def exchange(self, code: str, code_verifier: str) -> dict:
-        """The token response for a sign-in code: {id_token, access_token, refresh_token?, scope, ...}."""
+    def exchange(self, code: str, code_verifier: str, redirect_uri: str | None = None) -> dict:
+        """The token response for a sign-in code: {id_token, access_token, refresh_token?, scope, ...}.
+        redirect_uri: the one the sign-in was started with."""
         data = {"code": code, "client_id": self.client_id, "client_secret": self.client_secret,
-                "redirect_uri": self.redirect_uri, "grant_type": "authorization_code", "code_verifier": code_verifier}
+                "redirect_uri": redirect_uri or self.redirect_uri, "grant_type": "authorization_code",
+                "code_verifier": code_verifier}
         try:
             response = self.http.post(TOKEN_URL, data=data)
         except httpx.HTTPError as exc:

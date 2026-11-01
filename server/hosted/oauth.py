@@ -156,7 +156,7 @@ class AuthServer:
     def _client_url(self, pending: dict, **params) -> str:
         """An authorization response URL for the client, always with its state and our issuer (RFC 9207)."""
         return construct_redirect_uri(pending["redirect_uri"], **params, state=pending.get("state"),
-                                      iss=self.settings.issuer)
+                                      iss=pending.get("issuer") or self.settings.issuer)
 
     def _to_client(self, pending: dict, **params) -> RedirectResponse:
         """Redirect to the client: only after the user answered our consent page."""
@@ -185,14 +185,19 @@ class AuthServer:
 
     # ---------- metadata ----------
 
+    def _origin(self, request: Request) -> str:
+        """The public URL, or the alias (e.g. the domain before a rename) this request arrived on."""
+        return self.settings.origin(request.headers.get("host"))
+
     async def protected_resource(self, request: Request) -> Response:
-        doc = ProtectedResourceMetadata(resource=self.settings.resource, authorization_servers=[self.settings.issuer],
+        origin = self._origin(request)
+        doc = ProtectedResourceMetadata(resource=self.settings.resource_for(origin), authorization_servers=[origin],
                                         scopes_supported=[SCOPE], bearer_methods_supported=["header"],
-                                        resource_name="Qtracker")
+                                        resource_name="AskHooman")
         return JSONResponse(doc.model_dump(mode="json", exclude_none=True), headers={"Cache-Control": "max-age=300"})
 
     async def authorization_server(self, request: Request) -> Response:
-        base = self.settings.issuer
+        base = self._origin(request)
         doc = OAuthMetadata(
             issuer=base,
             authorization_endpoint=f"{base}/authorize",
@@ -223,14 +228,14 @@ class AuthServer:
             client = await self.client(client_id)
         except ClientError as exc:
             status = 503 if exc.code == "temporarily_unavailable" else 400
-            return error_page(f"This app can't connect to Qtracker: {exc}.", status)
-        return await anyio.to_thread.run_sync(self._authorize, params, client)
+            return error_page(f"This app can't connect to AskHooman: {exc}.", status)
+        return await anyio.to_thread.run_sync(self._authorize, params, client, self._origin(request))
 
-    def _authorize(self, params: dict, client: dict) -> Response:
+    def _authorize(self, params: dict, client: dict, origin: str) -> Response:
         try:
             redirect_uri, explicit = pick_redirect(client, params.get("redirect_uri"))
         except ClientError as exc:
-            return error_page(f"This app can't connect to Qtracker: {exc}.")
+            return error_page(f"This app can't connect to AskHooman: {exc}.")
         # A malformed request is the app's bug: say so here, never bounce the browser to its redirect URI.
         state = params.get("state")
         problem = None
@@ -243,9 +248,9 @@ class AuthServer:
         elif params.get("code_challenge_method") != "S256":
             problem = "code_challenge_method must be S256"
         elif not params.get("resource"):
-            problem = f"the resource parameter is required (RFC 8707): {self.settings.resource}"
-        elif canonical_resource(params["resource"]) != self.settings.resource:
-            problem = f"unknown resource; this server issues tokens for {self.settings.resource}"
+            problem = f"the resource parameter is required (RFC 8707): {self.settings.resource_for(origin)}"
+        elif canonical_resource(params["resource"]) != self.settings.resource_for(origin):
+            problem = f"unknown resource; this server issues tokens for {self.settings.resource_for(origin)}"
         if problem:
             return error_page(f"This app sent an invalid sign-in request: {problem}.")
         verifier, nonce = new_secret(nbytes=48), new_secret(nbytes=24)
@@ -253,10 +258,11 @@ class AuthServer:
             "purpose": "agent", "stage": "google", "client_id": client["client_id"], "client_kind": client["kind"],
             "client_name": client["client_name"], "localhost": is_loopback_uri(redirect_uri),
             "redirect_uri": redirect_uri, "redirect_explicit": explicit, "state": state,
-            "code_challenge": params["code_challenge"], "resource": self.settings.resource, "scope": SCOPE,
-            "nonce": nonce, "google_verifier": verifier, "forced": False,
+            "code_challenge": params["code_challenge"], "resource": self.settings.resource_for(origin), "scope": SCOPE,
+            "nonce": nonce, "google_verifier": verifier, "forced": False, "issuer": origin,
+            "google_redirect": self.settings.google_redirect_for(origin),
         })
-        url = self.google.auth_url(rid, nonce, s256(verifier))
+        url = self.google.auth_url(rid, nonce, s256(verifier), redirect_uri=self.settings.google_redirect_for(origin))
         return self._with_cookie(RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store"}), rid)
 
     async def link(self, request: Request) -> Response:
@@ -264,12 +270,15 @@ class AuthServer:
         if self._limited(request, "authorize"):
             return error_page(SLOW_DOWN, 429, "Slow down")
 
+        callback = self.settings.google_redirect_for(self._origin(request))
+
         def start() -> Response:
             verifier = new_secret(nbytes=48)
             nonce = new_secret(nbytes=24)
             rid = self.accounts.start_request({"purpose": "link", "stage": "google", "nonce": nonce,
-                                               "google_verifier": verifier, "forced": True})
-            url = self.google.auth_url(rid, nonce, s256(verifier), force_consent=True)
+                                               "google_verifier": verifier, "forced": True,
+                                               "google_redirect": callback})
+            url = self.google.auth_url(rid, nonce, s256(verifier), force_consent=True, redirect_uri=callback)
             return self._with_cookie(RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store"}),
                                      rid)
         return await anyio.to_thread.run_sync(start)
@@ -297,7 +306,7 @@ class AuthServer:
         if params.get("error") or not params.get("code"):
             return fail("Google sign-in was cancelled.", "access_denied")
         try:
-            tokens = self.google.exchange(params["code"], pending["google_verifier"])
+            tokens = self.google.exchange(params["code"], pending["google_verifier"], pending.get("google_redirect"))
             claims = self.google.verify_id_token(tokens["id_token"], [self.settings.web_client_id],
                                                  nonce=pending["nonce"])
         except GoogleError as exc:
@@ -311,9 +320,10 @@ class AuthServer:
                 # Only Google's consent screen issues a refresh token (and shows the Drive box again): ask once more.
                 verifier, nonce = new_secret(nbytes=48), new_secret(nbytes=24)
                 self.accounts.update_request(rid, {"forced": True, "google_verifier": verifier, "nonce": nonce})
-                url = self.google.auth_url(rid, nonce, s256(verifier), login_hint=email, force_consent=True)
+                url = self.google.auth_url(rid, nonce, s256(verifier), login_hint=email, force_consent=True,
+                                           redirect_uri=pending.get("google_redirect"))
                 return RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store"})
-            return fail("Qtracker needs access to its own data in your Google Drive (the box on Google's screen).",
+            return fail("AskHooman needs access to its own data in your Google Drive (the box on Google's screen).",
                         "access_denied")
         self.accounts.touch_user(sub, email)
         if refresh and has_scope:
@@ -469,7 +479,7 @@ class AuthServer:
             client = await self._authenticate_client(request, form)
             tokens = await anyio.to_thread.run_sync(self._token, client, form)
         except OAuthError as exc:
-            headers = {"WWW-Authenticate": 'Basic realm="qtracker"'} if exc.status == 401 and \
+            headers = {"WWW-Authenticate": 'Basic realm="askhooman"'} if exc.status == 401 and \
                 request.headers.get("authorization") else None
             return oauth_error(exc.code, exc.description, exc.status, headers)
         return JSONResponse(tokens, headers=NO_STORE)

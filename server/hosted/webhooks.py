@@ -2,10 +2,11 @@
 POST /api/events and the bridge POSTs to the asking agent's webhook URL.
 
 Request: JSON {type: "ask.answered"|"ask.closed"|"ask.reopened", ask, answer?, resolution?, event, delivery_id,
-sent_at}, headers Qtracker-Event, Qtracker-Delivery and
-    Qtracker-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
+sent_at}, headers AskHooman-Event, AskHooman-Delivery and
+    AskHooman-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
 with the agent's webhook secret (shown once in the app). Receivers should check the signature in constant time
-and reject old timestamps (e.g. > 5 minutes) to stop replays.
+and reject old timestamps (e.g. > 5 minutes) to stop replays. The same three also go out under the names from
+before the rename (Qtracker-Event, Qtracker-Delivery, Qtracker-Signature), for receivers written then.
 
 Delivery: a few worker threads take due deliveries from one bounded schedule; a receiver host has at most one
 delivery in flight, so a slow or broken receiver can only delay its own deliveries. An attempt has a wall-clock
@@ -37,7 +38,8 @@ ATTEMPT_DEADLINE = 10.0  # seconds, wall clock, per attempt
 REPLY_READ_MAX = 4096  # bytes of the receiver's reply that are read (and thrown away)
 QUEUE_MAX = 1000
 WORKERS = 4
-SIGNATURE_HEADER = "Qtracker-Signature"
+SIGNATURE_HEADER = "AskHooman-Signature"
+LEGACY_SIGNATURE_HEADER = "Qtracker-Signature"  # the product was called Qtracker until 01.11.2026
 
 
 def sign(secret: str, body: bytes, timestamp: int) -> str:
@@ -163,8 +165,12 @@ class WebhookSender:
         """POST once; the delay before the next attempt, or None when finished (delivered or given up)."""
         attempts = len(self.retry_delays) + 1
         timestamp = int(self.clock())
-        headers = {"Content-Type": "application/json", "Accept-Encoding": "identity", "Qtracker-Event": item.event_type,
-                   "Qtracker-Delivery": item.delivery_id, SIGNATURE_HEADER: sign(item.secret, item.body, timestamp)}
+        signature = sign(item.secret, item.body, timestamp)
+        headers = {"Content-Type": "application/json", "Accept-Encoding": "identity",
+                   "AskHooman-Event": item.event_type, "AskHooman-Delivery": item.delivery_id,
+                   SIGNATURE_HEADER: signature,
+                   "Qtracker-Event": item.event_type, "Qtracker-Delivery": item.delivery_id,
+                   LEGACY_SIGNATURE_HEADER: signature}
         retry_after = None
         try:
             with deadline(self.attempt_deadline), \

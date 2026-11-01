@@ -1,4 +1,4 @@
-"""App API of the hosted bridge (SPEC v4 "App API"), for the Qtracker app's "Connect an agent" and
+"""App API of the hosted bridge (SPEC v4 "App API"), for the AskHooman app's "Connect an agent" and
 "Connected agents" screens. Authenticated with the user's Google ID token (audience = the iOS client).
 
   GET    /api/agents             the user's connected agents
@@ -72,15 +72,15 @@ def connect_info(settings: HostedSettings, drive_linked: bool) -> dict:
             {"id": "claude", "name": "Claude (web, desktop and mobile)",
              "steps": "Settings → Connectors → Add custom connector → paste the URL → Connect"},
             {"id": "claude-code", "name": "Claude Code",
-             "command": f"claude mcp add --transport http qtracker {url}",
-             "steps": "Run the command, then /mcp in Claude Code → qtracker → Authenticate"},
+             "command": f"claude mcp add --transport http askhooman {url}",
+             "steps": "Run the command, then /mcp in Claude Code → askhooman → Authenticate"},
             {"id": "vscode", "name": "VS Code",
-             "config": {"servers": {"qtracker": {"type": "http", "url": url}}},
+             "config": {"servers": {"askhooman": {"type": "http", "url": url}}},
              "steps": "Add to .vscode/mcp.json (or the user mcp.json) and start the server"},
             {"id": "other", "name": "Any MCP client with OAuth",
              "steps": "Add a remote (streamable HTTP) MCP server with the URL; sign in with Google when asked"},
             {"id": "agent-key", "name": "Clients without OAuth (agent key)",
-             "command": f'claude mcp add --transport http qtracker {url} --header "Authorization: Bearer <agent key>"',
+             "command": f'claude mcp add --transport http askhooman {url} --header "Authorization: Bearer <agent key>"',
              "steps": "Create an agent key in the app and send it as the header Authorization: Bearer <agent key>"},
         ],
     }

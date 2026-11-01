@@ -51,9 +51,9 @@ def page(title: str, body: str, status: int = 200, head: str = "", index: bool =
     robots = "" if index else '<meta name="robots" content="noindex">'
     html = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-            f'{robots}<title>{escape(title)} · Qtracker</title>{ICONS}{head}'
+            f'{robots}<title>{escape(title)} · AskHooman</title>{ICONS}{head}'
             f'<style>{STYLE}</style></head><body><main>'
-            f'<div class="brand"><img src="/favicon.svg" alt="" width="20" height="20">Qtracker</div>'
+            f'<div class="brand"><img src="/favicon.svg" alt="" width="20" height="20">AskHooman</div>'
             f'<div class="card">{body}</div></main></body></html>')
     return HTMLResponse(html, status_code=status, headers=SECURITY_HEADERS)
 
@@ -112,7 +112,7 @@ If you continue, <b>{escape(client_name)}</b> will act as {escape(collision["nam
 """)
     body = f"""
 <h1>Connect an agent</h1>
-<p><b>{escape(client_name)}</b> wants to ask you questions and track its tasks in Qtracker.</p>
+<p><b>{escape(client_name)}</b> wants to ask you questions and track its tasks in AskHooman.</p>
 {who}{warning}
 <form method="post" action="{escape(action_url)}">
 <input type="hidden" name="csrf" value="{escape(csrf)}">
@@ -130,6 +130,6 @@ If you continue, <b>{escape(client_name)}</b> will act as {escape(collision["nam
 
 def linked_page(email: str | None) -> HTMLResponse:
     who = f" for {escape(email)}" if email else ""
-    return page("Google Drive linked", f"<h1>Google Drive linked</h1><p>Qtracker can now keep your agents’ "
+    return page("Google Drive linked", f"<h1>Google Drive linked</h1><p>AskHooman can now keep your agents’ "
                                        f"questions and tasks in your Google Drive{who}.</p>"
                                        f'<p class="muted">You can close this window.</p>')

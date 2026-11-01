@@ -1,18 +1,18 @@
-# Qtracker server
+# AskHooman server
 
-Qtracker lets people keep track of **asks** and **tasks** between themselves and their AI agents. An agent that needs a decision puts an ask on its human's list instead of asking in a chat; the human answers with one tap, and the agent picks the answer up the next time it checks. Agents also record their own long-running work as tasks, so they don't forget it and the human sees who is doing what.
+AskHooman lets people keep track of **asks** and **tasks** between themselves and their AI agents. An agent that needs a decision puts an ask on its human's list instead of asking in a chat; the human answers with one tap, and the agent picks the answer up the next time it checks. Agents also record their own long-running work as tasks, so they don't forget it and the human sees who is doing what.
 
-This repository is the server: a hosted **MCP server** for agents plus an **app API** for the Qtracker apps. The data of record lives in each user's own Google Drive, in the hidden per-app `appDataFolder`; the server keeps only accounts, connected agents and tokens (in Firestore).
+This repository is the server: a hosted **MCP server** for agents plus an **app API** for the AskHooman apps. The data of record lives in each user's own Google Drive, in the hidden per-app `appDataFolder`; the server keeps only accounts, connected agents and tokens (in Firestore).
 
 - Agents connect with one URL (`https://<host>/mcp`) using MCP authorization (OAuth 2.1 with PKCE, client ID metadata documents or dynamic client registration), signing the user in with Google. Clients without OAuth can use an agent key created in the app.
-- The official instance runs at `https://qtracker.allover.art`.
-- The Qtracker iOS/macOS app is a separate, proprietary client and is not part of this repository.
+- The official instance runs at `https://askhooman.com` (until 01.11.2026 the product was called Qtracker; `https://qtracker.allover.art` is still served as an alias, so agents connected there keep working).
+- The AskHooman iOS/macOS app is a separate, proprietary client and is not part of this repository.
 
 ### Self-hosting
 
-The server runs on Google Cloud Run with Firestore; the step-by-step guide is [deploy/hosted/README.md](deploy/hosted/README.md). A self-hosted server needs **its own Google Cloud project, its own Google OAuth clients and its own app/clients**: Drive's appDataFolder is scoped to one Google Cloud project, so data written through your project is invisible to apps registered in another project (including the official Qtracker apps), and the reverse.
+The server runs on Google Cloud Run with Firestore; the step-by-step guide is [deploy/hosted/README.md](deploy/hosted/README.md). A self-hosted server needs **its own Google Cloud project, its own Google OAuth clients and its own app/clients**: Drive's appDataFolder is scoped to one Google Cloud project, so data written through your project is invisible to apps registered in another project (including the official AskHooman apps), and the reverse.
 
-The contract (fields, statuses, REST, MCP, Drive file format, OAuth details) is [SPEC.md](SPEC.md). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Security reports: [SECURITY.md](SECURITY.md). License: [Apache-2.0](LICENSE). The license does not grant rights to the Qtracker name and logo (`server/hosted/static/`); a public instance of your own should use its own name and icons.
+The contract (fields, statuses, REST, MCP, Drive file format, OAuth details) is [SPEC.md](SPEC.md). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Security reports: [SECURITY.md](SECURITY.md). License: [Apache-2.0](LICENSE). The license does not grant rights to the AskHooman name and logo (`server/hosted/static/`); a public instance of your own should use its own name and icons.
 
 ## Concepts
 

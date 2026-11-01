@@ -1,4 +1,4 @@
-"""The public face of qtracker.allover.art: a small landing page at / and the icon kit next to it (favicons, touch
+"""The public face of AskHooman (askhooman.com): a small landing page at / and the icon kit next to it (favicons, touch
 icon, web manifest, link-preview image) from server/hosted/static/, copied from design/icon-kit/03_Website_PWA.
 
 Files are read once at startup; a missing one fails the deploy, not a request. No scripts anywhere.
@@ -39,12 +39,12 @@ def _file(name: str):
 def landing_page(public_url: str):
     image = escape(f"{public_url}/og-image-1200x630.png")
     head = (f'<meta name="description" content="{TAGLINE}"><meta property="og:type" content="website">'
-            f'<meta property="og:title" content="Qtracker"><meta property="og:description" content="{TAGLINE}">'
+            f'<meta property="og:title" content="AskHooman"><meta property="og:description" content="{TAGLINE}">'
             f'<meta property="og:url" content="{escape(public_url)}/"><meta property="og:image" content="{image}">'
             f'<meta name="twitter:card" content="summary_large_image"><meta name="twitter:image" content="{image}">')
     body = (f'<img class="appicon" src="/icon-192x192.png" alt="" width="88" height="88">'
-            f"<h1>Qtracker</h1><p>{TAGLINE}</p>"
-            f'<p class="muted">You answer in the Qtracker app on iPhone or Mac. Agents connect over MCP at '
+            f"<h1>AskHooman</h1><p>{TAGLINE}</p>"
+            f'<p class="muted">You answer in the AskHooman app on iPhone or Mac. Agents connect over MCP at '
             f"<b>{escape(public_url)}/mcp</b>: add one in the app’s Settings.</p>")
 
     async def endpoint(request: Request) -> Response:
