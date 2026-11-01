@@ -1,6 +1,6 @@
 # Security policy
 
-Please report vulnerabilities privately to **security@allover.art**, not in public issues or pull requests.
+Please report vulnerabilities privately to **security@askhooman.com**, not in public issues or pull requests.
 
 Include what you found, how to reproduce it, and the impact you expect. We will acknowledge the report, keep you informed while we fix it, and credit you in the release notes if you wish.
 

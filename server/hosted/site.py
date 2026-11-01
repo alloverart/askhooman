@@ -34,9 +34,9 @@ PAGE_HEADERS = {**SECURITY_HEADERS, "Cache-Control": "public, max-age=300"}
 
 TAGLINE = "Questions from your AI agents, waiting for your decision."
 GITHUB = "https://github.com/alloverart/askhooman"
-SUPPORT_EMAIL = "support@allover.art"
-PRIVACY_EMAIL = "privacy@allover.art"
-SECURITY_EMAIL = "security@allover.art"
+SUPPORT_EMAIL = "support@askhooman.com"
+PRIVACY_EMAIL = "privacy@askhooman.com"
+SECURITY_EMAIL = "security@askhooman.com"
 OPERATOR = "Allover Studio, LLC"
 POLICY_DATE = "1 November 2026"
 USER_DATA_POLICY = "https://developers.google.com/terms/api-services-user-data-policy"

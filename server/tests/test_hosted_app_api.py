@@ -163,9 +163,9 @@ def test_landing_page_and_icons(hosted):
     # the connect steps are the app's (connect-info), with the public URL
     assert f"claude mcp add --transport http askhooman {RESOURCE}" in landing.text and f">{RESOURCE}<" in landing.text
     assert "https://github.com/alloverart/askhooman" in landing.text and "coming soon" in landing.text.lower()
-    for path, words in (("/privacy", ("appDataFolder", "drive.appdata", "Delete hidden app data", "support@allover.art",
+    for path, words in (("/privacy", ("appDataFolder", "drive.appdata", "Delete hidden app data", "support@askhooman.com",
                                       "encrypted", "one-way hashes", "within 30")),
-                        ("/support", ("support@allover.art", "security@allover.art", "/issues"))):
+                        ("/support", ("support@askhooman.com", "security@askhooman.com", "/issues"))):
         page = hosted.get(path)
         assert page.status_code == 200 and "noindex" not in page.text, path
         assert all(w in page.text for w in words), path
@@ -202,14 +202,14 @@ def test_store_pages(hosted):
                   "Apache-2.0", "drive.appdata",
                   "We keep only your account email, an encrypted Google token and your agents' names and keys"):
         assert words in landing, words
-    for words in ("Effective 1 November 2026", "Allover Studio, LLC", "mailto:privacy@allover.art", "qtracker.test",
+    for words in ("Effective 1 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
                   "will adhere to the <a href=\"https://developers.google.com/terms/api-services-user-data-policy\">"
                   "Google API Services User Data Policy</a>, including the Limited Use requirements",
                   "drive.appdata", "appDataFolder", "never copied to our database", "Google Cloud",
                   "Settings → Delete account", "revokes", "stay in your Google Drive", "Delete hidden app data",
                   "Third-party apps", "Children", "Changes", "no ads", "never sell"):
         assert words in privacy, words
-    for words in ("mailto:support@allover.art", "mailto:privacy@allover.art", "mailto:security@allover.art",
+    for words in ("mailto:support@askhooman.com", "mailto:privacy@askhooman.com", "mailto:security@askhooman.com",
                   f"claude mcp add --transport http askhooman {RESOURCE}", "Add custom connector",
                   f'href="{PUBLIC}/oauth/link"', "Settings → Delete account", "Delete hidden app data",
                   'href="/privacy"'):
