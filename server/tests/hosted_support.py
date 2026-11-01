@@ -25,15 +25,19 @@ DENIS_SUB, DENIS_EMAIL = "1001", "owner@example.com"
 OLGA_SUB, OLGA_EMAIL = "2002", "olga@example.com"
 
 
-def settings_for(public: str = PUBLIC, aliases: tuple[str, ...] = ()) -> HostedSettings:
+def settings_for(public: str = PUBLIC, aliases: tuple[str, ...] = (),
+                 cors_origins: tuple[str, ...] = ()) -> HostedSettings:
     return HostedSettings(public_url=public, web_client_id=WEB_CLIENT_ID, web_client_secret=WEB_CLIENT_SECRET,
-                          app_client_ids=(IOS_CLIENT_ID,), encryption_keys=KEY, store="memory", aliases=aliases)
+                          app_client_ids=(IOS_CLIENT_ID,), encryption_keys=KEY, store="memory", aliases=aliases,
+                          cors_origins=cors_origins)
 
 
-def build(google: FakeGoogle, public: str = PUBLIC, aliases: tuple[str, ...] = ()):
+def build(google: FakeGoogle, public: str = PUBLIC, aliases: tuple[str, ...] = (),
+          cors_origins: tuple[str, ...] = ()):
     store = MemoryStore()
     public_http = httpx.Client(transport=google.public_transport())
-    app = create_hosted_app(settings_for(public, aliases), store=store, http=httpx.Client(transport=google.transport()),
+    app = create_hosted_app(settings_for(public, aliases, cors_origins), store=store,
+                            http=httpx.Client(transport=google.transport()),
                             public_http=public_http,
                             webhooks=WebhookSender(public_http, retry_delays=(0.01, 0.01)))
     return app, store

@@ -12,6 +12,9 @@
                                  the server keeps for the user -> 204; nothing left to delete -> 404.
                                  The asks and tasks in the user's Drive stay (they are the user's files).
                                  (GET /api/me is the agents' REST: who the agent token belongs to.)
+
+The web app calls these from a browser on another origin: CORS for them, and only them, is opened to the origins
+in ASKS_CORS_ORIGINS (AppCors); empty by default, then CORS stays closed.
 """
 
 import logging
@@ -22,6 +25,7 @@ from typing import Literal
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict
+from starlette.datastructures import Headers, MutableHeaders
 
 from ..db import utc_now
 from ..mcp_tools import IDENTITY_SCOPE_KEY
@@ -54,6 +58,57 @@ def is_app_path(path: str, method: str = "GET") -> bool:
 
 def is_account_deletion(path: str, method: str) -> bool:
     return path == "/api/me" and method == "DELETE"
+
+
+CORS_METHODS = ("GET", "POST", "PATCH", "DELETE")  # the App API's methods
+CORS_PREFLIGHT = {
+    "Access-Control-Allow-Methods": ", ".join(CORS_METHODS),
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Max-Age": "600",
+}
+
+
+class AppCors:
+    """CORS for the App API, for the web app on the origins in ASKS_CORS_ORIGINS (exact strings, never "*").
+
+    Sits outside RequestGuard: a preflight carries no token, so an allowed one is answered here (204) before the
+    token check, and the Access-Control-Allow-Origin of an actual response is added here, so the browser can read
+    the errors too (401 from RequestGuard, 404, 409, 422, 429). A preflight is judged by the method it asks for
+    (Access-Control-Request-Method): DELETE /api/me is the App API's, GET /api/me the agents'. Everything else
+    passes through untouched: other origins, the agents' /api/*, /mcp and the OAuth endpoints get no CORS headers,
+    and their preflights fail as before (401 or 405). No credentials: the app sends its ID token as a bearer."""
+
+    def __init__(self, app, origins: tuple[str, ...]):
+        self.app = app
+        self.origins = frozenset(origins)
+
+    async def __call__(self, scope, receive, send):
+        request = Headers(scope=scope) if scope["type"] == "http" else Headers()
+        origin = request.get("origin")
+        if origin not in self.origins:
+            await self.app(scope, receive, send)
+            return
+        method, path = scope["method"], scope["path"]
+        requested = request.get("access-control-request-method")
+        if method == "OPTIONS" and requested is not None:  # a preflight
+            if requested in CORS_METHODS and is_app_path(path, requested):
+                headers = {"Access-Control-Allow-Origin": origin, **CORS_PREFLIGHT, "Vary": "Origin"}
+                await Response(status_code=204, headers=headers)(scope, receive, send)
+            else:
+                await self.app(scope, receive, send)
+            return
+        if not is_app_path(path, method):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Access-Control-Allow-Origin"] = origin
+                headers.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
 
 
 class AgentPatch(BaseModel):
