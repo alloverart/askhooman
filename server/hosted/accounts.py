@@ -37,7 +37,7 @@ log = logging.getLogger("asks.hosted.accounts")
 
 AGENT_NAME_MAX = 40
 SEEN_EVERY = 300.0  # write an agent's last_seen at most this often (seconds)
-SCOPE = "qtracker"
+SCOPE = "qtracker"  # OAuth scope from before the rename to AskHooman: clients and tokens carry it, kept as is
 ACCESS_PREFIX, REFRESH_PREFIX, KEY_PREFIX = "qta_", "qtr_", "qtk_"
 ACCESS_FORMAT = re.compile(r"^qta_[A-Za-z0-9_-]{43}$")  # new_secret(ACCESS_PREFIX): 32 random bytes
 KEY_FORMAT = re.compile(r"^qtk_[A-Za-z0-9_-]{40}$")  # new_secret(KEY_PREFIX, 30)

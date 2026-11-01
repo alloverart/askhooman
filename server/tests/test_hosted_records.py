@@ -154,7 +154,7 @@ def test_drive_not_linked_or_revoked_is_a_clear_error(hosted, google):
         google.revoked_refresh.add(refresh)
     hosted.app.state.pool._clients.clear()  # forget the cached Google access token
     text = tool_error(mcp(hosted, token, "asks_mine"))
-    assert "unavailable: Qtracker can't reach" in text and "/oauth/link" in text
+    assert "unavailable: AskHooman can't reach" in text and "/oauth/link" in text
     assert not hosted.store.get("users", DENIS_SUB)["google_refresh"]  # dead link forgotten -> app can relink
     rest = hosted.get("/api/asks", headers={"Authorization": f"Bearer {token}"})
     assert rest.status_code == 503 and "/oauth/link" in rest.json()["detail"]

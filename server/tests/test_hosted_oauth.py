@@ -4,6 +4,7 @@ import base64
 import re
 
 import pytest
+from fastapi.testclient import TestClient
 
 from server.hosted.crypto import digest
 
@@ -14,6 +15,7 @@ from .hosted_support import (
     PUBLIC,
     RESOURCE,
     authorize,
+    build,
     connect,
     consent,
     csrf_of,
@@ -42,7 +44,7 @@ def test_metadata(hosted):
     assert resource.status_code == 200
     assert resource.json() == {"resource": RESOURCE, "authorization_servers": [PUBLIC],
                                "scopes_supported": ["qtracker"], "bearer_methods_supported": ["header"],
-                               "resource_name": "Qtracker"}
+                               "resource_name": "AskHooman"}
     assert hosted.get("/.well-known/oauth-protected-resource").json() == resource.json()
     meta = hosted.get("/.well-known/oauth-authorization-server").json()
     assert meta["issuer"] == PUBLIC  # exactly, no trailing slash (RFC 8414 / 9207 compare strings)
@@ -56,6 +58,42 @@ def test_metadata(hosted):
     assert "access-control-allow-origin" not in {k.lower() for k in resource.headers}
     assert hosted.options("/token", headers={"Origin": "https://evil.example",
                                              "Access-Control-Request-Method": "POST"}).status_code == 405
+
+
+OLD = "https://old-name.test"  # the domain before a rename, kept as an alias
+
+
+def test_an_alias_keeps_the_connections_made_on_it(google):
+    """After a rename the old domain stays an alias (ASKS_PUBLIC_URL_ALIASES): requests that arrive on it get its own
+    metadata, issuer and token audience, so agents connected there keep working. A token is good only on the origin
+    it was issued for, and other hosts are answered as the public URL."""
+    google.redirect_uris.add(f"{OLD}/oauth/google/callback")
+    app, _ = build(google, aliases=(OLD,))
+    with TestClient(app, base_url=PUBLIC) as new:  # runs the app's lifespan once; the others share it
+        old, other = TestClient(app, base_url=OLD), TestClient(app, base_url="https://elsewhere.test")
+        meta = old.get("/.well-known/oauth-protected-resource/mcp").json()
+        assert meta["resource"] == f"{OLD}/mcp" and meta["authorization_servers"] == [OLD]
+        assert old.get("/.well-known/oauth-authorization-server").json()["token_endpoint"] == f"{OLD}/token"
+        assert new.get("/.well-known/oauth-authorization-server").json()["issuer"] == PUBLIC
+        assert other.get("/.well-known/oauth-authorization-server").json()["issuer"] == PUBLIC
+        assert f'resource_metadata="{OLD}/.well-known' in old.post("/mcp", json={}).headers["www-authenticate"]
+        # the old domain only issues tokens for itself
+        assert "unknown resource" in authorize(old, register(old)["client_id"], pkce()[1]).text
+        legacy = register(old)
+        tokens = connect(old, google, legacy["client_id"], origin=OLD)  # Google returned to the old domain
+        assert google.auth_requests[-1]["redirect_uri"] == f"{OLD}/oauth/google/callback"
+        ask = tool_result(mcp(old, tokens["access_token"], "ask_create", {"title": "Still connected?"}))
+        assert ask["agent"] == "allen"
+        assert mcp(new, tokens["access_token"], "asks_mine").status_code == 401  # audience: the old domain
+        refreshed = old.post("/token", data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+                                             "client_id": legacy["client_id"]})
+        assert refreshed.status_code == 200, refreshed.text
+        mine = tool_result(mcp(old, refreshed.json()["access_token"], "asks_mine"))
+        assert [a["id"] for a in mine["asks"]] == [ask["id"]]
+        # a new connection on the public URL works there, and only there
+        fresh = connect(new, google, register(new)["client_id"], agent="Ogilvy")
+        assert tool_result(mcp(new, fresh["access_token"], "asks_mine"))["asks"] == []
+        assert mcp(old, fresh["access_token"], "asks_mine").status_code == 401
 
 
 def test_401_points_to_resource_metadata(hosted):

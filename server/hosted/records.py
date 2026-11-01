@@ -128,7 +128,7 @@ class DrivePool:
     def _credentials(self, sub: str) -> tuple[str, str, str]:
         refresh = self.accounts.google_refresh(sub)
         if not refresh:
-            raise DriveError("this account has not allowed Qtracker to use its Google Drive yet", reason="not_linked")
+            raise DriveError("this account has not allowed AskHooman to use its Google Drive yet", reason="not_linked")
         return self.client_id, self.client_secret, refresh
 
     def records(self, sub: str) -> "UserRecords":
@@ -187,7 +187,7 @@ class UserRecords:
             if exc.reason in ("not_linked", "invalid_grant"):
                 if exc.reason == "invalid_grant":
                     self.accounts.unlink_google(self.sub)
-                raise Unavailable("Qtracker can't reach this account's Google Drive: its owner must allow access "
+                raise Unavailable("AskHooman can't reach this account's Google Drive: its owner must allow access "
                                   f"at {self.pool.link_url} (or connect an agent again)") from None
             log.warning("Drive call failed: %s", exc)
             raise Unavailable("Google Drive is not available right now, try again") from None

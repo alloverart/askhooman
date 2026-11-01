@@ -173,6 +173,16 @@ def test_settings_from_env(tmp_dir):
     for bad in ("http://qtracker.allover.art", "https://x.example/path", ""):
         with pytest.raises(ConfigError):
             public_url(bad)
+    # unset: the product's domain; aliases (the domain before the rename) are canonical, deduplicated, never the URL
+    aliases = "HTTPS://Qtracker.Allover.art:443/, https://askhooman.com, https://qtracker.allover.art"
+    default = HostedSettings.from_env({**env, "ASKS_PUBLIC_URL": "", "ASKS_PUBLIC_URL_ALIASES": aliases})
+    assert default.public_url == "https://askhooman.com" and default.aliases == ("https://qtracker.allover.art",)
+    assert default.origin("qtracker.allover.art") == "https://qtracker.allover.art"
+    assert default.origin("QTRACKER.ALLOVER.ART:443") == "https://qtracker.allover.art"
+    for other in ("askhooman.com", "evil.example", "", None, "bad host:x"):
+        assert default.origin(other) == "https://askhooman.com"
+    with pytest.raises(ConfigError, match="ASKS_PUBLIC_URL_ALIASES"):
+        HostedSettings.from_env({**env, "ASKS_PUBLIC_URL_ALIASES": "http://qtracker.allover.art"})
     with pytest.raises(ConfigError):
         HostedSettings.from_env({**env, "ASKS_GOOGLE_APP_CLIENT_IDS": ""})
 
