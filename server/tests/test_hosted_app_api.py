@@ -1,6 +1,7 @@
 """Hosted bridge: the App API (Google ID tokens), agent keys and webhooks."""
 
 import json
+import logging
 import time
 
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -8,8 +9,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from server.hosted.webhooks import verify
 
 from .fake_drive import app_action
-from .fake_google import WEB_CLIENT_ID
+from .fake_google import DRIVE_SCOPE, GRANT_SCOPES, WEB_CLIENT_ID
 from .hosted_support import (
+    DENIS_EMAIL,
     DENIS_SUB,
     OLGA_SUB,
     PUBLIC,
@@ -151,6 +153,128 @@ def test_webhook_gives_up_on_4xx(hosted, google):
     assert hosted.app.state.webhooks.flush(5)
     assert len(google.webhook_calls) == 1
     assert json.loads(google.webhook_calls[0].content)["resolution"] == "Not relevant (Denis)"
+
+
+# ---------- the web app's Drive token (POST /api/drive/token) ----------
+
+def link_drive(client, google, sub: str = DENIS_SUB, email: str = DENIS_EMAIL) -> None:
+    """The user allows Drive at /oauth/link (Google sign-in only): the bridge stores a new grant."""
+    start = client.get("/oauth/link", follow_redirects=False)
+    linked = client.get(google.sign_in(start.headers["location"], sub, email))
+    assert linked.status_code == 200 and "Google Drive linked" in linked.text
+
+
+def web_refreshes(google) -> list[dict]:
+    """Google refreshes for the web app's token (the bridge's own Drive calls ask for no particular scope)."""
+    return [r for r in google.refreshes if r["scope"] is not None]
+
+
+def drive_token(client, google, sub: str = DENIS_SUB):
+    response = client.post("/api/drive/token", headers=id_token(google, sub=sub))
+    if response.status_code != 401:  # (RequestGuard's 401 is not this route's)
+        assert response.headers["cache-control"] == "no-store" and response.headers["pragma"] == "no-cache"
+    return response
+
+
+def test_drive_token_for_the_web_app(hosted, google, caplog):
+    """A Drive token made with the user's own grant at the bridge, asked for drive.appdata only, and handed out
+    again while it has a quarter of an hour left; only the App API's ID token gets one."""
+    assert hosted.post("/api/drive/token").status_code == 401
+    none = drive_token(hosted, google)  # no grant at the bridge yet: the app falls back to Google's window
+    assert none.status_code == 409 and none.json()["error"] == "not_linked"
+    assert f"{PUBLIC}/oauth/link" in none.json()["detail"] and google.refreshes == []
+
+    tokens = connect(hosted, google, register(hosted)["client_id"])  # connecting an agent stores the grant
+    agent = {"Authorization": f"Bearer {tokens['access_token']}"}
+    assert hosted.post("/api/drive/token", headers=agent).status_code == 401  # an agent's token is not the app's
+    cache = hosted.app.state.drive_tokens
+    start = time.monotonic()
+    cache.clock = lambda: start
+    with caplog.at_level(logging.DEBUG):
+        first = drive_token(hosted, google)
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert set(body) == {"access_token", "expires_in", "scope"} and body["scope"] == DRIVE_SCOPE
+    assert body["expires_in"] == 3599 and google.access_tokens[body["access_token"]] == DENIS_SUB
+    assert google.refreshes == [{"sub": DENIS_SUB, "scope": DRIVE_SCOPE}]  # drive.appdata only
+    assert body["access_token"] not in caplog.text + json.dumps(hosted.store.all("users"))
+    # the token reads the user's appDataFolder, where the agents' asks are
+    ask = tool_result(mcp(hosted, tokens["access_token"], "ask_create", {"title": "Seen from the web?"}))
+    files = hosted.app.state.pool.http.get(
+        "https://www.googleapis.com/drive/v3/files", headers={"Authorization": f"Bearer {body['access_token']}"},
+        params={"spaces": "appDataFolder", "q": "name contains 'ask-' and trashed = false",
+                "fields": "nextPageToken,files(id,name,appProperties,modifiedTime)"})
+    assert files.status_code == 200 and f"ask-{ask['id']}.json" in files.text
+
+    cache.clock = lambda: start + 600  # still 49 minutes left: the same token, Google isn't asked
+    again = drive_token(hosted, google).json()
+    assert again["access_token"] == body["access_token"] and again["expires_in"] == 2999
+    assert len(web_refreshes(google)) == 1
+    cache.clock = lambda: start + 3599 - 899  # less than 15 minutes left: a new one
+    fresh = drive_token(hosted, google).json()
+    assert fresh["access_token"] != body["access_token"] and fresh["expires_in"] == 3599
+    assert len(web_refreshes(google)) == 2
+    # another user never gets Denis's token
+    olga = drive_token(hosted, google, sub=OLGA_SUB)
+    assert olga.status_code == 409 and olga.json()["error"] == "not_linked" and len(web_refreshes(google)) == 2
+
+
+def test_drive_token_after_the_grant_was_revoked(hosted, google):
+    """Google says invalid_grant: 409, the dead grant is forgotten (connect-info says so) and Google isn't asked
+    again; linking Drive again heals it, and a token of the old grant is never handed out after a new link."""
+    connect(hosted, google, register(hosted)["client_id"])
+    old = drive_token(hosted, google).json()["access_token"]
+    for refresh, sub in google.refresh_tokens.items():
+        if sub == DENIS_SUB:
+            google.revoked_refresh.add(refresh)
+    hosted.app.state.drive_tokens.forget(DENIS_SUB)  # another instance, without the cached token
+    revoked = drive_token(hosted, google)
+    assert revoked.status_code == 409 and revoked.json()["error"] == "invalid_grant", revoked.text
+    assert hosted.get("/api/connect-info", headers=id_token(google)).json()["drive_linked"] is False
+    asked = len(google.refreshes)
+    assert drive_token(hosted, google).json()["error"] == "not_linked" and len(google.refreshes) == asked
+
+    link_drive(hosted, google)
+    healed = drive_token(hosted, google)
+    assert healed.status_code == 200 and healed.json()["access_token"] != old
+    # a new link (a new grant): the cached token of the previous one isn't reused
+    link_drive(hosted, google)
+    relinked = drive_token(hosted, google).json()["access_token"]
+    assert relinked != healed.json()["access_token"] and len(google.refreshes) == asked + 2
+
+
+def test_drive_token_when_google_fails_or_is_hammered(hosted, google):
+    """Google unreachable or failing: 503 (try again later), the grant is kept; refreshes are limited per user, so
+    a client looping on the endpoint can't make the bridge hammer Google."""
+    connect(hosted, google, register(hosted)["client_id"])
+    google.refresh_status = 503
+    failed = drive_token(hosted, google)
+    assert failed.status_code == 503 and failed.headers["retry-after"] == "30"
+    assert hosted.get("/api/connect-info", headers=id_token(google)).json()["drive_linked"] is True
+    for _ in range(9):
+        assert drive_token(hosted, google).status_code == 503
+    limited = drive_token(hosted, google)
+    assert limited.status_code == 429 and limited.headers["retry-after"] == "600"
+    assert len(google.refreshes) == 10  # the 11th call didn't reach Google
+    assert drive_token(hosted, google, sub=OLGA_SUB).status_code == 409  # per user
+
+
+def test_drive_token_scope_when_google_wont_narrow(hosted, google):
+    """If Google refused a refresh for fewer scopes, the token carries the whole grant (what the web app's own
+    token has too); the response says which."""
+    connect(hosted, google, register(hosted)["client_id"])
+    google.narrows = False
+    body = drive_token(hosted, google).json()
+    assert body["scope"].split() == list(GRANT_SCOPES)
+    assert [r["scope"] for r in google.refreshes] == [DRIVE_SCOPE, None]
+
+
+def test_drive_token_forgotten_with_the_account(hosted, google):
+    connect(hosted, google, register(hosted)["client_id"])
+    assert drive_token(hosted, google).status_code == 200
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    gone = drive_token(hosted, google)  # a new, empty account: nothing cached is handed out
+    assert gone.status_code == 409 and gone.json()["error"] == "not_linked"
 
 
 # ---------- the public site: landing page and the icon kit ----------

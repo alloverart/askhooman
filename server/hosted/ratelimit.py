@@ -19,6 +19,7 @@ LIMITS = {
     "register": (10, 60.0),
     "revoke": (30, 60.0),
     "app": (120, 60.0),
+    "drive_token": (10, 600.0),  # Google refreshes for the web app's Drive token, per user (app_api.DriveTokens)
     "agent": (300, 60.0),  # MCP/REST requests of one agent
     "user": (1200, 60.0),  # MCP/REST requests of all agents of one user
     "bearer_fail": (60, 60.0),  # failed bearer checks from one address

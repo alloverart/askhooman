@@ -3,6 +3,7 @@
 - The bridge's sign-in leg (SPEC v4 "Login = Google as the upstream IdP"): the project's Web application client,
   authorization code + PKCE + state + nonce, scopes openid email drive.appdata, access_type=offline.
 - Revocation of the refresh token the bridge holds for a user, when they delete their account (best effort).
+- Refreshing that token for a Drive access token the web app can use (POST /api/drive/token, app_api.py).
 - Google ID tokens: signature (RS256, Google's published keys, cached per Cache-Control), iss, aud, exp, iat;
   used both for the sign-in leg (aud = the Web client) and for the App API (aud = the iOS client).
 No token or secret appears in an error message or log line.
@@ -20,6 +21,7 @@ AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 REVOKE_TIMEOUT = 5.0  # seconds: revocation is best effort and must not hold up an account deletion
+REFRESH_TIMEOUT = 10.0  # seconds: the web app waits for this answer
 CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 ISSUERS = ("https://accounts.google.com", "accounts.google.com")
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
@@ -30,11 +32,16 @@ CERTS_REFETCH_MIN = 60.0  # an unknown key id refetches the keys at most this of
 
 
 class GoogleError(Exception):
-    """A refused or failed call to Google, or an invalid ID token. `public` is safe to show to the user."""
+    """A refused or failed call to Google, or an invalid ID token. `public` is safe to show to the user.
+    reason: Google's error code from the token endpoint (e.g. "invalid_grant"); transient: Google was unreachable
+    or overloaded (network error, 5xx, 429), so trying again later may work."""
 
-    def __init__(self, message: str, public: str = "Google sign-in failed"):
+    def __init__(self, message: str, public: str = "Google sign-in failed", reason: str = "",
+                 transient: bool = False):
         super().__init__(message)
         self.public = public
+        self.reason = reason
+        self.transient = transient
 
 
 def _max_age(cache_control: str) -> float | None:
@@ -100,6 +107,31 @@ class GoogleOAuth:
         if response.status_code != 200 or not isinstance(body, dict) or not body.get("id_token"):
             error = str(body.get("error", "")) if isinstance(body, dict) else ""
             raise GoogleError(f"Google refused the sign-in code (HTTP {response.status_code} {error})")
+        return body
+
+    def refresh(self, refresh_token: str, scope: str | None = None) -> dict:
+        """A new access token from a refresh token of this client: Google's token response {access_token,
+        expires_in, scope, ...}. `scope` asks for less than the grant holds (RFC 6749 §6); read the response's
+        `scope` for what the token really carries. GoogleError with Google's error code as `reason`
+        ("invalid_grant": the grant was revoked or has expired)."""
+        data = {"client_id": self.client_id, "client_secret": self.client_secret, "refresh_token": refresh_token,
+                "grant_type": "refresh_token"}
+        if scope:
+            data["scope"] = scope
+        try:
+            response = self.http.post(TOKEN_URL, data=data, timeout=REFRESH_TIMEOUT)
+        except httpx.HTTPError as exc:
+            raise GoogleError(f"Google token endpoint unreachable: {type(exc).__name__}",
+                              "Google could not be reached; try again", transient=True) from None
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if response.status_code != 200 or not isinstance(body, dict) or not isinstance(body.get("access_token"), str):
+            error = str(body.get("error", "")) if isinstance(body, dict) else ""
+            raise GoogleError(f"Google refused the token refresh (HTTP {response.status_code} {error})",
+                              "Google refused the request", reason=error,
+                              transient=response.status_code >= 500 or response.status_code == 429)
         return body
 
     def revoke(self, token: str) -> bool:

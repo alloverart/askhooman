@@ -8,6 +8,10 @@
   GET    /api/connect-info       the MCP URL and per-client setup snippets
   POST   /api/events             {ask_id, kind: answered|closed|reopened} after the user acted in the app
                                  -> the asking agent's webhook is called (webhooks.py)
+  POST   /api/drive/token        a Drive access token (drive.appdata) made with the Google grant the bridge holds for
+                                 the user, so the web app keeps reading their Drive after its own token ran out
+                                 (DriveTokens) -> {access_token, expires_in, scope}; 409 {detail, error} without a
+                                 usable grant (error: not_linked | invalid_grant)
   DELETE /api/me                 Delete Account: revoke the bridge's Google grant (best effort), delete everything
                                  the server keeps for the user -> 204; nothing left to delete -> 404.
                                  The asks and tasks in the user's Drive stay (they are the user's files).
@@ -18,12 +22,15 @@ in ASKS_CORS_ORIGINS (AppCors); empty by default, then CORS stays closed.
 """
 
 import logging
+import threading
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import Headers, MutableHeaders
 
@@ -33,7 +40,7 @@ from ..rules import Conflict, Invalid, NotFound
 from .accounts import Accounts, NameTaken, agent_json
 from .config import HostedSettings
 from .crypto import CryptoError
-from .google import GoogleOAuth
+from .google import DRIVE_SCOPE, GoogleError, GoogleOAuth
 from .ratelimit import RateLimiter
 from .records import DrivePool, HostedAsks
 from .webhooks import WebhookSender, check_webhook_url
@@ -41,6 +48,11 @@ from .webhooks import WebhookSender, check_webhook_url
 log = logging.getLogger("asks.hosted.app_api")
 
 EVENT_STATUS = {"answered": "answered", "closed": "closed", "reopened": "open"}
+DRIVE_TOKEN_PATH = "/api/drive/token"
+DRIVE_TOKEN_REUSE = 15 * 60  # seconds: a cached Drive token with at least this long left is handed out again
+DRIVE_TOKEN_USERS = 10000  # users whose Drive token one instance keeps
+DRIVE_TOKEN_STRIPES = 64
+NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
 
 @dataclass(frozen=True)
@@ -52,8 +64,8 @@ class AppUser:
 
 def is_app_path(path: str, method: str = "GET") -> bool:
     """App API requests (Google ID tokens); the other /api/* are the agents' (OAuth access tokens, agent keys)."""
-    return (path == "/api/agents" or path.startswith("/api/agents/") or path in ("/api/connect-info", "/api/events")
-            or is_account_deletion(path, method))
+    return (path == "/api/agents" or path.startswith("/api/agents/")
+            or path in ("/api/connect-info", "/api/events", DRIVE_TOKEN_PATH) or is_account_deletion(path, method))
 
 
 def is_account_deletion(path: str, method: str) -> bool:
@@ -111,6 +123,122 @@ class AppCors:
         await self.app(scope, receive, send_with_cors)
 
 
+class NoDriveGrant(Exception):
+    """The bridge holds no usable Google grant for the user. error: not_linked (none stored) or invalid_grant
+    (Google said it was revoked or expired; it is forgotten, as when an agent's call finds it dead)."""
+
+    def __init__(self, error: str, detail: str):
+        super().__init__(detail)
+        self.error = error
+        self.detail = detail
+
+
+class DriveTokens:
+    """Drive access tokens for the web app (POST /api/drive/token), made with the Google grant the bridge holds for
+    the user (from connecting an agent, or /oauth/link). The browser's own Drive token lives an hour and Google opens
+    its window for a new one only from a click; this one needs no click. Both OAuth clients belong to one Google
+    Cloud project, so the token reaches the same appDataFolder. Google is asked for drive.appdata only.
+
+    Per instance, a user's token is handed out again while it has DRIVE_TOKEN_REUSE left and the grant it came from
+    is still the stored one; calls to Google are serialised per user and limited per user ("drive_token" in
+    ratelimit.py), so a client can't make the bridge hammer Google. Tokens live in memory only, never in the store
+    or a log line."""
+
+    def __init__(self, accounts: Accounts, google: GoogleOAuth, limiter: RateLimiter, link_url: str,
+                 clock=time.monotonic, size: int = DRIVE_TOKEN_USERS):
+        self.accounts = accounts
+        self.google = google
+        self.limiter = limiter
+        self.link_url = link_url
+        self.clock = clock
+        self.size = size
+        # sub -> (access token, expires at on self.clock, scope, google_linked_at of the grant it came from)
+        self._held: OrderedDict[str, tuple[str, float, str, str]] = OrderedDict()
+        self._lock = threading.Lock()
+        self._stripes = [threading.Lock() for _ in range(DRIVE_TOKEN_STRIPES)]
+
+    def get(self, sub: str) -> dict:
+        """{access_token, expires_in, scope} for the user's own grant; NoDriveGrant, or HTTPException 429 / 503."""
+        with self._stripes[hash(sub) % DRIVE_TOKEN_STRIPES]:
+            user = self.accounts.user(sub) or {}
+            if not user.get("google_refresh"):
+                self.forget(sub)
+                raise NoDriveGrant("not_linked", "AskHooman's server has no access to this account's Google Drive "
+                                                 f"(connect an agent, or allow it at {self.link_url})")
+            linked_at = str(user.get("google_linked_at") or "")
+            now = self.clock()
+            with self._lock:
+                held = self._held.get(sub)
+                if held is not None:
+                    self._held.move_to_end(sub)
+            if held is not None and held[3] == linked_at and held[1] - now >= DRIVE_TOKEN_REUSE:
+                return self._reply(held, now)
+            if not self.limiter.allow("drive_token", sub):
+                raise HTTPException(429, "too many Drive token requests",
+                                    headers={"Retry-After": str(self.limiter.retry_after("drive_token")), **NO_STORE})
+            try:
+                refresh = self.accounts.google_refresh(sub)
+            except CryptoError:  # sealed with a key that is no longer configured: unusable until linked again
+                refresh = None
+            if not refresh:
+                raise NoDriveGrant("not_linked", "AskHooman's server can't use its Google Drive access for this "
+                                                 f"account (allow it again at {self.link_url})")
+            try:
+                body = self._refresh(refresh)
+            except GoogleError as exc:
+                if exc.reason == "invalid_grant":
+                    self._forget_grant(sub, refresh)
+                    raise NoDriveGrant("invalid_grant", "Google ended AskHooman's server access to this account's "
+                                                        f"Drive (allow it again at {self.link_url})") from None
+                log.warning("no Drive token for the web app: %s", exc)
+                raise HTTPException(503, "Google is not available right now, try again",
+                                    headers={"Retry-After": "30", **NO_STORE}) from None
+            scope = str(body.get("scope") or DRIVE_SCOPE)
+            if DRIVE_SCOPE not in scope.split():
+                raise NoDriveGrant("not_linked", "AskHooman's server has no Google Drive access for this account "
+                                                 f"(allow it at {self.link_url})")
+            try:
+                lifetime = float(body.get("expires_in", 3600))
+            except (TypeError, ValueError):
+                lifetime = 3600.0
+            held = (body["access_token"], now + lifetime, scope, linked_at)
+            with self._lock:
+                self._held[sub] = held
+                self._held.move_to_end(sub)
+                while len(self._held) > self.size:
+                    self._held.popitem(last=False)
+            return self._reply(held, now)
+
+    def _refresh(self, refresh: str) -> dict:
+        try:
+            return self.google.refresh(refresh, DRIVE_SCOPE)
+        except GoogleError as exc:
+            if exc.reason != "invalid_scope":
+                raise
+        # Google wouldn't narrow it: the token then carries the whole grant, openid email drive.appdata (the
+        # scopes the web app's own token has too).
+        return self.google.refresh(refresh)
+
+    def _forget_grant(self, sub: str, refresh: str) -> None:
+        """Google said the grant is dead: forget it (the app can offer to link again), unless the user linked a new
+        one meanwhile."""
+        self.forget(sub)
+        try:
+            current = self.accounts.google_refresh(sub)
+        except CryptoError:
+            current = None
+        if current == refresh:
+            self.accounts.unlink_google(sub)
+
+    @staticmethod
+    def _reply(held: tuple[str, float, str, str], now: float) -> dict:
+        return {"access_token": held[0], "expires_in": max(int(held[1] - now), 0), "scope": held[2]}
+
+    def forget(self, sub: str) -> None:
+        with self._lock:
+            self._held.pop(sub, None)
+
+
 class AgentPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = None
@@ -156,6 +284,8 @@ def connect_info(settings: HostedSettings, drive_linked: bool) -> dict:
 
 def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool: DrivePool,
                 webhooks: WebhookSender, limiter: RateLimiter, google: GoogleOAuth) -> None:
+    drive_tokens = DriveTokens(accounts, google, limiter, f"{settings.public_url}/oauth/link")
+    app.state.drive_tokens = drive_tokens
 
     def app_user(request: Request) -> AppUser:
         user = request.scope.get(IDENTITY_SCOPE_KEY)  # set by RequestGuard from the ID token
@@ -240,10 +370,21 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             queued += 1
         return {"queued": queued}
 
+    @app.post(DRIVE_TOKEN_PATH)
+    def drive_token(user: AppUser = Depends(app_user)):
+        """The web app's Drive access after its own token ran out, without Google's window. Never cached by the
+        browser or a proxy; 409 tells the app to fall back to "Continue with Google"."""
+        try:
+            token = drive_tokens.get(user.sub)
+        except NoDriveGrant as exc:
+            return JSONResponse({"detail": exc.detail, "error": exc.error}, status_code=409, headers=NO_STORE)
+        return JSONResponse(token, headers=NO_STORE)
+
     @app.delete("/api/me", status_code=204, response_class=Response)
     def delete_account(user: AppUser = Depends(app_user)):
         """Delete Account. Google first (so the bridge loses Drive access even if the store fails halfway; a retry
-        finds the account again), then everything in the store, then the Drive client cached in this instance."""
+        finds the account again), then everything in the store, then the Drive client and the web app's Drive token
+        cached in this instance."""
         try:
             refresh = accounts.google_refresh(user.sub)
         except CryptoError:  # sealed with a key that is no longer configured: nothing usable to revoke
@@ -252,6 +393,7 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             log.warning("Google did not confirm revoking a deleted account's grant (unreachable or already revoked)")
         found = accounts.delete_user(user.sub)
         pool.forget(user.sub)
+        drive_tokens.forget(user.sub)
         if not found:
             raise NotFound("no account to delete: it was already deleted")
         return Response(status_code=204)

@@ -26,6 +26,7 @@ WEB_CLIENT_ID = "922-web.apps.googleusercontent.com"
 WEB_CLIENT_SECRET = "GOCSPX-web-secret-SECRET"
 IOS_CLIENT_ID = "922-ios.apps.googleusercontent.com"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
+GRANT_SCOPES = ("openid", "https://www.googleapis.com/auth/userinfo.email", DRIVE_SCOPE)  # a sign-in grant's
 
 
 def s256(verifier: str) -> str:
@@ -45,6 +46,9 @@ class FakeGoogle:
         self.revoked_refresh: set[str] = set()
         self.revocations: list[str] = []  # every token the bridge asked Google to revoke
         self.revoke_status: int | None = None  # set to make the revocation endpoint fail (e.g. 503)
+        self.refreshes: list[dict] = []  # every refresh grant the bridge asked for: {sub, scope}
+        self.refresh_status: int | None = None  # set to make refreshes fail (e.g. 503)
+        self.narrows = True  # a refresh may ask for fewer scopes than the grant has (False: invalid_scope)
         self.auth_requests: list[dict] = []  # params of every authorization URL the bridge sent a user to
         self.lock = threading.RLock()
         # the public internet seen by the bridge (CIMD documents, webhook receivers)
@@ -140,11 +144,19 @@ class FakeGoogle:
             if form.get("grant_type") == "refresh_token":
                 refresh = form.get("refresh_token", "")
                 sub = self.refresh_tokens.get(refresh)
+                self.refreshes.append({"sub": sub, "scope": form.get("scope")})
+                if self.refresh_status is not None:
+                    return httpx.Response(self.refresh_status, json={"error": "backend_error"})
                 if sub is None or refresh in self.revoked_refresh:
                     return httpx.Response(400, json={"error": "invalid_grant",
                                                      "error_description": "Token has been expired or revoked."})
+                scope = " ".join(GRANT_SCOPES)
+                if form.get("scope"):  # RFC 6749 §6: the same scopes or fewer
+                    if not self.narrows or not set(form["scope"].split()) <= set(GRANT_SCOPES):
+                        return httpx.Response(400, json={"error": "invalid_scope"})
+                    scope = form["scope"]
                 return httpx.Response(200, json={"access_token": self._access(sub), "expires_in": 3599,
-                                                 "token_type": "Bearer", "scope": DRIVE_SCOPE})
+                                                 "token_type": "Bearer", "scope": scope})
         return httpx.Response(400, json={"error": "unsupported_grant_type"})
 
     def _revoke(self, request: httpx.Request) -> httpx.Response:

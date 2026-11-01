@@ -2,8 +2,9 @@
 
   /mcp                  MCP (streamable HTTP, stateless) for agents: OAuth access tokens or agent keys
   /api/asks, /api/tasks the same REST as the single-tenant bridge, for agents (same tokens as /mcp)
-  /api/agents…, /api/connect-info, /api/events, DELETE /api/me   the App API (Google ID tokens), app_api.py;
-                        the only routes with CORS, and only for the origins in ASKS_CORS_ORIGINS
+  /api/agents…, /api/connect-info, /api/events, /api/drive/token, DELETE /api/me
+                        the App API (Google ID tokens), app_api.py; the only routes with CORS, and only for the
+                        origins in ASKS_CORS_ORIGINS
   /authorize, /token, /register, /revoke, /oauth/…, /.well-known/…   the authorization server, oauth.py
   /healthz
 
