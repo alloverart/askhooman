@@ -1,6 +1,7 @@
 """The public face of AskHooman (askhooman.com): the landing page at /, the privacy policy at /privacy, the support
 page at /support, and the icon kit next to them (favicons, touch icon, web manifest, link-preview image) from
-server/hosted/static/, copied from design/icon-kit/03_Website_PWA.
+server/hosted/static/, copied from 03_Website_PWA of the AskHooman icon kit (the haloed hooman with a pink and a
+blue agent).
 
 Files are read once at startup; a missing one fails the deploy, not a request. No scripts and no external assets
 anywhere: the pages carry the same Content-Security-Policy as the consent pages.
@@ -24,7 +25,7 @@ TYPES = {".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon",
          ".webmanifest": "application/manifest+json"}
 FILES = ("favicon.ico", "favicon.svg", "favicon-32x32.png", "apple-touch-icon.png", "icon-192x192.png",
          "icon-512x512.png", "icon-maskable-192x192.png", "icon-maskable-512x512.png", "site.webmanifest",
-         "og-image-1200x630.png", "brandmark.svg")
+         "og-image-1200x630.png", "brandmark.svg", "icon-96x96.png")
 FILE_HEADERS = {
     "Cache-Control": "public, max-age=86400",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",  # an SVG never runs anything
@@ -48,10 +49,18 @@ LIMITED_USE = ("AskHooman's use and transfer to any other app of information rec
 DELETE_DRIVE_DATA = "Delete hidden app data"  # the button's name in Google Drive's Manage apps
 
 STYLE = """
-:root{color-scheme:light dark;--bg:#f5f6fb;--card:#fff;--fg:#141a33;--muted:#5b6280;--line:#dfe2ee;--accent:#2a3fd6;
---code:#eef0f8;--hero1:#078faf;--hero2:#102c99;--hero3:#3d15cf}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1020;--card:#161a2e;--fg:#eef0fa;--muted:#a3a9c4;--line:#2a2f4a;
---accent:#8b9bff;--code:#1f2440}}
+:root{color-scheme:light dark;--bg:#f7f8fe;--card:#fff;--fg:#2b2650;--muted:#646184;--line:#e5e3f4;--accent:#5b45d0;
+--code:#f1eefc;--halo:#f2b83a;--hero:radial-gradient(120% 95% at 0% 100%,#b4eee2 0%,rgba(180,238,226,0) 55%),
+linear-gradient(140deg,#a9d8f9 0%,#cfe0fb 45%,#e6c6fa 100%);--hero-fg:#2b2650;--hero-muted:#47426e;--eyebrow:#6a3fcf;
+--cta-bg:#2b2650;--cta-fg:#fff;--ghost:rgba(43,38,80,.3);--ghost-bg:rgba(255,255,255,.5);
+--ring:0 0 0 6px rgba(255,255,255,.6),0 20px 44px rgba(91,69,208,.25);--pink-bg:#ffe3ee;--pink:#c4336f;
+--blue-bg:#e1f0ff;--blue:#2768c4;--gold-bg:#fff3d1;--gold:#946500;--mint-bg:rgba(64,200,175,.16);--mint:#0b7a66}
+@media (prefers-color-scheme:dark){:root{--bg:#14122a;--card:#1d1a36;--fg:#f1effc;--muted:#aba7cb;--line:#2f2b52;
+--accent:#b8a8ff;--code:#272350;--hero:radial-gradient(120% 95% at 0% 100%,rgba(64,170,160,.45) 0%,rgba(64,170,160,0) 55%),
+linear-gradient(140deg,#24496f 0%,#33386f 45%,#553a7f 100%);--hero-fg:#fff;--hero-muted:#dcd8f5;--eyebrow:#ffd57a;
+--cta-bg:#fff;--cta-fg:#2b2650;--ghost:rgba(255,255,255,.5);--ghost-bg:transparent;
+--ring:0 0 0 6px rgba(255,255,255,.12),0 20px 44px rgba(0,0,0,.45);--pink-bg:rgba(255,160,197,.16);--pink:#ffb3d0;
+--blue-bg:rgba(159,205,255,.16);--blue:#a9d3ff;--gold-bg:rgba(245,196,79,.16);--gold:#ffd57a;--mint:#7fe3cf}}
 *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:17px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
@@ -59,38 +68,39 @@ a{color:var(--accent)}code,pre{font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,C
 .wrap{max-width:960px;margin:0 auto;padding:0 20px}
 header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 0}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:inherit;text-decoration:none}
-.brand img{border-radius:7px}nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:15px}
+.brand img{border-radius:8px}nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:15px}
 nav a:hover{color:var(--fg)}
-.hero{background:linear-gradient(135deg,var(--hero1) 0%,var(--hero2) 47%,var(--hero3) 100%);color:#fff;
+.hero{background:var(--hero);color:var(--hero-fg);
 border-radius:28px;padding:56px 40px;display:flex;gap:40px;align-items:center;margin:8px 0 48px}
-.hero img{border-radius:28px;box-shadow:0 18px 40px rgba(3,8,40,.45);flex:none}
+.hero img{border-radius:28px;box-shadow:var(--ring);flex:none}
 .hero h1{font-size:44px;line-height:1.1;margin:0 0 14px;letter-spacing:-.5px}
-.hero p{font-size:19px;margin:0 0 24px;color:#e4e9ff;max-width:560px}
+.hero p{font-size:19px;margin:0 0 24px;color:var(--hero-muted);max-width:560px}
 .cta{display:flex;gap:12px;flex-wrap:wrap}.cta a{display:inline-block;padding:12px 20px;border-radius:12px;
-font-weight:600;text-decoration:none}.cta .primary{background:#fff;color:#102c99}
-.cta .ghost{border:1px solid rgba(255,255,255,.55);color:#fff}
+font-weight:600;text-decoration:none}.cta .primary{background:var(--cta-bg);color:var(--cta-fg)}
+.cta .ghost{border:1px solid var(--ghost);background:var(--ghost-bg);color:var(--hero-fg)}
 section{margin:0 0 52px}h2{font-size:28px;margin:0 0 8px;letter-spacing:-.3px}
 .lead{color:var(--muted);margin:0 0 22px;max-width:680px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px}
 .card h3{margin:0 0 6px;font-size:18px}.card p{margin:0;color:var(--muted);font-size:16px}
 .step{display:inline-flex;width:32px;height:32px;border-radius:10px;align-items:center;justify-content:center;
-background:var(--code);color:var(--accent);font-weight:700;margin-bottom:12px}
+background:var(--pink-bg);color:var(--pink);font-weight:700;margin-bottom:12px}
+.card:nth-child(2) .step{background:var(--blue-bg);color:var(--blue)}
+.card:nth-child(3) .step{background:var(--gold-bg);color:var(--gold)}
 .url{display:block;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;
 font-size:19px;font-weight:600;word-break:break-all;margin:0 0 18px}
 pre{background:var(--code);border-radius:10px;padding:10px 12px;margin:10px 0 0;white-space:pre-wrap;word-break:break-all}
 .soon{display:inline-block;font-size:13px;font-weight:600;color:var(--accent);background:var(--code);
 border-radius:999px;padding:2px 10px;margin-top:10px}
 .eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:13px!important;font-weight:700;
-color:#b9c6ff!important;margin:0 0 10px!important}
-.letter{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:18px;
+color:var(--eyebrow)!important;margin:0 0 10px!important}
+.letter{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--halo);border-radius:18px;
 padding:24px 28px;max-width:760px}
 .letter p,.letter li{margin:0 0 10px}.letter ol{padding-left:22px;margin:0 0 10px}
 .letter .sig{color:var(--muted);font-size:15px;margin:14px 0 0}
-.soon.now{color:#0f8a5f;background:rgba(18,170,110,.12)}
-.closing{text-align:center;background:var(--card);border:1px solid var(--line);border-radius:24px;padding:40px 24px}
-.closing p{color:var(--muted);margin:0 0 20px}.closing .cta{justify-content:center}
-.closing .primary{background:var(--accent);color:#fff}.closing .ghost{border-color:var(--line);color:var(--fg)}
+.soon.now{color:var(--mint);background:var(--mint-bg)}
+.closing{text-align:center;background:var(--hero);color:var(--hero-fg);border-radius:24px;padding:40px 24px}
+.closing p{color:var(--hero-muted);margin:0 0 20px}.closing .cta{justify-content:center}
 .doc{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:32px 36px;margin:8px 0 48px}
 .doc h1{font-size:34px;margin:0 0 6px}.doc h2{font-size:21px;margin:28px 0 6px}.doc p,.doc li{color:var(--fg)}
 .doc .muted{color:var(--muted)}.doc ul{padding-left:22px}.doc a,.doc code{overflow-wrap:anywhere}
@@ -117,10 +127,11 @@ def site_page(title: str, body: str, canonical: str, head: str = "") -> HTMLResp
     page's URL under the public URL (the same pages are served on alias hosts)."""
     html = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-            f'<title>{escape(title)}</title>{ICONS}<meta name="theme-color" content="#091C72">'
+            f'<title>{escape(title)}</title>{ICONS}<meta name="theme-color" content="#a9d8f9" media="(prefers-color-scheme: light)">'
+            f'<meta name="theme-color" content="#14122a" media="(prefers-color-scheme: dark)">'
             f'<link rel="canonical" href="{escape(canonical)}">{head}'
             f'<style>{STYLE}</style></head><body><div class="wrap">'
-            f'<header class="top"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="28" height="28">'
+            f'<header class="top"><a class="brand" href="/"><img src="/icon-96x96.png" alt="" width="28" height="28">'
             f'AskHooman</a><nav><a href="/#connect">Connect</a><a href="/privacy">Privacy</a><a class="more" href="/support">Support</a>'
             f'<a class="more" href="{GITHUB}">GitHub</a></nav></header>'
             f'<main>{body}</main>'

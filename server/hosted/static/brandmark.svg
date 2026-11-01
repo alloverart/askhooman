@@ -1,18 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Questions tracker icon">
-      <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#078FAF"/><stop offset=".47" stop-color="#102C99"/><stop offset="1" stop-color="#3D15CF"/></linearGradient>
-      <linearGradient id="robot" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#43DFFE"/><stop offset="1" stop-color="#3460E8"/></linearGradient>
-      <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FFFFFF"/><stop offset="1" stop-color="#E2EEFF"/></linearGradient>
-      <linearGradient id="mint" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#24E1C9"/><stop offset="1" stop-color="#008D91"/></linearGradient></defs>
-      
-      <rect x="150" y="163" width="263" height="258" rx="49" fill="#21A7FE" opacity=".46" />
-      <path d="M126 167 Q126 130 165 130 H359 Q400 130 400 174 V350 Q400 388 357 388 H219 L161 434 Q144 445 144 424 V388 Q126 383 126 350 Z" fill="url(#panel)"/>
-      <path d="M210 242 C198 207 211 188 252 186 C293 184 313 208 310 236 C308 256 287 268 271 282 C257 295 256 308 256 315" fill="none" stroke="#1430B9" stroke-width="29" stroke-linecap="round"/>
-      <circle cx="255" cy="343" r="17" fill="#1430B9"/>
-      <g><circle cx="161" cy="153" r="55" fill="url(#robot)" stroke="#87E9FF" stroke-width="3"/>
-      <rect x="124" y="131" width="74" height="44" rx="20" fill="#11268E"/>
-      <circle cx="147" cy="152" r="7" fill="#B8FAFF"/><circle cx="177" cy="152" r="7" fill="#B8FAFF"/>
-      <path d="M161 111 V102" stroke="#EFFFFF" stroke-width="9" stroke-linecap="round"/>
-      <circle cx="161" cy="99" r="10" fill="#EFFFFF"/></g>
-      <circle cx="380" cy="368" r="62" fill="url(#mint)" stroke="#71F5EE" stroke-width="5"/>
-      <path d="M347 369 L370 391 L412 344" fill="none" stroke="white" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<defs><linearGradient id="a" x2="1" y2="1"><stop stop-color="#a9d8f9"/><stop offset="1" stop-color="#e6c6fa"/></linearGradient></defs>
+<rect width="64" height="64" rx="13" fill="url(#a)"/>
+<path d="M22 16c4-7 15-8 20 0 4 3 5 9 3 13-1 12-8 18-14 18S17 41 17 30c-2-7 0-12 5-14" fill="#8d4e42"/>
+<ellipse cx="32" cy="33" rx="14" ry="16" fill="#ffd2ab"/>
+<path d="M23 30q4 3 8 0 M34 30q4 3 7 0 M28 39q4 3 8 0" stroke="#734239" stroke-linecap="round" stroke-width="2.3" fill="none"/>
+<rect x="5" y="42" width="16" height="13" rx="6" fill="#ffa0c5"/><rect x="43" y="42" width="16" height="13" rx="6" fill="#9fcdff"/>
+<path d="M10 47q2-3 5 0 M48 47q3-3 6 0" stroke="#574169" stroke-width="1.8" fill="none"/>
+<path d="M26 12L22 7 M33 9V5 M40 12L44 7" stroke="#f5c44f" stroke-width="3" stroke-linecap="round"/>
+</svg>
