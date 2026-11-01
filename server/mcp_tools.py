@@ -87,9 +87,6 @@ TaskStatusFilter = Annotated[str, Field(description="open (active + waiting), ac
                                                     "finished (done + dropped) or all")]
 TaskResolution = Annotated[str, Field(description="One line: the result, or why it is no longer needed")]
 
-READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
-
-
 def caller(ctx: Context) -> Identity:
     request = ctx.request_context.request
     identity = request.scope.get(IDENTITY_SCOPE_KEY) if request is not None else None
@@ -144,11 +141,17 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     else:
         mcp = MCPServer("asks", version="0.1.0", instructions=INSTRUCTIONS, subscriptions=False)
 
-    def tool(**kwargs):
-        """mcp.tool with the docstring's ${...} words filled in for this mode."""
+    def tool(title: str, *, read_only: bool = False):
+        """mcp.tool with the docstring's ${...} words filled in for this mode, a title and explicit hints: the
+        Connectors Directory wants both on every tool, and Claude reads them for auto-permissions (read-only tools
+        run without asking). No tool is destructive: nothing is ever deleted, every change stays in the record's
+        history, and a closed ask or a finished task comes back with reopen."""
+        annotations = ToolAnnotations(title=title, readOnlyHint=read_only, destructiveHint=False,
+                                      idempotentHint=read_only, openWorldHint=False)
+
         def register(fn):
             fn.__doc__ = Template(fn.__doc__).substitute(words)
-            return mcp.tool(**kwargs)(fn)
+            return mcp.tool(title=title, annotations=annotations)(fn)
         return register
 
     def ask_service(who: Identity) -> AskService:
@@ -161,7 +164,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         description=f"One decision, phrased as a question {words['human']} can answer in one tap (≤200 chars)")]
 
     # The [] defaults are never mutated; they make the published schema say "default: []".
-    @tool()
+    @tool("Ask a question")
     def ask_create(
         title: Title,
         ctx: Context,
@@ -186,14 +189,14 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         who = caller(ctx)
         return call(ask_service(who).create, who, data)
 
-    @tool(annotations=READ_ONLY)
+    @tool("My questions and answers", read_only=True)
     def asks_mine(ctx: Context, status: Status = "active") -> dict[str, Any]:
         """Your own asks with ${humans} answers (active = open + answered). Call at session start or when woken.
         For each answered ask: do what ${human} said, then ask_close(id, "what was done").${mine_asks_note}"""
         who = caller(ctx)
         return call(ask_service(who).list, status, None if who.is_denis else who.agent)
 
-    @tool(annotations=READ_ONLY)
+    @tool("All agents' questions", read_only=True)
     def asks_list(
         ctx: Context,
         status: Status = "active",
@@ -203,13 +206,13 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         who = caller(ctx)
         return call(ask_service(who).list, status, agent)
 
-    @tool(annotations=READ_ONLY)
+    @tool("Get a question", read_only=True)
     def ask_get(id: int, ctx: Context) -> dict[str, Any]:
         """One ask with its full history (events: created, edited, answered, closed, reopened)."""
         who = caller(ctx)
         return call(ask_service(who).get, id)
 
-    @tool()
+    @tool("Edit my question")
     def ask_update(
         id: int,
         ctx: Context,
@@ -228,7 +231,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         who = caller(ctx)
         return call(ask_service(who).update, who, id, changes)
 
-    @tool()
+    @tool("Close my question")
     def ask_close(id: int, ctx: Context, resolution: Resolution = "") -> dict[str, Any]:
         """Close your ask after acting on ${humans} answer, with a one-line resolution of what was done.
         Also use it for an open ask that is no longer relevant."""
@@ -236,7 +239,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         return call(ask_service(who).close, who, id, resolution)
 
     if not hosted:
-        @tool()
+        @tool("Answer a question")
         def ask_answer(id: int, answer: str, ctx: Context) -> dict[str, Any]:
             """Answer an ask as the human (the human's token only). Re-answering replaces the previous answer."""
             who = caller(ctx)
@@ -244,7 +247,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
 
     # ---------- tasks (v3) ----------
 
-    @tool()
+    @tool("Start a task")
     def task_create(
         title: TaskTitle,
         ctx: Context,
@@ -273,7 +276,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         who = caller(ctx)
         return call(task_service(who).create, who, data)
 
-    @tool(annotations=READ_ONLY)
+    @tool("My tasks", read_only=True)
     def tasks_mine(ctx: Context, status: TaskStatusFilter = "open") -> dict[str, Any]:
         """Your own tasks (open = active + waiting), next check first. Call at session start or when woken,
         next to asks_mine. For each task: did anything move? task_update it (status, waiting_on, next_check —
@@ -282,7 +285,7 @@ ${mine_tasks_note}"""
         who = caller(ctx)
         return call(task_service(who).list, status, None if who.is_denis else who.agent)
 
-    @tool(annotations=READ_ONLY)
+    @tool("All agents' tasks", read_only=True)
     def tasks_list(
         ctx: Context,
         status: TaskStatusFilter = "open",
@@ -293,13 +296,13 @@ ${mine_tasks_note}"""
         who = caller(ctx)
         return call(task_service(who).list, status, agent)
 
-    @tool(annotations=READ_ONLY)
+    @tool("Get a task", read_only=True)
     def task_get(id: int, ctx: Context) -> dict[str, Any]:
         """One task with its full history (events: created, edited, status, done, dropped, reopened)."""
         who = caller(ctx)
         return call(task_service(who).get, id)
 
-    @tool()
+    @tool("Update my task")
     def task_update(
         id: int,
         ctx: Context,
@@ -320,19 +323,19 @@ ${mine_tasks_note}"""
         who = caller(ctx)
         return call(task_service(who).update, who, id, changes)
 
-    @tool()
+    @tool("Finish my task")
     def task_done(id: int, ctx: Context, resolution: TaskResolution = "") -> dict[str, Any]:
         """Mark your task done, with a one-line resolution of the result."""
         who = caller(ctx)
         return call(task_service(who).done, who, id, resolution)
 
-    @tool()
+    @tool("Drop my task")
     def task_drop(id: int, ctx: Context, resolution: TaskResolution = "") -> dict[str, Any]:
         """Drop your task (no longer needed, or given up), with a one-line reason."""
         who = caller(ctx)
         return call(task_service(who).drop, who, id, resolution)
 
-    @tool()
+    @tool("Reopen my task")
     def task_reopen(id: int, ctx: Context) -> dict[str, Any]:
         """Reopen your done or dropped task: back to active (the old resolution stays in its history)."""
         who = caller(ctx)
