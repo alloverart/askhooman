@@ -199,7 +199,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     add_api_routes(app, services)
     add_app_api(app, settings, accounts, pool, webhooks, limiter)
     app.router.routes.extend(auth_server.routes())
-    app.router.routes.extend(site.routes(settings.public_url))
+    app.router.routes.extend(site.routes(settings))
     app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, settings.trust_forwarded),
                                    include_in_schema=False))
     app.add_middleware(RequestGuard, authenticate=authenticate)
