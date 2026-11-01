@@ -2,7 +2,8 @@
 
   /mcp                  MCP (streamable HTTP, stateless) for agents: OAuth access tokens or agent keys
   /api/asks, /api/tasks the same REST as the single-tenant bridge, for agents (same tokens as /mcp)
-  /api/agents…, /api/connect-info, /api/events, DELETE /api/me   the App API (Google ID tokens), app_api.py
+  /api/agents…, /api/connect-info, /api/events, DELETE /api/me   the App API (Google ID tokens), app_api.py;
+                        the only routes with CORS, and only for the origins in ASKS_CORS_ORIGINS
   /authorize, /token, /register, /revoke, /oauth/…, /.well-known/…   the authorization server, oauth.py
   /healthz
 
@@ -26,7 +27,7 @@ from ..mcp_tools import IDENTITY_SCOPE_KEY, build_mcp
 from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
-from .app_api import AppUser, add_app_api, is_account_deletion, is_app_path
+from .app_api import AppCors, AppUser, add_app_api, is_account_deletion, is_app_path
 from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
@@ -173,8 +174,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        log.info("AskHooman hosted bridge: %s (aliases: %s, store=%s)", settings.public_url,
-                 ", ".join(settings.aliases) or "none", settings.store)
+        log.info("AskHooman hosted bridge: %s (aliases: %s, CORS for the App API: %s, store=%s)", settings.public_url,
+                 ", ".join(settings.aliases) or "none", ", ".join(settings.cors_origins) or "none", settings.store)
         async with mcp.session_manager.run():
             yield
         await anyio.to_thread.run_sync(webhooks.flush, 5.0)
@@ -204,4 +205,6 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, settings.trust_forwarded),
                                    include_in_schema=False))
     app.add_middleware(RequestGuard, authenticate=authenticate)
+    if settings.cors_origins:  # added last = outermost: preflights are answered before RequestGuard's token check
+        app.add_middleware(AppCors, origins=settings.cors_origins)
     return app

@@ -127,6 +127,7 @@ Logs: `gcloud run services logs read qtracker --region=$REGION --limit=100`. Tok
 | `ASKS_FIRESTORE_PROJECT` | `<PROJECT_ID>` (default: the project of the environment) |
 | `ASKS_FIRESTORE_DATABASE` | `(default)` |
 | `ASKS_TRUST_FORWARDED` | `1` (default): the client IP for rate limits is the last `X-Forwarded-For` entry, which Cloud Run's frontend sets |
+| `ASKS_CORS_ORIGINS` | optional, comma-separated: origins of a web app that calls the App API from the browser, e.g. `https://app.<PUBLIC_HOST>`; exact `https://` origins, or `http://localhost:<port>` for development. Empty (default): CORS stays closed. It opens CORS for the App API only; put the web app's OAuth client id into `ASKS_GOOGLE_APP_CLIENT_IDS` too |
 
 Local run without Google Cloud (in-memory store; Google sign-in works only if the Web client's redirect URI points at localhost):
 

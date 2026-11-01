@@ -14,10 +14,13 @@ ASKS_FIRESTORE_PROJECT      Google Cloud project of the Firestore database (defa
 ASKS_FIRESTORE_DATABASE     Firestore database id (default "(default)")
 ASKS_TRUST_FORWARDED        "1" (default): the client IP for rate limits is the last X-Forwarded-For entry
                             (Cloud Run's front end appends it); "0": the TCP peer
+ASKS_CORS_ORIGINS           origins of the web app allowed to call the App API from a browser, comma-separated, exact
+                            (https://..., or http://localhost:<port> for development). Empty (default): CORS closed
 """
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -80,6 +83,19 @@ def public_url(value: str, name: str = "ASKS_PUBLIC_URL") -> str:
     return f"{scheme}://{host}" + (f":{port}" if port and port != default else "")
 
 
+def cors_origin(value: str) -> str:
+    """One entry of ASKS_CORS_ORIGINS, canonical as a browser sends it in the Origin header (compared as an exact
+    string): https on a host name, or http://localhost:<port> for a development server. No wildcards."""
+    origin = public_url(value, "ASKS_CORS_ORIGINS")
+    scheme, host = origin.split("://", 1)
+    name, _, port = host.partition(":")
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*", name):
+        raise ConfigError(f"ASKS_CORS_ORIGINS: {value.strip()!r} is not an origin with a host name")
+    if scheme == "http" and (name != "localhost" or not port):
+        raise ConfigError("ASKS_CORS_ORIGINS: http only as http://localhost:<port> (development); otherwise https")
+    return origin
+
+
 @dataclass(frozen=True)
 class HostedSettings:
     public_url: str
@@ -96,6 +112,7 @@ class HostedSettings:
     code_ttl: int = CODE_TTL
     request_ttl: int = REQUEST_TTL
     aliases: tuple[str, ...] = ()
+    cors_origins: tuple[str, ...] = ()  # the web app's origins, for the App API only (app_api.AppCors)
 
     @property
     def issuer(self) -> str:
@@ -144,6 +161,8 @@ class HostedSettings:
         aliases = tuple(dict.fromkeys(
             public_url(a, "ASKS_PUBLIC_URL_ALIASES") for a in env.get("ASKS_PUBLIC_URL_ALIASES", "").split(",")
             if a.strip() and public_url(a, "ASKS_PUBLIC_URL_ALIASES") != public))
+        cors_origins = tuple(dict.fromkeys(
+            cors_origin(o) for o in env.get("ASKS_CORS_ORIGINS", "").split(",") if o.strip()))
         if store not in ("firestore", "memory"):
             raise ConfigError("ASKS_STORE must be 'firestore' or 'memory'")
         return cls(
@@ -157,4 +176,5 @@ class HostedSettings:
             firestore_database=env.get("ASKS_FIRESTORE_DATABASE", "").strip() or "(default)",
             trust_forwarded=env.get("ASKS_TRUST_FORWARDED", "1").strip().lower() not in ("0", "false", "no", "off"),
             aliases=aliases,
+            cors_origins=cors_origins,
         )
