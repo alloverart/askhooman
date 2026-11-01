@@ -23,6 +23,7 @@ LIMITS = {
     "agent": (300, 60.0),  # MCP/REST requests of one agent
     "user": (1200, 60.0),  # MCP/REST requests of all agents of one user
     "bearer_fail": (60, 60.0),  # failed bearer checks from one address
+    "look_fetch": (10, 600.0),  # set_my_look image_url fetches of one agent (looks.own_look)
 }
 MAX_KEYS = 20000
 

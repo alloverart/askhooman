@@ -1,8 +1,9 @@
 """App API of the hosted bridge (SPEC v4 "App API"), for the AskHooman app's "Connect an agent" and
 "Connected agents" screens. Authenticated with the user's Google ID token (audience = the iOS client).
 
-  GET    /api/agents             the user's connected agents
-  PATCH  /api/agents/{id}        {name?, webhook_url?, rotate_webhook_secret?} -> agent (+ webhook_secret, once)
+  GET    /api/agents             the user's connected agents (each with its look: color, avatar)
+  PATCH  /api/agents/{id}        {name?, webhook_url?, rotate_webhook_secret?, color?, avatar?}
+                                 -> agent (+ webhook_secret, once)
   DELETE /api/agents/{id}        revoke: every token and key of the agent stops working at once
   POST   /api/agents/keys        {name} -> 201 {agent, key}: an agent key (qtk_…), shown only in this response
   GET    /api/connect-info       the MCP URL and per-client setup snippets
@@ -41,6 +42,7 @@ from .accounts import Accounts, NameTaken, agent_json
 from .config import HostedSettings
 from .crypto import CryptoError
 from .google import DRIVE_SCOPE, GoogleError, GoogleOAuth
+from .looks import clean_avatar, clean_color
 from .ratelimit import RateLimiter
 from .records import DrivePool, HostedAsks
 from .webhooks import WebhookSender, check_webhook_url
@@ -244,6 +246,8 @@ class AgentPatch(BaseModel):
     name: str | None = None
     webhook_url: str | None = None
     rotate_webhook_secret: bool = False
+    color: str | None = None  # a palette key (looks.AGENT_COLORS)
+    avatar: dict | None = None  # {kind: robot} | {kind: emoji, emoji} | {kind: image, data: data URL}
 
 
 class KeyIn(BaseModel):
@@ -303,12 +307,18 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
 
     @app.get("/api/agents")
     def list_agents(user: AppUser = Depends(app_user)):
-        return {"agents": [agent_json(a) for a in accounts.agents(user.sub)]}
+        # Agents from before colours existed get theirs here, once (accounts.ensure_colors).
+        return {"agents": [agent_json(a) for a in accounts.ensure_colors(accounts.agents(user.sub))]}
 
     @app.patch("/api/agents/{agent_id}")
     def update_agent(agent_id: str, body: AgentPatch, user: AppUser = Depends(app_user)):
         agent = own(user, agent_id)
         given = body.model_dump(exclude_unset=True)
+        look = {}  # checked first, written last: a refused name or webhook leaves the look as it was
+        if "color" in given:
+            look["color"] = clean_color(given["color"])
+        if "avatar" in given:
+            look["avatar"] = clean_avatar(given["avatar"])
         if body.name is not None:
             agent = accounts.rename_agent(agent, body.name)
         secret = None
@@ -323,6 +333,8 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             elif body.rotate_webhook_secret:
                 raise Invalid("set a webhook_url to have a webhook secret")
             agent, secret = accounts.set_webhook(agent, url or None, rotate=body.rotate_webhook_secret)
+        if look:
+            agent = accounts.set_look(agent, **look)
         reply = {"agent": agent_json(agent)}
         if secret:
             reply["webhook_secret"] = secret  # shown once; store it in the receiver

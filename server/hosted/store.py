@@ -4,7 +4,7 @@ Production: Firestore (firestore_store.py). Tests and local development: MemoryS
 hosted bridge keeps outside the users' Drives goes through this interface (accounts.py builds on it):
 
   users/{google sub}        email, encrypted Google refresh token, id counters
-  agents/{agent id}         user, name, slug, last client, last seen, webhook, revoked_at
+  agents/{agent id}         user, name, slug, last client, last seen, webhook, revoked_at, look (colour, icon)
   clients/{client id}       dynamically registered OAuth clients (hashed secret)
   requests/{sha256(id)}     pending authorizations (Google sign-in + consent), short-lived
   codes/{sha256(code)}      authorization codes, short-lived
