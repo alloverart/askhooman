@@ -13,7 +13,7 @@ DEV = "http://localhost:5173"  # its development server
 # the App API with the method a browser asks for in its preflight
 APP_ROUTES = (("/api/agents", "GET"), ("/api/agents/ag_x", "PATCH"), ("/api/agents/ag_x", "DELETE"),
               ("/api/agents/keys", "POST"), ("/api/connect-info", "GET"), ("/api/events", "POST"),
-              ("/api/me", "DELETE"))
+              ("/api/drive/token", "POST"), ("/api/me", "DELETE"))
 
 
 @pytest.fixture
@@ -72,6 +72,11 @@ def test_responses_to_the_web_app_carry_cors_errors_included(web, google, monkey
     assert status(web.patch(f"/api/agents/{agent_id}", json={"slug": "x"}, headers=me)) == 422
     assert status(web.post("/api/events", json={"ask_id": 1, "kind": "edited"}, headers=me)) == 422
     assert status(web.post("/api/events", json={"ask_id": 1, "kind": "closed"}, headers=me)) == 503  # Drive not linked
+    no_grant = web.post("/api/drive/token", headers=me)  # the app then falls back to Google's window
+    assert status(no_grant) == 409 and no_grant.json()["error"] == "not_linked"
+    connect(web, google, register(web)["client_id"])
+    token = web.post("/api/drive/token", headers=me)
+    assert status(token) == 200 and token.json()["access_token"] and token.headers["cache-control"] == "no-store"
     with monkeypatch.context() as limited:
         limited.setattr(web.app.state.limiter, "allow", lambda *args: False)
         assert status(web.get("/api/agents", headers=me)) == 429
