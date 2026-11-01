@@ -1,0 +1,10 @@
+# Upload only what the image needs: server/ (without tests and caches) and deploy/hosted/.
+/*
+!/server/
+!/deploy/
+/deploy/*
+!/deploy/hosted/
+/server/tests/
+**/__pycache__/
+**/*.pyc
+.DS_Store

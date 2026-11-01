@@ -1,0 +1,9 @@
+# Runtime deps for the Asks server (Python 3.11+). mcp 2.x: FastMCP is called MCPServer there.
+# Tests (from the repository root): uv run --with-requirements server/requirements.txt --with httpx --with pytest python -m pytest server/tests -q
+fastapi>=0.115
+uvicorn>=0.31.1
+mcp>=2.3,<3
+pydantic>=2.12
+typing-extensions>=4.13
+httpx>=0.27  # Drive client (server/drive.py); mcp 2.x pulls in httpx2, not httpx
+pyjwt[crypto]>=2.10  # hosted mode only (Google ID tokens; AES-GCM via cryptography); already a dependency of mcp

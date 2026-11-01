@@ -1,0 +1,13 @@
+# local scratch, screenshots, test and dev data — never committed
+/_tmp/
+/_shots/
+/data/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
+*.db.tmp
+*.log
+/seed/

@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Server tests
+        run: >
+          uv run --python 3.12
+          --with-requirements server/requirements.txt
+          --with-requirements deploy/hosted/requirements.txt
+          --with httpx --with pytest
+          python -m pytest server/tests -q

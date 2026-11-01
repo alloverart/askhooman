@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" aria-label="Questions">
+ <defs><linearGradient id="b" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#063FA5"/><stop offset="1" stop-color="#3911C2"/></linearGradient></defs>
+ <rect width="512" height="512" rx="106" fill="url(#b)"/>
+ <path d="M111 122 Q111 95 142 95 H360 Q400 95 400 135 V355 Q400 395 360 395 H208 L161 434 Q146 443 146 420 V394 Q111 391 111 352Z" fill="white"/>
+ <path d="M207 202 C206 172 231 158 263 163 C294 168 308 190 300 216 C295 237 262 245 256 267" fill="none" stroke="#1735BA" stroke-width="36" stroke-linecap="round"/>
+ <circle cx="256" cy="313" r="19" fill="#1735BA"/>
+ <circle cx="376" cy="371" r="61" fill="#00B8AC"/>
+ <path d="M343 368 L367 391 L410 346" fill="none" stroke="white" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+ </svg>

@@ -1,0 +1,29 @@
+# A push to an allen/<topic> branch opens a pull request into main by itself:
+# the maintainers' automation agent pushes those branches with a deploy key and
+# has no GitHub account to open PRs. main is protected; a maintainer reviews and
+# merges. Contributors from forks open pull requests as usual.
+name: allen-pr
+
+on:
+  push:
+    branches: ["allen/**"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "PR for $BRANCH is already open"; exit 0
+          fi
+          TITLE=$(git log -1 --format=%s)
+          gh pr create --base main --head "$BRANCH" --title "$TITLE" \
+            --body "Opened automatically for a push to \`$BRANCH\` (automation agent). Review and merge by a maintainer."

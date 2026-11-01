@@ -1,0 +1,53 @@
+# Deploy of the hosted bridge to Cloud Run on every merge to main.
+# Keyless: GitHub OIDC -> Workload Identity Federation -> deploy service account.
+# Repository variables (Settings -> Variables): GCP_PROJECT, GCP_REGION,
+# GCP_WIF_PROVIDER, GCP_DEPLOY_SA, CLOUD_RUN_SERVICE. A fork without them skips
+# the job, so self-hosters are not forced into our project.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ["server/**", "deploy/hosted/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  cloud-run:
+    needs: tests
+    if: ${{ vars.GCP_WIF_PROVIDER != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Build image
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/qtracker/bridge:$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          gcloud builds submit --project "${{ vars.GCP_PROJECT }}" \
+            --config deploy/hosted/cloudbuild.yaml --ignore-file deploy/hosted/.gcloudignore \
+            --substitutions "_IMAGE=$IMAGE" .
+      - name: Deploy (env vars and secrets of the service are kept)
+        run: |
+          gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE }}" --project "${{ vars.GCP_PROJECT }}" \
+            --region "${{ vars.GCP_REGION }}" --image "$IMAGE" --quiet
+      - name: Smoke check
+        run: |
+          URL=$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE }}" --project "${{ vars.GCP_PROJECT }}" \
+            --region "${{ vars.GCP_REGION }}" --format='value(status.url)')
+          curl -fsS "$URL/.well-known/oauth-authorization-server" > /dev/null

@@ -1,0 +1,4 @@
+# Hosted bridge (ASKS_MODE=hosted) on Cloud Run: the server's requirements plus the Firestore client.
+# The single-tenant bridge installs only server/requirements.txt and never imports Firestore.
+-r ../../server/requirements.txt
+google-cloud-firestore>=2.19,<3

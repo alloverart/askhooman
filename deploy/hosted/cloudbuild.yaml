@@ -1,0 +1,17 @@
+# Builds the hosted bridge image from the repository root and pushes it to Artifact Registry
+# in the project the build runs in (${PROJECT_ID}).
+#   gcloud builds submit --config deploy/hosted/cloudbuild.yaml --ignore-file deploy/hosted/.gcloudignore \
+#     --substitutions _IMAGE=$REGION-docker.pkg.dev/$PROJECT/qtracker/bridge:$(date +%Y%m%d-%H%M) .
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "deploy/hosted/Dockerfile", "-t", "${_IMAGE}", "."]
+images:
+  - "${_IMAGE}"
+substitutions:
+  _REGION: europe-west1
+  _IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/qtracker/bridge:latest
+options:
+  dynamicSubstitutions: true
+  # CI passes its own _IMAGE, so _REGION goes unused; loose lets the build run
+  substitutionOption: ALLOW_LOOSE
+  logging: CLOUD_LOGGING_ONLY
