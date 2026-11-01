@@ -195,7 +195,9 @@ def test_drive_token_for_the_web_app(hosted, google, caplog):
     assert first.status_code == 200, first.text
     body = first.json()
     assert set(body) == {"access_token", "expires_in", "scope"} and body["scope"] == DRIVE_SCOPE
-    assert body["expires_in"] == 3599 and google.access_tokens[body["access_token"]] == DENIS_SUB
+    # the fake Google counts its 3600 s on the real clock: a second may tick over before the reply
+    life = body["expires_in"]
+    assert life in (3598, 3599) and google.access_tokens[body["access_token"]] == DENIS_SUB
     assert google.refreshes == [{"sub": DENIS_SUB, "scope": DRIVE_SCOPE}]  # drive.appdata only
     assert body["access_token"] not in caplog.text + json.dumps(hosted.store.all("users"))
     # the token reads the user's appDataFolder, where the agents' asks are
@@ -208,11 +210,11 @@ def test_drive_token_for_the_web_app(hosted, google, caplog):
 
     cache.clock = lambda: start + 600  # still 49 minutes left: the same token, Google isn't asked
     again = drive_token(hosted, google).json()
-    assert again["access_token"] == body["access_token"] and again["expires_in"] == 2999
+    assert again["access_token"] == body["access_token"] and again["expires_in"] == life - 600
     assert len(web_refreshes(google)) == 1
     cache.clock = lambda: start + 3599 - 899  # less than 15 minutes left: a new one
     fresh = drive_token(hosted, google).json()
-    assert fresh["access_token"] != body["access_token"] and fresh["expires_in"] == 3599
+    assert fresh["access_token"] != body["access_token"] and fresh["expires_in"] in (3598, 3599)
     assert len(web_refreshes(google)) == 2
     # another user never gets Denis's token
     olga = drive_token(hosted, google, sub=OLGA_SUB)
