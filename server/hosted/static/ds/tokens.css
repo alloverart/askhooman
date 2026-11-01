@@ -1,0 +1,230 @@
+/* AskHooman design system: tokens.
+ *
+ * One source of colour, type and shape for the web app, the landing and (later) the storefront
+ * constructor. The structure follows BlankBuilder's quiet panel UI: neutral surfaces, one accent,
+ * thin lines. The colours come from the app icon: the sky of its background is the accent, its
+ * mint and lavender make the brand gradient, its pink and blue agents and the halo give the
+ * agent colours.
+ *
+ * Theme: the system's light or dark by default; data-theme="light" | "dark" on <html> wins over
+ * the system in both directions. Components use the tokens only, never raw colours.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* surfaces */
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --field: #ffffff;
+  --hover: #eef2f7;
+  --seg-bg: #ebeff4;
+  --mat: #f7f9fb;
+
+  /* text and icons */
+  --ink: #2c3142;
+  --label: #3a4052;
+  --muted: #636c7d;
+  --faint: #9aa3b1;
+  --icon: #4a5466;
+
+  /* lines: hairlines for pane edges and dividers only; cards and rows are told apart by background
+     and spacing, selection by a fill (never a fill plus an outline) */
+  --line: #edf0f4;
+  --line-strong: #e2e7ed;
+  --field-line: #d9dfe6;
+  --toggle-off: #d3d9e1;
+
+  /* soft filled controls: secondary buttons, chips */
+  --fill: #edf0f4;
+  --fill-hover: #e2e7ed;
+
+  /* accent: the icon's sky */
+  --accent: #3577b8;
+  --accent-hover: #2d69a5;
+  --accent-soft: #e6f0fa;
+  --accent-ink: #ffffff;
+  --accent-text: #2d69a5;
+
+  /* brand: the icon's background and halo */
+  --sky: #8bcaf9;
+  --aqua: #b5e7ee;
+  --lavender: #cdbdf6;
+  --halo: #f6d77a;
+  --brand-grad: linear-gradient(140deg, #8bcaf9 0%, #b5e7ee 48%, #d6c8f8 100%);
+  --brand-wash: linear-gradient(160deg, #eaf4fd 0%, #eef9fa 50%, #f3effd 100%);
+
+  /* states: text on the page, the panel and its own soft fill is 4.5:1 or more (WCAG AA) */
+  --danger: #ce2e23;
+  --danger-soft: #fdeceb;
+  --warn: #8a5a00;
+  --warn-soft: #fff3d6;
+  --urgent: #c9271c;
+  --urgent-soft: #fde7e4;
+  --ok: #1c7c52;
+  --ok-soft: #e3f5ec;
+
+  /* glass: floating plates over content */
+  --glass: rgba(255, 255, 255, 0.78);
+  --glass-strong: rgba(255, 255, 255, 0.95);
+  --glass-line: rgba(16, 24, 40, 0.1);
+  --scrim: rgba(16, 24, 40, 0.45);
+
+  /* toast: inverse of the page */
+  --toast-bg: #1d2029;
+  --toast-ink: #f4f6f9;
+
+  /* elevation */
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 4px 14px rgba(16, 24, 40, 0.07);
+  --shadow-pop: 0 2px 4px rgba(16, 24, 40, 0.05), 0 14px 34px rgba(16, 24, 40, 0.16);
+  --shadow-modal: 0 20px 60px rgba(16, 24, 40, 0.25);
+
+  /* type: Inter, with the system's face as the fallback */
+  --f-body: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, Roboto, sans-serif;
+  --f-display: var(--f-body);
+  --f-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs: 13.5px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+  --lh: 1.45;
+
+  /* shape */
+  --r-xs: 5px;
+  --r-sm: 7px;
+  --r: 8px;
+  --r-seg: 9px;
+  --r-md: 10px;
+  --r-lg: 12px;
+  --r-xl: 14px;
+  --r-2xl: 16px;
+  --r-pill: 999px;
+
+  /* control heights: mouse; touch screens get taller ones below */
+  --h-sm: 28px;
+  --h: 32px;
+  --h-lg: 40px;
+  --h-row: 34px;
+
+  /* motion */
+  --t-fast: 0.12s;
+  --t: 0.15s;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@media (pointer: coarse) {
+  :root {
+    --h-sm: 34px;
+    --h: 40px;
+    --h-lg: 48px;
+    --h-row: 44px;
+    --fs: 15px;
+    --fs-md: 15px;
+  }
+}
+
+/* dark: the same tokens, redefined; components never branch on the theme */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --bg: #181a1f;
+    --panel: #212329;
+    --field: #1c1e23;
+    --hover: #2b2e35;
+    --seg-bg: #2a2d33;
+    --mat: #25272d;
+    --ink: #e6e9ee;
+    --label: #cbd0d8;
+    --muted: #a0a7b2;
+    --faint: #6d7480;
+    --icon: #c1c7d0;
+    --line: #2b2e34;
+    --line-strong: #353940;
+    --field-line: #42464e;
+    --toggle-off: #4a4e57;
+    --fill: #2c2f36;
+    --fill-hover: #363940;
+    --accent: #7ab8ef;
+    --accent-hover: #8fc5f3;
+    --accent-soft: #1f3347;
+    --accent-ink: #0d1a2a;
+    --accent-text: #8fc5f3;
+    --sky: #5aa6e6;
+    --aqua: #6fc9d4;
+    --lavender: #a08fe6;
+    --halo: #e8c35a;
+    --brand-grad: linear-gradient(140deg, #1e3a57 0%, #1b4650 48%, #352d58 100%);
+    --brand-wash: linear-gradient(160deg, #1b2530 0%, #1a2a2d 50%, #241f33 100%);
+    --danger: #f28b82;
+    --danger-soft: #3b1f1e;
+    --warn: #ffd47e;
+    --warn-soft: #382c12;
+    --urgent: #ff8a7e;
+    --urgent-soft: #3d201d;
+    --ok: #6fd3a0;
+    --ok-soft: #1a3328;
+    --glass: rgba(40, 42, 48, 0.78);
+    --glass-strong: rgba(48, 50, 56, 0.95);
+    --glass-line: rgba(255, 255, 255, 0.1);
+    --scrim: rgba(0, 0, 0, 0.55);
+    --toast-bg: #eef1f5;
+    --toast-ink: #181a1f;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.35);
+    --shadow-pop: 0 14px 34px rgba(0, 0, 0, 0.5);
+    --shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.6);
+  }
+}
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #181a1f;
+  --panel: #212329;
+  --field: #1c1e23;
+  --hover: #2b2e35;
+  --seg-bg: #2a2d33;
+  --mat: #25272d;
+  --ink: #e6e9ee;
+  --label: #cbd0d8;
+  --muted: #a0a7b2;
+  --faint: #6d7480;
+  --icon: #c1c7d0;
+  --line: #2b2e34;
+  --line-strong: #353940;
+  --field-line: #42464e;
+  --toggle-off: #4a4e57;
+  --fill: #2c2f36;
+  --fill-hover: #363940;
+  --accent: #7ab8ef;
+  --accent-hover: #8fc5f3;
+  --accent-soft: #1f3347;
+  --accent-ink: #0d1a2a;
+  --accent-text: #8fc5f3;
+  --sky: #5aa6e6;
+  --aqua: #6fc9d4;
+  --lavender: #a08fe6;
+  --halo: #e8c35a;
+  --brand-grad: linear-gradient(140deg, #1e3a57 0%, #1b4650 48%, #352d58 100%);
+  --brand-wash: linear-gradient(160deg, #1b2530 0%, #1a2a2d 50%, #241f33 100%);
+  --danger: #f28b82;
+  --danger-soft: #3b1f1e;
+  --warn: #ffd47e;
+  --warn-soft: #382c12;
+  --urgent: #ff8a7e;
+  --urgent-soft: #3d201d;
+  --ok: #6fd3a0;
+  --ok-soft: #1a3328;
+  --glass: rgba(40, 42, 48, 0.78);
+  --glass-strong: rgba(48, 50, 56, 0.95);
+  --glass-line: rgba(255, 255, 255, 0.1);
+  --scrim: rgba(0, 0, 0, 0.55);
+  --toast-bg: #eef1f5;
+  --toast-ink: #181a1f;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.35);
+  --shadow-pop: 0 14px 34px rgba(0, 0, 0, 0.5);
+  --shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
