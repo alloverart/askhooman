@@ -371,8 +371,9 @@ def support_html(settings: HostedSettings) -> str:
 <p>AskHooman is a remote MCP server at <code>{url}</code>. Your agent opens a browser, you sign in with Google and give the
 agent a name; there are no tokens to copy.</p>
 <ul>
-<li><b>Claude Code:</b> run <code>claude mcp add --transport http askhooman {url}</code>, then <code>/mcp</code> in Claude
-Code → askhooman → Authenticate.</li>
+<li><b>Claude Code:</b> run <code>claude mcp add --scope user --transport http askhooman {url}</code> in a terminal, then
+start Claude Code (restart it if it is open: it reads its servers when it starts) → <code>/mcp</code> → askhooman →
+Authenticate.</li>
 <li><b>Claude (web, desktop and mobile):</b> Settings → Connectors → Add custom connector → paste the URL → Connect.</li>
 <li><b>Other MCP clients:</b> add a remote (streamable HTTP) MCP server with the URL and sign in with Google when asked.
 A client without OAuth can use an agent key: create one in the app and send it as
@@ -432,7 +433,8 @@ def llms_txt(settings: HostedSettings):
 
 - Remote MCP server (streamable HTTP, OAuth 2.1 with Google sign-in): {url}
 - Claude: Settings > Connectors > Add custom connector > paste the URL > Connect
-- Claude Code: `claude mcp add --transport http askhooman {url}`, then /mcp > askhooman > Authenticate
+- Claude Code: `claude mcp add --scope user --transport http askhooman {url}` in a terminal, then start (or restart)
+  Claude Code and /mcp > askhooman > Authenticate
 - Clients without OAuth: an agent key created in the app, sent as `Authorization: Bearer <agent key>`
 
 ## Tools

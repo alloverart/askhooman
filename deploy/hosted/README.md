@@ -91,7 +91,8 @@ If `gcloud builds submit` fails on permissions: the build service account (in ne
 ```bash
 curl -s https://<PUBLIC_HOST>/.well-known/oauth-authorization-server   # issuer, endpoints, S256, CIMD
 curl -si -X POST https://<PUBLIC_HOST>/mcp | grep -i www-authenticate   # resource_metadata=...
-claude mcp add --transport http askhooman https://<PUBLIC_HOST>/mcp     # then /mcp → askhooman → Authenticate
+claude mcp add --scope user --transport http askhooman https://<PUBLIC_HOST>/mcp
+# then start (or restart) Claude Code: it reads its servers at start → /mcp → askhooman → Authenticate
 ```
 
 (`/healthz` works locally, but Cloud Run's frontend reserves paths ending in `z` and answers 404 there.)

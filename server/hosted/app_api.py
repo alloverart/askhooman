@@ -272,15 +272,19 @@ def connect_info(settings: HostedSettings, drive_linked: bool) -> dict:
             {"id": "claude", "name": "Claude (web, desktop and mobile)",
              "steps": "Settings → Connectors → Add custom connector → paste the URL → Connect"},
             {"id": "claude-code", "name": "Claude Code",
-             "command": f"claude mcp add --transport http askhooman {url}",
-             "steps": "Run the command, then /mcp in Claude Code → askhooman → Authenticate"},
+             "command": f"claude mcp add --scope user --transport http askhooman {url}",
+             # --scope user: without it the server exists only in the folder the command ran in. Claude Code reads
+             # its servers when it starts, so an open session sees the new one only after a restart (02.11.2026).
+             "steps": "Run the command in a terminal, then start Claude Code (restart it if it is open) → /mcp → "
+                      "askhooman → Authenticate"},
             {"id": "vscode", "name": "VS Code",
              "config": {"servers": {"askhooman": {"type": "http", "url": url}}},
              "steps": "Add to .vscode/mcp.json (or the user mcp.json) and start the server"},
             {"id": "other", "name": "Any MCP client with OAuth",
              "steps": "Add a remote (streamable HTTP) MCP server with the URL; sign in with Google when asked"},
             {"id": "agent-key", "name": "Clients without OAuth (agent key)",
-             "command": f'claude mcp add --transport http askhooman {url} --header "Authorization: Bearer <agent key>"',
+             "command": f'claude mcp add --scope user --transport http askhooman {url} '
+                        '--header "Authorization: Bearer <agent key>"',
              "steps": "Create an agent key in the app and send it as the header Authorization: Bearer <agent key>"},
         ],
     }
