@@ -127,10 +127,12 @@ def _file(name: str):
 def site_page(title: str, body: str, canonical: str, head: str = "") -> HTMLResponse:
     """A public page: header, body, footer with the privacy policy, support and the source code. canonical: the
     page's URL under the public URL (the same pages are served on alias hosts)."""
-    html = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    # Light only (Denis 02.11.2026: «чтобы лендинг был такой светлый»): data-theme="light" wins over the system's
+    # dark theme in the design system's tokens.css.
+    html = (f'<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-            f'<title>{escape(title)}</title>{ICONS}<meta name="theme-color" content="#f4f6f9" media="(prefers-color-scheme: light)">'
-            f'<meta name="theme-color" content="#181a1f" media="(prefers-color-scheme: dark)">'
+            f'<title>{escape(title)}</title>{ICONS}<meta name="color-scheme" content="light">'
+            f'<meta name="theme-color" content="#f4f6f9">'
             f'<link rel="canonical" href="{escape(canonical)}">{head}'
             f'<link rel="preload" href="/{DS_FONT}" as="font" type="font/woff2" crossorigin>'
             f'<link rel="stylesheet" href="{asset("ds/fonts.css")}"><link rel="stylesheet" href="{asset("ds/tokens.css")}">'

@@ -312,6 +312,8 @@ def test_landing_page_and_icons(hosted):
         assert "default-src 'none'" in response.headers["content-security-policy"]
     # the design system's stylesheets and Inter come from our own origin, nothing else
     assert 'href="/ds/tokens.css?v=' in landing.text and 'class="ds"' in landing.text
+    # the public pages are light whatever the system's theme (Denis 02.11.2026)
+    assert '<html lang="en" data-theme="light">' in landing.text and "prefers-color-scheme: dark" not in landing.text
     # every page names its files with their version, so a changed icon or stylesheet reaches browsers at once
     from server.hosted.site import VERSIONS
     assert f'src="/icon-512x512.png?v={VERSIONS["icon-512x512.png"]}"' in landing.text
