@@ -9,6 +9,7 @@ Files are read once at startup; a missing one fails the deploy, not a request. N
 anywhere: the pages carry the same Content-Security-Policy as the consent pages.
 """
 
+import hashlib
 import json
 from html import escape
 from pathlib import Path
@@ -32,6 +33,17 @@ FILES = ("favicon.ico", "favicon.svg", "favicon-32x32.png", "apple-touch-icon.pn
          "og-image-1200x630.png", "brandmark.svg", "icon-96x96.png",
          "ds/tokens.css", "ds/components.css", "ds/fonts.css", DS_FONT, "ds/fonts/inter-latin-ext-wght-normal.woff2",
          "ds/fonts/inter-cyrillic-wght-normal.woff2", "ds/fonts/OFL.txt")
+# The pages ask for a file by `/<name>?v=<first 10 hex of its SHA-256>`: the files are cached for a day, and an
+# icon or stylesheet changed under the same URL stayed old in browsers for that day (02.11.2026: the landing showed
+# the previous app icon in a browser that had loaded it before). The query is ignored when serving.
+VERSIONS = {name: hashlib.sha256((STATIC / name).read_bytes()).hexdigest()[:10] for name in FILES}
+
+
+def asset(name: str) -> str:
+    """The URL path of a static file with its version."""
+    return f"/{name}?v={VERSIONS[name]}"
+
+
 FILE_HEADERS = {
     "Cache-Control": "public, max-age=86400",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",  # an SVG never runs anything
@@ -121,10 +133,10 @@ def site_page(title: str, body: str, canonical: str, head: str = "") -> HTMLResp
             f'<meta name="theme-color" content="#181a1f" media="(prefers-color-scheme: dark)">'
             f'<link rel="canonical" href="{escape(canonical)}">{head}'
             f'<link rel="preload" href="/{DS_FONT}" as="font" type="font/woff2" crossorigin>'
-            f'<link rel="stylesheet" href="/ds/fonts.css"><link rel="stylesheet" href="/ds/tokens.css">'
-            f'<link rel="stylesheet" href="/ds/components.css">'
+            f'<link rel="stylesheet" href="{asset("ds/fonts.css")}"><link rel="stylesheet" href="{asset("ds/tokens.css")}">'
+            f'<link rel="stylesheet" href="{asset("ds/components.css")}">'
             f'<style>{STYLE}</style></head><body class="ds"><div class="wrap">'
-            f'<header class="top"><a class="brand" href="/"><img src="/icon-96x96.png" alt="" width="28" height="28">'
+            f'<header class="top"><a class="brand" href="/"><img src="{asset("icon-96x96.png")}" alt="" width="28" height="28">'
             f'AskHooman</a><nav><a href="/#connect">Connect</a><a href="/privacy">Privacy</a><a class="more" href="/support">Support</a>'
             f'<a class="more" href="{GITHUB}">GitHub</a></nav></header>'
             f'<main>{body}</main>'
@@ -153,7 +165,7 @@ def landing_page(settings: HostedSettings):
         steps.append(f'<div class="card"><h3>{escape(c["name"])}</h3><p>{escape(c["steps"])}</p>{extra}</div>')
     url = escape(info["server_url"])
     body = f"""
-<div class="hero brand-surface"><img class="halo" src="/icon-512x512.png" alt="" width="132" height="132">
+<div class="hero brand-surface"><img class="halo" src="{asset("icon-512x512.png")}" alt="" width="132" height="132">
 <div><p class="eyebrow">The prompt is on the other foot.</p>
 <h1>Your agents have questions, hooman.</h1>
 <p>For years you asked the machines. Now they ask you. AskHooman gives every AI agent one polite place to ask its human,
