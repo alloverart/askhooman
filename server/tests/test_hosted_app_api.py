@@ -311,7 +311,13 @@ def test_landing_page_and_icons(hosted):
         assert response.status_code == 200 and response.headers["content-type"].startswith(kind) and response.content
         assert "default-src 'none'" in response.headers["content-security-policy"]
     # the design system's stylesheets and Inter come from our own origin, nothing else
-    assert 'href="/ds/tokens.css"' in landing.text and 'class="ds"' in landing.text
+    assert 'href="/ds/tokens.css?v=' in landing.text and 'class="ds"' in landing.text
+    # every page names its files with their version, so a changed icon or stylesheet reaches browsers at once
+    from server.hosted.site import VERSIONS
+    assert f'src="/icon-512x512.png?v={VERSIONS["icon-512x512.png"]}"' in landing.text
+    assert len(VERSIONS["icon-512x512.png"]) == 10
+    versioned = hosted.get(f"/icon-512x512.png?v={VERSIONS['icon-512x512.png']}")
+    assert versioned.status_code == 200 and versioned.headers["content-type"] == "image/png"
     assert "font-src 'self'" in landing.headers["content-security-policy"]
     error = hosted.get("/oauth/consent")
     assert "noindex" in error.text and "/favicon.svg" in error.text  # every page carries the icons, only / is indexed
