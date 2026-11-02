@@ -96,7 +96,8 @@ def test_connect_info(hosted, google):
     ids = [c["id"] for c in info["clients"]]
     assert "claude" in ids and "claude-code" in ids and "agent-key" in ids
     code = next(c for c in info["clients"] if c["id"] == "claude-code")
-    assert code["command"] == f"claude mcp add --transport http askhooman {RESOURCE}"
+    assert code["command"] == f"claude mcp add --scope user --transport http askhooman {RESOURCE}"
+    assert "restart" in code["steps"], "an open Claude Code sees a new server only after a restart"
 
 
 def test_events_call_the_agents_webhook_signed_and_retried(hosted, google):
@@ -287,7 +288,7 @@ def test_landing_page_and_icons(hosted):
     assert f'property="og:image" content="{PUBLIC}/og-image-1200x630.png"' in landing.text
     assert "noindex" not in landing.text and 'href="/favicon.ico"' in landing.text
     # the connect steps are the app's (connect-info), with the public URL
-    assert f"claude mcp add --transport http askhooman {RESOURCE}" in landing.text and f">{RESOURCE}<" in landing.text
+    assert f"claude mcp add --scope user --transport http askhooman {RESOURCE}" in landing.text and f">{RESOURCE}<" in landing.text
     assert "https://github.com/alloverart/askhooman" in landing.text and "coming soon" in landing.text.lower()
     for path, words in (("/privacy", ("appDataFolder", "drive.appdata", "Delete hidden app data", "support@askhooman.com",
                                       "encrypted", "one-way hashes", "within 30")),
@@ -328,7 +329,7 @@ def test_store_pages(hosted):
             assert link in page.text, (path, link)
     landing, privacy, support = (" ".join(pages[p].text.split()) for p in ("/", "/privacy", "/support"))  # as rendered
     assert f"<code class=\"url\">{RESOURCE}</code>" in landing
-    assert "Add custom connector" in landing and f"claude mcp add --transport http askhooman {RESOURCE}" in landing
+    assert "Add custom connector" in landing and f"claude mcp add --scope user --transport http askhooman {RESOURCE}" in landing
     for words in ("Coming soon to the App Store", "Coming soon to Google Play", "app.askhooman.com · coming soon",
                   "Apache-2.0", "drive.appdata",
                   "We keep only your account email, an encrypted Google token and your agents' names and keys"):
@@ -341,7 +342,7 @@ def test_store_pages(hosted):
                   "Third-party apps", "Children", "Changes", "no ads", "never sell"):
         assert words in privacy, words
     for words in ("mailto:support@askhooman.com", "mailto:privacy@askhooman.com", "mailto:security@askhooman.com",
-                  f"claude mcp add --transport http askhooman {RESOURCE}", "Add custom connector",
+                  f"claude mcp add --scope user --transport http askhooman {RESOURCE}", "Add custom connector",
                   f'href="{PUBLIC}/oauth/link"', "Settings → Delete account", "Delete hidden app data",
                   'href="/privacy"'):
         assert words in support, words
