@@ -451,10 +451,12 @@ def get_task(client, task_id) -> dict:
 
 def assert_task_mirrored(client, fake, task_id, rev=None, kept=()) -> dict:
     """The file holds exactly what REST returns (task + events), plus rev/schema/kind/writer (and `kept`
-    top-level fields someone else added)."""
+    top-level fields someone else added), minus the derived reply / reply_pending, which are never stored."""
     task = get_task(client, task_id)
     file = fake.file(f"task-{task_id}.json")
     doc = json.loads(file["content"])
+    assert "reply" not in doc and "reply_pending" not in doc
+    task = {k: v for k, v in task.items() if k not in ("reply", "reply_pending")}
     assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "kind", "writer", *kept)} == task
     assert (doc["schema"], doc["kind"], doc["writer"]) == (1, "task", "bridge")
     assert file["appProperties"] == {"task_id": str(task_id), "status": task["status"], "agent": task["agent"],
