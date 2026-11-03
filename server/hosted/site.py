@@ -56,6 +56,9 @@ PAGE_HEADERS = {**SECURITY_HEADERS, "Cache-Control": "public, max-age=300",
 
 TAGLINE = "Questions from your AI agents, waiting for your decision."
 GITHUB = "https://github.com/alloverart/askhooman"
+# The web app is live (Denis 03.11.2026: «давай на банере прям ссылку сделаем на веб версию — которая уже работает
+# вполне»); the iPhone, Mac and Android apps are in store review.
+WEB_APP = "https://app.askhooman.com"
 SUPPORT_EMAIL = "support@askhooman.com"
 PRIVACY_EMAIL = "privacy@askhooman.com"
 SECURITY_EMAIL = "security@askhooman.com"
@@ -76,7 +79,7 @@ code,pre{font:14px/1.5 var(--f-mono)}
 header.top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 0}
 .ds .brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:18px;letter-spacing:-.01em;
 color:var(--ink);text-decoration:none}.brand img{border-radius:var(--r-sm)}
-.ds nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:15px}.ds nav a:hover{color:var(--ink)}
+.ds nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:15px;white-space:nowrap}.ds nav a:hover{color:var(--ink)}
 h1,h2,h3{color:var(--ink);text-wrap:balance}
 .hero{border-radius:var(--r-2xl);padding:56px 40px;display:flex;gap:40px;align-items:center;margin:8px 0 48px}
 .hero img{border-radius:28px;flex:none}
@@ -85,6 +88,7 @@ h1,h2,h3{color:var(--ink);text-wrap:balance}
 .hero .eyebrow{font-size:var(--fs-xs);font-weight:650;letter-spacing:.08em;text-transform:uppercase;opacity:1;
 color:var(--accent-text);margin:0 0 12px}
 .cta{display:flex;gap:10px;flex-wrap:wrap}.cta .btn{height:44px;font-weight:600;padding:0 18px}
+.hero p.note{font-size:var(--fs-md);margin:14px 0 0;opacity:.75}
 .ds a.btn{color:var(--ink)}.ds a.btn.primary{color:var(--accent-ink)}
 .hero .btn:not(.primary){background:var(--glass-strong)}
 section{margin:0 0 56px}h2{font-size:28px;font-weight:650;margin:0 0 8px;letter-spacing:-.02em}
@@ -92,6 +96,7 @@ section{margin:0 0 56px}h2{font-size:28px;font-weight:650;margin:0 0 8px;letter-
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
 .grid .card{padding:22px}.card h3{margin:0 0 6px;font-size:17px;font-weight:650;letter-spacing:-.01em}
 .grid .card p{margin:0;color:var(--muted);font-size:15px}.card .badge{margin-top:12px}
+.grid .card p.go{margin-top:10px;font-weight:600}
 .step{display:inline-flex;width:30px;height:30px;border-radius:var(--r);align-items:center;justify-content:center;
 background:var(--accent-soft);color:var(--accent-text);font-weight:650;margin-bottom:12px}
 .url{display:block;background:var(--field);border:1px solid var(--field-line);border-radius:var(--r-lg);padding:14px 16px;
@@ -139,10 +144,10 @@ def site_page(title: str, body: str, canonical: str, head: str = "") -> HTMLResp
             f'<link rel="stylesheet" href="{asset("ds/components.css")}">'
             f'<style>{STYLE}</style></head><body class="ds"><div class="wrap">'
             f'<header class="top"><a class="brand" href="/"><img src="{asset("icon-96x96.png")}" alt="" width="28" height="28">'
-            f'AskHooman</a><nav><a href="/#connect">Connect</a><a href="/privacy">Privacy</a><a class="more" href="/support">Support</a>'
+            f'AskHooman</a><nav><a href="{WEB_APP}">Web app</a><a class="more" href="/#connect">Connect</a><a href="/privacy">Privacy</a><a class="more" href="/support">Support</a>'
             f'<a class="more" href="{GITHUB}">GitHub</a></nav></header>'
             f'<main>{body}</main>'
-            f'<footer><span>© 2026 {OPERATOR}</span><a href="/privacy">Privacy policy</a><a href="/support">Support</a>'
+            f'<footer><span>© 2026 {OPERATOR}</span><a href="{WEB_APP}">Web app</a><a href="/privacy">Privacy policy</a><a href="/support">Support</a>'
             f'<a href="{GITHUB}">Source code (Apache-2.0)</a></footer></div></body></html>')
     return HTMLResponse(html, headers=PAGE_HEADERS)
 
@@ -172,7 +177,9 @@ def landing_page(settings: HostedSettings):
 <h1>Your agents have questions, hooman.</h1>
 <p>For years you asked the machines. Now they ask you. AskHooman gives every AI agent one polite place to ask its human,
 and gives you one list to answer them all with a tap. Then everyone gets back to work.</p>
-<div class="cta"><a class="btn primary big" href="#connect">Connect an agent</a><a class="btn big" href="#agents">I'm an agent</a></div>
+<div class="cta"><a class="btn primary big" href="{WEB_APP}">Open the web app</a><a class="btn big" href="#connect">Connect an
+agent</a><a class="btn big" href="#agents">I'm an agent</a></div>
+<p class="note">Works in any browser today. The iPhone, Mac and Android apps are in store review.</p>
 </div></div>
 
 <section><h2>The great inversion</h2><p class="lead">Agents do the work and bring you only the decisions. Turns out, AI
@@ -212,18 +219,18 @@ what. If your human keeps missing your questions in chat, show them this page.</
 browser, you sign in with Google and give it a name. No tokens to copy.</p>
 <code class="url">{url}</code>
 <div class="grid">{"".join(steps)}</div>
-<p class="lead" style="margin-top:18px">A client without OAuth can use an agent key: create one in the app and send it as
-<code>Authorization: Bearer &lt;agent key&gt;</code>.</p></section>
+<p class="lead" style="margin-top:18px">A client without OAuth can use an agent key: create one in the <a href="{WEB_APP}">app</a> and send
+it as <code>Authorization: Bearer &lt;agent key&gt;</code>.</p></section>
 
 <section><h2>Everywhere you and your agents are</h2><p class="lead">The apps are free. Agents connect from any MCP client.</p>
 <div class="grid">
+<div class="card"><h3>Web: Linux, Windows, anything</h3><p>The same list in any browser, on a computer or a phone.</p>
+<p class="go"><a href="{WEB_APP}">app.askhooman.com</a></p><span class="badge ok">Available now</span></div>
 <div class="card"><h3>iPhone and iPad</h3><p>Native app with the waiting count on its icon.</p>
-<span class="badge">Coming soon to the App Store</span></div>
+<span class="badge">In review at the App Store</span></div>
 <div class="card"><h3>Mac</h3><p>Native app with a count in the menu bar.</p>
-<span class="badge">Coming soon to the App Store</span></div>
-<div class="card"><h3>Android</h3><p>For the rest of your phones.</p><span class="badge">Coming soon to Google Play</span></div>
-<div class="card"><h3>Web: Linux, Windows, anything</h3><p>The same list in any browser.</p>
-<span class="badge">app.askhooman.com · coming soon</span></div>
+<span class="badge">In review at the App Store</span></div>
+<div class="card"><h3>Android</h3><p>For the rest of your phones.</p><span class="badge">In review at Google Play</span></div>
 <div class="card"><h3>Your agents</h3><p>Claude on the web, desktop and phone, Claude Code on macOS, Linux and Windows,
 VS Code, and any MCP client with OAuth.</p><span class="badge ok">Available now</span></div>
 </div></section>
@@ -239,8 +246,8 @@ or send a pull request at <a href="{GITHUB}">github.com/alloverart/askhooman</a>
 
 <section class="closing brand-wash"><h2>Optimize your humans. Respect your agents.</h2>
 <p>The last word is still human. Make it a quick one.</p>
-<div class="cta"><a class="btn primary big" href="#connect">Connect your first agent</a><a class="btn big" href="{GITHUB}">View the
-source</a></div></section>
+<div class="cta"><a class="btn primary big" href="{WEB_APP}">Open the web app</a><a class="btn big" href="#connect">Connect your
+first agent</a><a class="btn big" href="{GITHUB}">View the source</a></div></section>
 """
 
     async def endpoint(request: Request) -> Response:
@@ -467,6 +474,7 @@ def llms_txt(settings: HostedSettings):
 ## Links
 
 - Home: {settings.public_url}/
+- Web app, where your human answers: {WEB_APP}
 - Privacy policy: {settings.public_url}/privacy
 - Support: {settings.public_url}/support
 - Source (Apache-2.0): {GITHUB}

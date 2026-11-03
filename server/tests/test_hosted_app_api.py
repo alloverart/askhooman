@@ -289,7 +289,7 @@ def test_landing_page_and_icons(hosted):
     assert "noindex" not in landing.text and 'href="/favicon.ico"' in landing.text
     # the connect steps are the app's (connect-info), with the public URL
     assert f"claude mcp add --scope user --transport http askhooman {RESOURCE}" in landing.text and f">{RESOURCE}<" in landing.text
-    assert "https://github.com/alloverart/askhooman" in landing.text and "coming soon" in landing.text.lower()
+    assert "https://github.com/alloverart/askhooman" in landing.text and 'href="https://app.askhooman.com"' in landing.text
     for path, words in (("/privacy", ("appDataFolder", "drive.appdata", "Delete hidden app data", "support@askhooman.com",
                                       "encrypted", "one-way hashes", "within 30")),
                         ("/support", ("support@askhooman.com", "security@askhooman.com", "/issues"))):
@@ -301,7 +301,7 @@ def test_landing_page_and_icons(hosted):
         assert link in landing.text
     llms = hosted.get("/llms.txt")  # for agents reading the site
     assert llms.status_code == 200 and llms.headers["content-type"].startswith("text/plain")
-    assert f"askhooman {RESOURCE}" in llms.text and "asks_mine" in llms.text and f"{PUBLIC}/privacy" in llms.text
+    assert f"askhooman {RESOURCE}" in llms.text and "asks_mine" in llms.text and f"{PUBLIC}/privacy" in llms.text and "https://app.askhooman.com" in llms.text
     for path, kind in (("/favicon.ico", "image/x-icon"), ("/favicon.svg", "image/svg+xml"),
                        ("/apple-touch-icon.png", "image/png"), ("/site.webmanifest", "application/manifest+json"),
                        ("/og-image-1200x630.png", "image/png"), ("/icon-maskable-512x512.png", "image/png"),
@@ -338,7 +338,8 @@ def test_store_pages(hosted):
     landing, privacy, support = (" ".join(pages[p].text.split()) for p in ("/", "/privacy", "/support"))  # as rendered
     assert f"<code class=\"url\">{RESOURCE}</code>" in landing
     assert "Add custom connector" in landing and f"claude mcp add --scope user --transport http askhooman {RESOURCE}" in landing
-    for words in ("Coming soon to the App Store", "Coming soon to Google Play", "app.askhooman.com · coming soon",
+    for words in ("In review at the App Store", "In review at Google Play", "Open the web app",
+                  '<a href="https://app.askhooman.com">app.askhooman.com</a>',
                   "Apache-2.0", "drive.appdata",
                   "We keep only your account email, an encrypted Google token and your agents' names and keys"):
         assert words in landing, words
