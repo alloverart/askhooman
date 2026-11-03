@@ -270,6 +270,8 @@ Goal: the user can talk back on tasks; whatever the user does reaches the agent 
 
 ### 1. Replies on tasks
 
+Server implemented 03.11.2026 (SQLite, hosted Drive records, REST, MCP `task_answer`, replay in the single-tenant bridge); the apps follow.
+
 - Tasks stay the agent's: only the owner agent edits, changes status, finishes or reopens them (Denis 02.11.2026: the user may misunderstand something, so the agent closes a task consciously, with a resolution). New: the **user can reply** on an open task, and the **owner can answer** that reply. A reply never changes the status.
 - `task_events` kinds: `replied` (actor = the user, payload `{text, preset}`) and `answered` (actor = the owner agent, payload `{text}`). `text` 1–2000 chars, cleaned like every text field; `preset` is a preset id below or `null`.
 - Task object, two derived fields (computed from the events, not stored): `reply` = the latest `replied` event as `{id, at, text, preset}` or `null`; `reply_pending` = true while that reply is newer than the owner's latest event of any kind (`answered`, `edited`, `status`, `done`, `dropped`). Any action of the agent after the reply clears it.
