@@ -15,7 +15,7 @@ from server.drive import DriveClient, DriveError
 from server.notify import answer_text, close_text, reopen_text
 
 from .conftest import ALLEN, DENIS, auth
-from .fake_drive import CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN, FakeDrive, app_action, make_client
+from .fake_drive import CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN, FakeDrive, app_action, app_task_reply, make_client
 
 
 @pytest.fixture
@@ -597,3 +597,41 @@ def test_task_file_adopted_or_written_again(dclient, fake):
     sync(dclient)
     doc = assert_task_mirrored(dclient, fake, 1, rev=1)
     assert doc["ref"] == "TG 2" and fake.file("task-1.json")["id"] != file_id
+
+
+# ---------- replies on tasks from the app (SPEC v5) ----------
+
+def test_app_task_reply_is_replayed_once(dclient, fake, sender, notifier, caplog):
+    task = create_task(dclient, title="Chase the supplier")
+    sync(dclient)
+    app_task_reply(fake, task["id"], "What's the status?\nany news", "status")
+    with caplog.at_level(logging.WARNING, logger="asks.drive"):
+        sync(dclient)
+    assert "changed outside the bridge" not in caplog.text
+    after = get_task(dclient, task["id"])
+    replied = after["events"][-1]
+    assert (replied["kind"], replied["actor"], replied["payload"]) == (
+        "replied", "denis", {"text": "What's the status?\nany news", "preset": "status"})
+    assert after["reply_pending"] is True and after["status"] == "active"
+    doc = assert_task_mirrored(dclient, fake, task["id"])   # pushed back with the bridge's event id
+    assert [e["kind"] for e in doc["events"]] == ["created", "replied"]
+    fake.requests.clear()
+    sync(dclient)                                            # the same reply again: nothing applied or written
+    assert writes(fake) == [] and len(get_task(dclient, task["id"])["events"]) == 2
+    assert sender.sent == []
+
+
+def test_app_task_reply_on_a_task_finished_meanwhile_is_skipped(dclient, fake, sender, notifier, caplog):
+    task = create_task(dclient, title="Chase the supplier")
+    sync(dclient)
+    stale = json.loads(fake.file("task-1.json")["content"])
+    assert dclient.post(f"/api/tasks/{task['id']}/done", json={}, headers=auth(ALLEN)).status_code == 200
+    sync(dclient)
+    app_task_reply(fake, task["id"], "Is this still needed?", "still-needed", base=stale)  # an old copy
+    with caplog.at_level(logging.INFO, logger="asks.drive"):
+        sync(dclient)
+    assert "skipped the human's replied of task #1" in caplog.text
+    after = get_task(dclient, task["id"])
+    assert after["status"] == "done" and [e["kind"] for e in after["events"]] == ["created", "done"]
+    doc = assert_task_mirrored(dclient, fake, task["id"])   # rewritten from SQLite
+    assert doc["status"] == "done"

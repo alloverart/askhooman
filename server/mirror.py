@@ -8,8 +8,9 @@ one step at a time:
   have yet;
 - between full syncs AskService/TaskService wake it after each write, and it pushes what changed.
 Asks (ask-<id>.json) and tasks (task-<id>.json) go through the same steps; a `Kind` says what differs
-(tables, file name, fixed fields). Only ask files are replayed: the app never writes task files, so a
-task file someone else changed is just logged and overwritten with the bridge's state.
+(tables, file name, fixed fields). Ask files and the user's task replies are replayed: in task files the app
+writes only `replied` events (SPEC v5), replayed through TaskService.reply; any other change to a task file
+is logged and overwritten with the bridge's state.
 What Drive holds is tracked in SQLite (drive_files for asks, drive_task_files for tasks: file id, rev,
 last event pushed), so a push that failed (Drive down, process restarted) is simply done by a later
 cycle, and the first start with an empty table pushes everything that exists (migration). Drive problems
@@ -46,6 +47,12 @@ CREATE TABLE IF NOT EXISTS drive_replayed (    -- the human's actions from the a
     at     TEXT NOT NULL,
     PRIMARY KEY (ask_id, kind, at)
 );
+CREATE TABLE IF NOT EXISTS drive_task_replayed (  -- v5: the user's task replies from the app already replayed
+    task_id INTEGER NOT NULL,
+    kind    TEXT NOT NULL,
+    at      TEXT NOT NULL,
+    PRIMARY KEY (task_id, kind, at)
+);
 CREATE TABLE IF NOT EXISTS drive_task_files (  -- tasks: same columns as drive_files
     task_id       INTEGER PRIMARY KEY,
     file_id       TEXT NOT NULL,
@@ -58,6 +65,7 @@ CREATE TABLE IF NOT EXISTS drive_task_files (  -- tasks: same columns as drive_f
 
 DENIS = Identity("denis")
 REPLAYED_KINDS = ("answered", "closed", "reopened")
+REPLAYED_TASK_KINDS = ("replied",)
 FILE_SCHEMA = 1
 BACKOFF_MAX = 300.0  # seconds between retries while Drive keeps failing
 LOG_EVERY = 600.0  # repeat an unchanged warning this often
@@ -73,7 +81,7 @@ class Kind:
     mapping: str
     fields: tuple[str, ...]
     marker: tuple[tuple[str, object], ...] = ()  # fixed top-level fields of the file, e.g. ("kind", "task")
-    replay: bool = False  # the human's app actions in the file are replayed (asks only)
+    replay: bool = False  # the human's app actions in the file are replayed (asks; tasks: replies, v5)
 
     def file(self, item_id: int) -> str:
         return file_name(item_id, self.name)
@@ -84,7 +92,8 @@ class Kind:
 
 
 ASK = Kind("ask", "asks", "ask_events", "ask_id", "drive_files", ASK_FIELDS, replay=True)
-TASK = Kind("task", "tasks", "task_events", "task_id", "drive_task_files", TASK_FIELDS, marker=(("kind", "task"),))
+TASK = Kind("task", "tasks", "task_events", "task_id", "drive_task_files", TASK_FIELDS, marker=(("kind", "task"),),
+            replay=True)
 KNOWN_KEYS = ASK.known
 
 
@@ -107,6 +116,18 @@ def _state(doc: dict, kind: Kind = ASK) -> dict:
     """The part of a file that must equal SQLite: the record's fields and events (and the fixed fields)."""
     return {**{field: doc.get(field) for field in (*kind.fields, *(k for k, _ in kind.marker))},
             "events": doc.get("events")}
+
+
+def _beyond_replies(remote: dict, local: dict) -> bool:
+    """A task file differs from SQLite in more than the user's replies (SPEC v5): compare both without `replied`
+    events and updated_at, which a reply changes on both sides."""
+    def strip(doc: dict) -> dict:
+        state = _state({**doc, **dict(TASK.marker)}, TASK)
+        events = state["events"] if isinstance(state["events"], list) else []
+        state["events"] = [e for e in events if not (isinstance(e, dict) and e.get("kind") == "replied")]
+        state.pop("updated_at", None)
+        return state
+    return strip(remote) != strip(local)
 
 
 def build_doc(item: dict, rev: int, extra: dict | None = None, kind: Kind = ASK) -> dict:
@@ -289,32 +310,37 @@ class DriveMirror:
             # Not the record we have under this id (e.g. the database was restored from an old copy).
             log.warning("Drive file %s holds another %s (agent %s, created %s): it will be rewritten from SQLite",
                         name, kind.name, remote.get("agent"), remote.get("created_at"))
-        elif kind.replay and self._replay(item_id, remote.get("events")):
+        elif kind.replay and self._replay(kind, item_id, remote.get("events")):
             local = service.get(item_id)
         rev = max(_rev(meta), _int(remote.get("rev")), row["rev"] if row else 0)
         in_sync = remote.get("writer") == "bridge" and _state(remote, kind) == _state({**local, **dict(kind.marker)}, kind)
-        if remote and row is not None and not kind.replay and not in_sync:
-            # Only the bridge writes task files, yet someone changed this one: nothing to apply, the bridge's state wins.
+        if remote and row is not None and kind is TASK and not in_sync and _beyond_replies(remote, local):
+            # In task files the app writes only replies (replayed above); anything else someone changed: nothing to
+            # apply, the bridge's state wins.
             log.warning("Drive file %s was changed outside the bridge (rev %s, writer %s): overwriting it",
                         name, rev, remote.get("writer"))
         extra = {key: value for key, value in remote.items() if key not in kind.known}
         self._save(kind, item_id, meta["id"], rev, _last_event(local) if in_sync else -1, meta.get("modifiedTime"),
                    extra)
 
-    def _replay(self, ask_id: int, events) -> int:
+    def _replay(self, item_kind: Kind, item_id: int, events) -> int:
         """Apply the human's actions from the file that the bridge doesn't have yet, in file order, as the human
-        through AskService. An action is new if no SQLite event and no earlier replay has its kind + at.
-        Invalid ones (e.g. the agent closed the ask meanwhile) are logged and skipped. Returns how many
-        were applied."""
+        through AskService (asks: answer/close/reopen) or TaskService (tasks: replies, SPEC v5). An action is new
+        if no SQLite event and no earlier replay has its kind + at. Invalid ones (e.g. the agent closed the ask
+        or finished the task meanwhile) are logged and skipped. Returns how many were applied."""
         if not isinstance(events, list):
             return 0
+        is_task = item_kind is TASK
+        replayed_table, kinds = ("drive_task_replayed", REPLAYED_TASK_KINDS) if is_task else ("drive_replayed",
+                                                                                             REPLAYED_KINDS)
         with self.db.transaction() as conn:
             seen = {(r["kind"], r["at"]) for r in conn.execute(
-                "SELECT kind, at FROM ask_events WHERE ask_id = ? UNION SELECT kind, at FROM drive_replayed WHERE ask_id = ?",
-                (ask_id, ask_id))}
+                f"SELECT kind, at FROM {item_kind.events} WHERE {item_kind.key} = ? "
+                f"UNION SELECT kind, at FROM {replayed_table} WHERE {item_kind.key} = ?",
+                (item_id, item_id))}
         applied = 0
         for event in events:
-            if not isinstance(event, dict) or event.get("actor") != "denis" or event.get("kind") not in REPLAYED_KINDS:
+            if not isinstance(event, dict) or event.get("actor") != "denis" or event.get("kind") not in kinds:
                 continue
             kind, at = event["kind"], str(event.get("at"))
             if (kind, at) in seen:
@@ -322,20 +348,25 @@ class DriveMirror:
             seen.add((kind, at))
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             try:
-                if kind == "answered":
-                    self.service.answer(DENIS, ask_id, payload.get("answer"))
+                if is_task:
+                    self._services[TASK.name].reply(DENIS, item_id, {"text": payload.get("text"),
+                                                                     "preset": payload.get("preset")})
+                elif kind == "answered":
+                    self.service.answer(DENIS, item_id, payload.get("answer"))
                 elif kind == "closed":
-                    self.service.close(DENIS, ask_id, payload.get("resolution"))
+                    self.service.close(DENIS, item_id, payload.get("resolution"))
                 else:
-                    self.service.reopen(DENIS, ask_id)
+                    self.service.reopen(DENIS, item_id)
             except AskError as exc:
-                log.warning("Drive: skipped the human's %s of ask #%s from the app (at %s): %s", kind, ask_id, at, exc)
+                log.warning("Drive: skipped the human's %s of %s #%s from the app (at %s): %s",
+                            kind, item_kind.name, item_id, at, exc)
             else:
-                log.info("Drive: replayed the human's %s of ask #%s from the app (at %s)", kind, ask_id, at)
+                log.info("Drive: replayed the human's %s of %s #%s from the app (at %s)",
+                         kind, item_kind.name, item_id, at)
                 applied += 1
             with self.db.transaction(write=True) as conn:
-                conn.execute("INSERT OR IGNORE INTO drive_replayed (ask_id, kind, at) VALUES (?, ?, ?)",
-                             (ask_id, kind, at))
+                conn.execute(f"INSERT OR IGNORE INTO {replayed_table} ({item_kind.key}, kind, at) VALUES (?, ?, ?)",
+                             (item_id, kind, at))
         return applied
 
     def _push(self, kind: Kind, item_id: int) -> None:
