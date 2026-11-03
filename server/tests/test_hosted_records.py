@@ -9,7 +9,7 @@ from server.mirror import ASK, app_properties, build_doc
 from server.rules import ask_order
 from server.task_rules import task_order
 
-from .fake_drive import app_action
+from .fake_drive import app_action, app_task_reply
 from .hosted_support import (
     DENIS_SUB,
     OLGA_EMAIL,
@@ -192,3 +192,33 @@ def test_python_order_matches_sqlite_order(tmp_dir):
     assert [a["id"] for a in sorted(asks, key=ask_order)] == [a["id"] for a in sql_asks]
     assert [t["id"] for t in sorted(tasks, key=task_order)] == [t["id"] for t in sql_tasks]
     assert json.dumps(sql_asks)  # plain JSON
+
+
+def test_task_replies_from_the_app_and_task_answer(hosted, google):
+    """SPEC v5: the app writes the user's `replied` event into task-<id>.json; the hosted bridge derives
+    reply / reply_pending from the file (never stored), lists pending first, and the owner answers."""
+    allen = agent_token(hosted, google, "Allen")
+    feynman = agent_token(hosted, google, "Feynman")
+    drive = google.drive(DENIS_SUB)
+    first = tool_result(mcp(hosted, allen, "task_create", {"title": "Chase the supplier", "next_check": "2026-11-04"}))
+    second = tool_result(mcp(hosted, allen, "task_create", {"title": "Renew the domain", "next_check": "2026-12-01"}))
+    assert first["reply"] is None and first["reply_pending"] is False
+    app_task_reply(drive, second["id"], "What's the status?\nany news", "status")
+    got = tool_result(mcp(hosted, allen, "task_get", {"id": second["id"]}))
+    assert got["reply_pending"] is True and got["reply"]["text"] == "What's the status?\nany news"
+    assert got["reply"]["preset"] == "status" and got["events"][-1]["kind"] == "replied"
+    mine = tool_result(mcp(hosted, allen, "tasks_mine"))["tasks"]
+    assert [t["id"] for t in mine] == [second["id"], first["id"]] and mine[0]["reply_pending"] is True
+    assert "forbidden" in tool_error(mcp(hosted, feynman, "task_answer", {"id": second["id"], "text": "not mine"}))
+    answered = tool_result(mcp(hosted, allen, "task_answer", {"id": second["id"], "text": "Asked them again"}))
+    assert answered["reply_pending"] is False and answered["reply"]["text"].startswith("What's the status?")
+    doc = drive.task_doc(second["id"])
+    assert "reply" not in doc and "reply_pending" not in doc
+    assert [(e["kind"], e["actor"]) for e in doc["events"]] == [
+        ("created", "allen"), ("replied", "denis"), ("answered", "allen")]
+    assert [t["id"] for t in tool_result(mcp(hosted, allen, "tasks_mine"))["tasks"]] == [first["id"], second["id"]]
+    # an agent can't reply (REST); finished tasks take no answer
+    auth = {"Authorization": f"Bearer {allen}"}
+    assert hosted.post(f"/api/tasks/{first['id']}/reply", json={"text": "hi"}, headers=auth).status_code == 403
+    tool_result(mcp(hosted, allen, "task_done", {"id": first["id"]}))
+    assert "conflict" in tool_error(mcp(hosted, allen, "task_answer", {"id": first["id"], "text": "late"}))

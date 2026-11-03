@@ -22,6 +22,7 @@ import json
 import logging
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -53,9 +54,12 @@ from ..task_rules import (
     default_limit,
     new_task_record,
     plan_finish,
+    plan_task_answer,
     plan_task_create,
     plan_task_reopen,
+    plan_task_reply,
     plan_task_update,
+    reply_state,
     task_order,
 )
 from ..task_rules import STATUS_FILTERS as TASK_FILTERS
@@ -249,8 +253,10 @@ class DriveCollection:
     """The asks (or tasks) of one user: reads and writes of their files."""
 
     def __init__(self, records: UserRecords, kind: Kind, filters: dict, statuses: tuple, order, list_fields,
-                 groups: dict):
+                 groups: dict, decorate: Callable[[dict, list], dict] | None = None):
         self.records = records
+        # derived fields from the events (tasks: reply / reply_pending), on every record returned, never written
+        self.decorate = decorate or (lambda record, events: record)
         self.kind = kind
         self.filters = filters
         self.statuses = statuses
@@ -339,6 +345,7 @@ class DriveCollection:
             raise self._missing(item_id) from None
         if entry is None or entry["id"] != item_id:
             raise Unavailable(f"{self.kind.file(item_id)} in Google Drive is not a valid {self.kind.name}")
+        entry = self.decorate(entry, entry["events"])
         if not with_events:
             entry.pop("events")
         return entry
@@ -355,6 +362,7 @@ class DriveCollection:
             wanted = sorted(wanted, key=self._hint)[:limit + LIST_SLACK]
         items = []
         for entry in self._entries(wanted):
+            entry = self.decorate(entry, entry["events"])
             entry.pop("events")
             if entry["status"] in statuses and (not agent or entry["agent"] == agent):
                 items.append(entry)
@@ -371,7 +379,7 @@ class DriveCollection:
         doc = build_doc({**record, "events": [event]}, 1, None, self.kind)
         self.records.call(self.records.drive.create, self.kind.file(item_id), doc, app_properties(record, 1, self.kind))
         log.info("hosted: created %s for agent %s", self.kind.file(item_id), who.agent)
-        return record
+        return self.decorate(record, [event])
 
     def mutate(self, who: Identity, item_id, plan) -> dict:
         """Read-modify-write of one file. plan(load) -> (current record, Change | None), from the shared rules;
@@ -419,7 +427,7 @@ class DriveCollection:
         entry = self._entry_of(doc, item_id)
         if entry is not None and written.get("modifiedTime"):
             self.records.pool.remember((self.kind.name, meta["id"], written["modifiedTime"]), entry)
-        return record
+        return self.decorate(record, events)
 
 
 class HostedAsks:
@@ -456,7 +464,8 @@ class HostedTasks:
 
     def __init__(self, records: UserRecords):
         self.items = DriveCollection(records, TASK, TASK_FILTERS, TASK_STATUSES, task_order, ("links",),
-                                     {"active": 0, "waiting": 0, "done": 1, "dropped": 1})
+                                     {"active": 0, "waiting": 0, "done": 1, "dropped": 1},
+                                     decorate=lambda record, events: {**record, **reply_state(events)})
 
     def get(self, task_id: int, with_events: bool = True) -> dict:
         return self.items.get(task_id, with_events)
@@ -478,4 +487,10 @@ class HostedTasks:
 
     def reopen(self, who: Identity, task_id: int) -> dict:
         return self.items.mutate(who, task_id, lambda load: plan_task_reopen(who, load, utc_now()))
+
+    def reply(self, who: Identity, task_id: int, data: dict) -> dict:
+        return self.items.mutate(who, task_id, lambda load: plan_task_reply(who, data, load, utc_now()))
+
+    def answer(self, who: Identity, task_id: int, data: dict) -> dict:
+        return self.items.mutate(who, task_id, lambda load: plan_task_answer(who, data, load, utc_now()))
 

@@ -240,3 +240,19 @@ def app_action(fake: FakeDrive, ask_id: int, kind: str, answer: str | None = Non
     fake.write(file["id"], doc, {"ask_id": str(ask_id), "status": doc["status"], "agent": doc["agent"],
                                  "rev": str(doc["rev"])})
     return doc
+
+
+def app_task_reply(fake: FakeDrive, task_id: int, text: str, preset: str | None = None) -> dict:
+    """What the apps do for a reply on a task (SPEC v5): fresh download, a denis `replied` event with id max+1,
+    rev+1, writer "app"; appProperties unchanged except rev."""
+    file = fake.file(f"task-{task_id}.json")
+    doc = json.loads(file["content"])
+    time.sleep(0.002)
+    at = now_iso()
+    doc["events"].append({"id": max(e["id"] for e in doc["events"]) + 1, "task_id": task_id, "at": at,
+                          "actor": "denis", "kind": "replied", "payload": {"text": text, "preset": preset}})
+    doc["updated_at"] = at
+    doc["rev"] += 1
+    doc["writer"] = "app"
+    fake.write(file["id"], doc, {**file["appProperties"], "rev": str(doc["rev"])})
+    return doc
