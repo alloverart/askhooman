@@ -303,12 +303,50 @@ Server implemented 03.11.2026 (SQLite, hosted Drive records, REST, MCP `task_ans
 
 ### 2. Waking the agent
 
-- Events: `ask.answered`, `ask.closed`, `ask.reopened` (as now) and **`task.replied`**: body `{type, task (no events), reply: {text, preset}, event: {id, at}, delivery_id, sent_at}`, signed like the others. `POST /api/events` also takes `{task_id, kind: "replied"}` (404 if the task isn't in the user's Drive, 409 if it has no such event).
-- **Per-agent switch `wake`** (default on): off = the bridge sends nothing for that agent, webhook or not. `PATCH /api/agents/{id} {wake}`; the agent shape adds `wake`, `webhook_set_by` (`"user"` | `"agent"` | `null`) and `last_delivery` = `{at, ok, status, error}` (the latest delivery's outcome: success, or the final failure after retries).
-- Apps, Agents screen, per agent: a **Wake-up** switch; "Webhook → <host> · set by the agent" (or "by you"); "Last ping ok, 11:20" or "Last ping failed: 404, 11:20"; the existing Webhook button edits or removes the address.
-- **Agents wire themselves** (hosted MCP): `set_my_webhook(url, rotate_secret=False)`: https, port 443, public host (the App API's check); `""` removes it. Returns `{webhook_url, secret?}`; the `whsec_…` secret is returned only when new (first set, or `rotate_secret`), so the agent can verify signatures. Sets `webhook_set_by: "agent"`. `test_my_webhook()`: sends `{type: "ping", delivery_id, sent_at}`, signed, waits for the first attempt (10 s) and returns `{ok, status, error}`; it updates `last_delivery`. Limits: 10 sets and 10 tests per hour per agent. Only the calling agent's own webhook (identity from the token).
-- Server instructions (to agents): "Your user may want you to wake up when they answer. If you can receive an HTTPS POST (your own server, a bot, a workflow tool), ask your user with ask_create whether to set it up, then call set_my_webhook and test_my_webhook. If you can't (a chat app), don't: you see answers in asks_mine and tasks_mine when you start."
-- Not in v5: a Claude Code channel plugin (waits for a check of what Claude Code allows third-party channels) and an `ask_wait` long-poll.
+Rewritten 03.11.2026 (Denis: «relay внутри AskHooman»). Most agents run where nothing can reach them: a Claude Code
+session on a laptop behind NAT, Codex on a desktop. A webhook needs a public HTTPS receiver, and most users have none.
+So the bridge keeps each agent's events, and the agent's side fetches them over a connection it opens itself. Nobody
+needs a public URL. Webhooks stay for agents that do have a server.
+
+- **Events:** `ask.answered`, `ask.closed`, `ask.reopened` (as now) and **`task.replied`**: body `{type, task (no events),
+  reply: {text, preset}, event: {id, at}, delivery_id, sent_at}`. `POST /api/events` also takes
+  `{task_id, kind: "replied"}` (404 if the task isn't in the user's Drive, 409 if it has no such event). An event only
+  wakes the agent. What happened is read with `asks_mine` / `tasks_mine`, as always. Delivery is at least once.
+- **The agent's event feed (new):** `GET /api/agent/events?after=<cursor>&wait=<seconds>` with the agent's token (OAuth
+  access token or agent key) → `{events: [...], cursor}`. It is a long poll: it answers at once if there are events after
+  `cursor`, otherwise it holds the request up to `wait` seconds (≤ 50, well under Cloud Run's request timeout) and
+  answers with what arrived, or `[]`. Events wait in a bounded per-agent queue in the bridge's store (the last 200 or
+  7 days). A cursor that is too old answers `{events: [], cursor, missed: true}`, so the agent rereads `asks_mine` /
+  `tasks_mine`. Only the calling agent's own events are served.
+- **MCP `ask_wait(timeout=50)`:** the same feed inside MCP for clients without the plugin. The call returns when the
+  agent has an event, or after `timeout` (≤ 50) with none; the bridge keeps the cursor per agent. Docstring: "Wait
+  for your user: returns as soon as they answer, close or reopen one of your asks or reply on one of your tasks. Then
+  call asks_mine / tasks_mine."
+- **AskHooman channel plugin for Claude Code (open source, in this repo, `plugins/claude-code`):** a local stdio MCP
+  server that declares `claude/channel`, long-polls the feed with an agent key, and turns each event into a channel
+  message: "AskHooman: <user> answered ask #N — call asks_mine". Install:
+  `/plugin marketplace add alloverart/askhooman`, `/plugin install askhooman@askhooman`, then start Claude Code with
+  `--dangerously-load-development-channels plugin:askhooman@askhooman` until Anthropic lists the plugin (we apply).
+  Limits from Claude Code: interactive sessions only, and claude.ai or Console sign-in.
+- **CLI `askhooman listen --exec "<command>"`:** long-polls the feed and runs the user's command per event, with
+  `ASKHOOMAN_EVENT`, `ASKHOOMAN_ASK_ID` / `ASKHOOMAN_TASK_ID` in the environment. Use it for Codex, scripts, cron and
+  bots, for example `askhooman listen --exec 'claude -p "check asks_mine"'`. It runs with an agent key.
+- **Webhooks (as in v4, plus):** `set_my_webhook(url, rotate_secret=False)` / `test_my_webhook()` let an agent with
+  its own server, n8n or Zapier wire itself. They follow the rules already drafted (https, port 443, public host; a
+  `whsec_…` secret returned only when new; 10 sets and 10 tests per hour; only the caller's own webhook;
+  `webhook_set_by: "agent"`).
+- **Per-agent switch `wake`** (default on): off = no events in the feed and no webhook calls for that agent.
+  `PATCH /api/agents/{id} {wake}`. The agent shape adds `wake`, `webhook_set_by`, `last_delivery` = `{at, ok, status,
+  error}` (webhook) and `last_seen` = when the agent last read its feed.
+- **Apps, Agents screen, per agent:** a **Wake-up** switch. "Wakes through the plugin, last seen 11:20", or "Webhook →
+  <host> · set by the agent". "Last ping ok, 11:20" or "Last ping failed: 404, 11:20". The existing Webhook button edits
+  or removes the address.
+- **Server instructions (to agents):** "Your user may want you to wake up when they answer. In Claude Code, suggest
+  the AskHooman plugin (one install, no server). Elsewhere, call ask_wait while you wait for an answer, or, if you can
+  receive an HTTPS POST, ask your user with ask_create whether to set up set_my_webhook. Either way, read asks_mine
+  and tasks_mine when you start."
+- **Not in v5:** pushing into a running Claude Code session from the remote MCP server itself. Claude Code doesn't
+  inject server notifications into the conversation, so the plugin is the way.
 
 ### 3. The agent's name
 
@@ -323,4 +361,4 @@ Server implemented 03.11.2026 (SQLite, hosted Drive records, REST, MCP `task_ans
 
 ### Order
 
-1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery`, the Wake-up row in the apps. 3. `set_my_name`. 4. Images. Each step ships on its own; existing tools and file formats keep working throughout.
+1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the agent's event feed + `ask_wait`, the Claude Code channel plugin, `askhooman listen`, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery` / `last_seen`, the Wake-up row in the apps. 3. `set_my_name`. 4. Images. Each step ships on its own; existing tools and file formats keep working throughout.
