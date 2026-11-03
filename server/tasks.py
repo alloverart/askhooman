@@ -167,7 +167,7 @@ class TaskService:
         return self.get(task_id, with_events=False)
 
     @staticmethod
-    def _with_reply(conn, tasks: list[dict]) -> None:
+    def _with_reply(conn, tasks: "list[dict]") -> None:  # quoted: `list` is the method above, in this class body
         """Set the derived `reply` / `reply_pending` (task_rules.reply_state) on each task, in place."""
         if not tasks:
             return
