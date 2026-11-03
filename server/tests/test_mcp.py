@@ -14,7 +14,8 @@ from mcp.shared._httpx_utils import create_mcp_http_client
 from .conftest import ALLEN, CHAT, DENIS, HAMILTON, auth
 
 TOOLS = {"ask_create", "asks_mine", "asks_list", "ask_get", "ask_update", "ask_close", "ask_answer",
-         "task_create", "tasks_mine", "tasks_list", "task_get", "task_update", "task_done", "task_drop", "task_reopen"}
+         "task_create", "tasks_mine", "tasks_list", "task_get", "task_update", "task_done", "task_drop", "task_reopen",
+         "task_answer"}
 
 
 @asynccontextmanager
@@ -122,7 +123,7 @@ def test_every_tool_has_a_title_and_explicit_hints(live_server):
             assert t.annotations.read_only_hint is not None and t.annotations.destructive_hint is False, t.name
         assert {t.name for t in tools if t.annotations.read_only_hint} == {
             "asks_mine", "asks_list", "ask_get", "tasks_mine", "tasks_list", "task_get"}
-        assert len(tools) == 15  # single-tenant: ask_answer too
+        assert len(tools) == 16  # single-tenant: ask_answer too; v5: task_answer
 
     asyncio.run(scenario())
 
@@ -282,3 +283,33 @@ def test_mcp_task_round_trip(live_server, sender, notifier):
 
     asyncio.run(scenario())
     assert notifier.flush() and sender.sent == []  # no Telegram for tasks
+
+
+def test_mcp_task_answer_and_reply_pending_docs(live_server):
+    """SPEC v5: the user replies on a task (REST, the app); the owner sees reply_pending and answers with
+    task_answer."""
+    from server.mcp_tools import HOSTED_INSTRUCTIONS, INSTRUCTIONS
+    assert "task_answer" in INSTRUCTIONS and "task_answer" in HOSTED_INSTRUCTIONS
+
+    async def scenario():
+        async with connect(live_server, ALLEN) as allen, connect(live_server, HAMILTON) as hamilton:
+            tools = {t.name: t for t in (await allen.list_tools()).tools}
+            assert "reply_pending" in tools["tasks_mine"].description
+            assert "replied" in tools["task_get"].description and "answered" in tools["task_get"].description
+            assert tools["task_answer"].title == "Answer my human's reply"
+            assert "what you did about their reply" in tools["task_answer"].description
+            task = payload(await allen.call_tool("task_create", {"title": "Chase the supplier"}))
+            async with httpx.AsyncClient(base_url=live_server) as http:
+                r = await http.post(f"/api/tasks/{task['id']}/reply", json={"text": "Status?", "preset": "status"},
+                                    headers=auth(DENIS))
+                assert r.status_code == 200, r.text
+            mine = payload(await allen.call_tool("tasks_mine", {}))
+            assert mine["tasks"][0]["reply_pending"] is True and mine["tasks"][0]["reply"]["text"] == "Status?"
+            assert "only the agent who owns" in error_text(
+                await hamilton.call_tool("task_answer", {"id": task["id"], "text": "not mine"}))
+            answered = payload(await allen.call_tool("task_answer", {"id": task["id"], "text": "Asked again today"}))
+            assert answered["reply_pending"] is False
+            payload(await allen.call_tool("task_done", {"id": task["id"]}))
+            assert "done" in error_text(await allen.call_tool("task_answer", {"id": task["id"], "text": "late"}))
+
+    asyncio.run(scenario())

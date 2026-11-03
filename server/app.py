@@ -83,6 +83,15 @@ class TaskCreate(StrictBody):
     ref: str | None = None
 
 
+class ReplyIn(StrictBody):  # POST /api/tasks/{id}/reply (the user; SPEC v5)
+    text: str
+    preset: str | None = None
+
+
+class TaskAnswerIn(StrictBody):  # POST /api/tasks/{id}/answer (the owner agent; SPEC v5)
+    text: str
+
+
 class TaskPatch(StrictBody):
     title: str | None = None
     context: str | None = None
@@ -336,6 +345,16 @@ def add_api_routes(app: FastAPI, services) -> None:
     @app.post("/api/tasks/{task_id}/reopen")
     def reopen_task(task_id: int, who: Identity = Depends(current_identity)):
         return services(who)[1].reopen(who, task_id)
+
+    # replies on tasks (v5): the user replies on an open task, the owner agent answers
+
+    @app.post("/api/tasks/{task_id}/reply")
+    def reply_task(task_id: int, body: ReplyIn, who: Identity = Depends(current_identity)):
+        return services(who)[1].reply(who, task_id, body.model_dump(exclude_unset=True))
+
+    @app.post("/api/tasks/{task_id}/answer")
+    def answer_task(task_id: int, body: TaskAnswerIn, who: Identity = Depends(current_identity)):
+        return services(who)[1].answer(who, task_id, body.model_dump())
 
 
 def create_app(settings: Settings | None = None, notifier: Notifier | None = None,

@@ -451,3 +451,45 @@ def test_an_existing_database_gets_the_task_tables(settings, notifier):
     with sqlite3.connect(settings.db_path) as conn:
         assert conn.execute("SELECT * FROM asks").fetchall() == before
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone() == (1,)
+
+
+# ---------- REST: reply (the user) and answer (the owner) ----------
+
+def reply(client, task_id, token=DENIS, **body):
+    return client.post(f"/api/tasks/{task_id}/reply", json=body, headers=auth(token))
+
+
+def answer(client, task_id, token=ALLEN, **body):
+    return client.post(f"/api/tasks/{task_id}/answer", json=body, headers=auth(token))
+
+
+def test_rest_reply_and_answer_round_trip(client):
+    task = create(client, status="waiting", waiting_on="Supplier")
+    r = reply(client, task["id"], text="any news?", preset="status")
+    assert r.status_code == 200, r.text
+    assert r.json()["reply"] == {"id": r.json()["reply"]["id"], "at": r.json()["reply"]["at"],
+                                 "text": "any news?", "preset": "status"}
+    assert r.json()["reply_pending"] is True and r.json()["status"] == "waiting"
+    listed = client.get("/api/tasks", headers=auth(ALLEN)).json()["tasks"]
+    assert listed[0]["id"] == task["id"] and listed[0]["reply_pending"] is True
+    a = answer(client, task["id"], text="Asked them again, reply expected Friday")
+    assert a.status_code == 200, a.text
+    assert a.json()["reply_pending"] is False
+    kinds = [e["kind"] for e in client.get(f"/api/tasks/{task['id']}", headers=auth(DENIS)).json()["events"]]
+    assert kinds[-2:] == ["replied", "answered"]
+
+
+def test_rest_reply_permissions_and_validation(client):
+    task = create(client)
+    assert reply(client, task["id"], token=ALLEN, text="hi").status_code == 403       # agents don't reply
+    assert answer(client, task["id"], token=HAMILTON, text="hi").status_code == 403   # not the owner
+    assert answer(client, task["id"], token=DENIS, text="hi").status_code == 403      # the user doesn't answer
+    assert reply(client, task["id"], text="hi", extra=1).status_code == 422
+    assert reply(client, task["id"], text="hi", preset="later").status_code == 422
+    assert reply(client, task["id"], text="  ").status_code == 422
+    assert reply(client, task["id"]).status_code == 422
+    assert answer(client, task["id"], text="hi", preset="status").status_code == 422
+    assert reply(client, 999, text="hi").status_code == 404
+    finish(client, task["id"])
+    assert reply(client, task["id"], text="hi").status_code == 409
+    assert answer(client, task["id"], text="hi").status_code == 409

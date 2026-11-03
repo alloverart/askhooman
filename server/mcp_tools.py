@@ -29,7 +29,8 @@ their answers. Act on an answer, then ask_close it with a one-line resolution of
 Tasks are your own long-running work (more than a day, or waiting on someone outside), so you don't
 forget it and your human sees who is doing what: task_create, check tasks_mine at session start / when woken,
 task_update what moved, task_done with a one-line result. Your human only reads tasks; anything that needs
-their decision is an ask."""
+their decision is an ask. Your human can reply on your tasks; a task with reply_pending waits for you: act on
+it and answer with task_answer (or update or finish the task)."""
 
 # Hosted mode (SPEC "Hosted bridge … (v4)"): many users, each connects their own agents.
 HOSTED_INSTRUCTIONS = """\
@@ -40,7 +41,8 @@ Instead of asking them in a chat, create an ask (ask_create): one decision per a
 ask_close it with a one-line resolution of what was done.
 Tasks are your own long-running work (more than a day, or waiting on someone outside), so you don't forget
 it and they see who is doing what: task_create, task_update what moved, task_done with a one-line result.
-They only read tasks; anything that needs their decision is an ask."""
+They only read tasks; anything that needs their decision is an ask. Your user can reply on your tasks; a task
+with reply_pending waits for you: act on it and answer with task_answer (or update or finish the task)."""
 
 # Words that differ between the single-tenant bridge (one human and their agents) and the hosted one.
 WORDS = {
@@ -87,6 +89,7 @@ NextCheck = Annotated[str, Field(description="When you will look again: a date Y
 TaskStatusFilter = Annotated[str, Field(description="open (active + waiting), active, waiting, done, dropped, "
                                                     "finished (done + dropped) or all")]
 TaskResolution = Annotated[str, Field(description="One line: the result, or why it is no longer needed")]
+AnswerText = Annotated[str, Field(description="What you did about the reply, or why the task stays open; ≤2000 chars")]
 
 def caller(ctx: Context) -> Identity:
     request = ctx.request_context.request
@@ -289,8 +292,10 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     @tool("My tasks", read_only=True)
     def tasks_mine(ctx: Context, status: TaskStatusFilter = "open") -> dict[str, Any]:
         """Your own tasks (open = active + waiting), next check first. Call at session start or when woken,
-        next to asks_mine. For each task: did anything move? task_update it (status, waiting_on, next_check —
-        an overdue next_check means look now), or task_done / task_drop it with a one-line resolution.\
+        next to asks_mine. Tasks where ${human} replied and you haven't acted yet come first (reply_pending):
+        read the reply, act, then task_answer, task_update or task_done / task_drop. For each other task: did
+        anything move? task_update it (status, waiting_on, next_check — an overdue next_check means look now),
+        or task_done / task_drop it with a one-line resolution.\
 ${mine_tasks_note}"""
         who = caller(ctx)
         return call(task_service(who).list, status, None if who.is_denis else who.agent)
@@ -308,7 +313,8 @@ ${mine_tasks_note}"""
 
     @tool("Get a task", read_only=True)
     def task_get(id: int, ctx: Context) -> dict[str, Any]:
-        """One task with its full history (events: created, edited, status, done, dropped, reopened)."""
+        """One task with its full history (events: created, edited, status, done, dropped, reopened, replied —
+        ${humans} reply — and answered — yours)."""
         who = caller(ctx)
         return call(task_service(who).get, id)
 
@@ -344,6 +350,13 @@ ${mine_tasks_note}"""
         """Drop your task (no longer needed, or given up), with a one-line reason."""
         who = caller(ctx)
         return call(task_service(who).drop, who, id, resolution)
+
+    @tool(f"Answer {words['humans'].replace('your ', 'my ')} reply")
+    def task_answer(id: int, ctx: Context, text: AnswerText) -> dict[str, Any]:
+        """Tell ${human} what you did about their reply on your task, or why it stays open. Clears
+        reply_pending; so does any update or finishing the task."""
+        who = caller(ctx)
+        return call(task_service(who).answer, who, id, {"text": text})
 
     @tool("Reopen my task")
     def task_reopen(id: int, ctx: Context) -> dict[str, Any]:
