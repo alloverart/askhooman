@@ -23,6 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..db import utc_now
@@ -113,11 +114,13 @@ def agent_json(agent: dict) -> dict:
 
 
 class Accounts:
-    def __init__(self, store: Store, keyring: Keyring, settings: HostedSettings, clock=time.time):
+    def __init__(self, store: Store, keyring: Keyring, settings: HostedSettings, clock=time.time,
+                 on_new_user: Callable[[dict], None] | None = None):
         self.store = store
         self.keyring = keyring
         self.settings = settings
         self.clock = clock
+        self.on_new_user = on_new_user  # the operator's sign-up ping (operator.OperatorPing.new_user)
         self._seen: dict[str, float] = {}
         self._seen_lock = threading.Lock()
 
@@ -130,24 +133,36 @@ class Accounts:
         """Make sure the user exists (first sign-in through the app or the bridge); keep the email current."""
         def change(doc):
             if doc is None:
-                return {"sub": sub, "email": email, "created_at": utc_now(), "counters": {}}, None
+                return {"sub": sub, "email": email, "created_at": utc_now(), "counters": {}}, True
             if email and doc.get("email") != email:
                 doc["email"] = email
-                return doc, None
-            return UNCHANGED, None
-        self.store.transact("users", sub, change)
-        return self.user(sub)
+                return doc, False
+            return UNCHANGED, False
+        created = self.store.transact("users", sub, change)
+        user = self.user(sub)
+        if created:
+            self._signed_up(user)
+        return user
 
     def link_google(self, sub: str, email: str | None, refresh_token: str) -> None:
         sealed = self.keyring.encrypt(refresh_token, f"google-refresh:{sub}")
 
         def change(doc):
+            created = doc is None
             doc = doc or {"sub": sub, "created_at": utc_now(), "counters": {}}
             doc.update(google_refresh=sealed, google_linked_at=utc_now())
             if email:
                 doc["email"] = email
-            return doc, None
-        self.store.transact("users", sub, change)
+            return doc, created
+        if self.store.transact("users", sub, change):
+            self._signed_up(self.user(sub))
+
+    def _signed_up(self, user: dict | None) -> None:
+        if user and self.on_new_user:
+            try:
+                self.on_new_user(user)
+            except Exception as exc:  # a ping never breaks a sign-in
+                log.warning("new-user hook failed: %s", type(exc).__name__)
 
     def google_refresh(self, sub: str) -> str | None:
         sealed = (self.user(sub) or {}).get("google_refresh")

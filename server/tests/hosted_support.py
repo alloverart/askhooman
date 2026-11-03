@@ -33,13 +33,13 @@ def settings_for(public: str = PUBLIC, aliases: tuple[str, ...] = (),
 
 
 def build(google: FakeGoogle, public: str = PUBLIC, aliases: tuple[str, ...] = (),
-          cors_origins: tuple[str, ...] = ()):
+          cors_origins: tuple[str, ...] = (), settings: HostedSettings | None = None, operator=None):
     store = MemoryStore()
     public_http = httpx.Client(transport=google.public_transport())
-    app = create_hosted_app(settings_for(public, aliases, cors_origins), store=store,
+    app = create_hosted_app(settings or settings_for(public, aliases, cors_origins), store=store,
                             http=httpx.Client(transport=google.transport()),
                             public_http=public_http,
-                            webhooks=WebhookSender(public_http, retry_delays=(0.01, 0.01)))
+                            webhooks=WebhookSender(public_http, retry_delays=(0.01, 0.01)), operator=operator)
     return app, store
 
 

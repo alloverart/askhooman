@@ -63,9 +63,10 @@ class FakeGoogle:
             return self.drives.setdefault(sub, FakeDrive())
 
     def id_token(self, sub: str, email: str, aud: str, nonce: str | None = None, expires_in: int = 3600,
-                 iss: str = "https://accounts.google.com", key=None, kid: str | None = None) -> str:
+                 iss: str = "https://accounts.google.com", key=None, kid: str | None = None,
+                 email_verified: bool = True) -> str:
         now = int(time.time())
-        claims = {"iss": iss, "aud": aud, "sub": sub, "email": email, "email_verified": True,
+        claims = {"iss": iss, "aud": aud, "sub": sub, "email": email, "email_verified": email_verified,
                   "iat": now, "exp": now + expires_in}
         if nonce is not None:
             claims["nonce"] = nonce

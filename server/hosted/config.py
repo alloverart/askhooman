@@ -16,6 +16,12 @@ ASKS_TRUST_FORWARDED        "1" (default): the client IP for rate limits is the 
                             (Cloud Run's front end appends it); "0": the TCP peer
 ASKS_CORS_ORIGINS           origins of the web app allowed to call the App API from a browser, comma-separated, exact
                             (https://..., or http://localhost:<port> for development). Empty (default): CORS closed
+ASKS_ADMIN_EMAILS           Google accounts (emails, comma-separated) that see the operator's stats in the app
+                            (GET /api/admin/stats). Empty (default): nobody. They count as internal users too
+ASKS_INTERNAL_EMAILS        more accounts of the operator's own people (emails, or "@domain" for a whole domain),
+                            comma-separated: the stats show them apart from external users and no sign-up ping
+ASKS_OPERATOR_TELEGRAM_CHAT a Telegram chat id that gets a ping on every new external user (optional)
+ASKS_OPERATOR_TELEGRAM_TOKEN the bot token for that ping, inline or a path; required with the chat
 """
 
 import json
@@ -62,6 +68,19 @@ def parse_web_client(text: str) -> tuple[str, str]:
     if not isinstance(client_id, str) or not client_id or not isinstance(secret, str) or not secret:
         raise ConfigError("ASKS_GOOGLE_WEB_CLIENT has no client_id/client_secret")
     return client_id, secret
+
+
+EMAIL = re.compile(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+")
+DOMAIN = re.compile(r"@[^@\s,]+\.[^@\s,]+")
+
+
+def email_list(value: str, name: str, domains: bool = False) -> tuple[str, ...]:
+    """A comma-separated list of emails (and "@domain" entries if `domains`), lower-cased, in order, no repeats."""
+    entries = tuple(dict.fromkeys(x.strip().lower() for x in (value or "").split(",") if x.strip()))
+    for entry in entries:
+        if not (EMAIL.fullmatch(entry) or (domains and DOMAIN.fullmatch(entry))):
+            raise ConfigError(f"{name}: {entry!r} is not an email" + (' or "@domain"' if domains else ""))
+    return entries
 
 
 def public_url(value: str, name: str = "ASKS_PUBLIC_URL") -> str:
@@ -113,6 +132,10 @@ class HostedSettings:
     request_ttl: int = REQUEST_TTL
     aliases: tuple[str, ...] = ()
     cors_origins: tuple[str, ...] = ()  # the web app's origins, for the App API only (app_api.AppCors)
+    admin_emails: tuple[str, ...] = ()  # see the operator's stats (lower-case)
+    internal_emails: tuple[str, ...] = ()  # the operator's own people: emails or "@domain" (lower-case)
+    operator_chat: str | None = None  # Telegram chat for the new-user ping
+    operator_token: str | None = None
 
     @property
     def issuer(self) -> str:
@@ -165,6 +188,13 @@ class HostedSettings:
             cors_origin(o) for o in env.get("ASKS_CORS_ORIGINS", "").split(",") if o.strip()))
         if store not in ("firestore", "memory"):
             raise ConfigError("ASKS_STORE must be 'firestore' or 'memory'")
+        operator_chat = env.get("ASKS_OPERATOR_TELEGRAM_CHAT", "").strip() or None
+        operator_token = None
+        if operator_chat or env.get("ASKS_OPERATOR_TELEGRAM_TOKEN", "").strip():
+            if not operator_chat:
+                raise ConfigError("ASKS_OPERATOR_TELEGRAM_TOKEN is set without ASKS_OPERATOR_TELEGRAM_CHAT")
+            operator_token = _inline_or_file(env.get("ASKS_OPERATOR_TELEGRAM_TOKEN", ""),
+                                             "ASKS_OPERATOR_TELEGRAM_TOKEN")
         return cls(
             public_url=public,
             web_client_id=client_id,
@@ -177,4 +207,8 @@ class HostedSettings:
             trust_forwarded=env.get("ASKS_TRUST_FORWARDED", "1").strip().lower() not in ("0", "false", "no", "off"),
             aliases=aliases,
             cors_origins=cors_origins,
+            admin_emails=email_list(env.get("ASKS_ADMIN_EMAILS", ""), "ASKS_ADMIN_EMAILS"),
+            internal_emails=email_list(env.get("ASKS_INTERNAL_EMAILS", ""), "ASKS_INTERNAL_EMAILS", domains=True),
+            operator_chat=operator_chat,
+            operator_token=operator_token,
         )

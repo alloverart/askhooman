@@ -17,6 +17,8 @@
                                  the server keeps for the user -> 204; nothing left to delete -> 404.
                                  The asks and tasks in the user's Drive stay (they are the user's files).
                                  (GET /api/me is the agents' REST: who the agent token belongs to.)
+  GET    /api/account            {email, admin}: who is signed in; admin = the app shows the operator's Admin page
+  GET    /api/admin/stats        the operator's stats (stats.admin_stats): ASKS_ADMIN_EMAILS only, else 403
 
 The web app calls these from a browser on another origin: CORS for them, and only them, is opened to the origins
 in ASKS_CORS_ORIGINS (AppCors); empty by default, then CORS stays closed.
@@ -28,6 +30,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
@@ -45,6 +48,7 @@ from .google import DRIVE_SCOPE, GoogleError, GoogleOAuth
 from .looks import clean_avatar, clean_color
 from .ratelimit import RateLimiter
 from .records import DrivePool, HostedAsks
+from .stats import admin_stats, internal_check
 from .webhooks import WebhookSender, check_webhook_url
 
 log = logging.getLogger("asks.hosted.app_api")
@@ -55,6 +59,7 @@ DRIVE_TOKEN_REUSE = 15 * 60  # seconds: a cached Drive token with at least this 
 DRIVE_TOKEN_USERS = 10000  # users whose Drive token one instance keeps
 DRIVE_TOKEN_STRIPES = 64
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+ACCOUNT_PATH, ADMIN_STATS_PATH = "/api/account", "/api/admin/stats"
 
 
 @dataclass(frozen=True)
@@ -62,12 +67,14 @@ class AppUser:
     """The signed-in app user (from a verified Google ID token)."""
     sub: str
     email: str | None = None
+    email_verified: bool = False  # Google's claim; the admin check needs it
 
 
 def is_app_path(path: str, method: str = "GET") -> bool:
     """App API requests (Google ID tokens); the other /api/* are the agents' (OAuth access tokens, agent keys)."""
     return (path == "/api/agents" or path.startswith("/api/agents/")
-            or path in ("/api/connect-info", "/api/events", DRIVE_TOKEN_PATH) or is_account_deletion(path, method))
+            or path in ("/api/connect-info", "/api/events", DRIVE_TOKEN_PATH, ACCOUNT_PATH, ADMIN_STATS_PATH)
+            or is_account_deletion(path, method))
 
 
 def is_account_deletion(path: str, method: str) -> bool:
@@ -357,6 +364,25 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
                            "give it a key, or choose another name") from None
         return {"agent": agent_json(agent), "key": key, "drive_linked": accounts.drive_linked(user.sub),
                 "link_url": f"{settings.public_url}/oauth/link"}
+
+    internal = internal_check(settings.admin_emails, settings.internal_emails)
+
+    def is_admin(user: AppUser) -> bool:
+        return user.email_verified and (user.email or "").lower() in settings.admin_emails
+
+    @app.get(ACCOUNT_PATH)
+    def get_account(user: AppUser = Depends(app_user)):
+        """Who is signed in, and whether they see the operator's stats (the app shows its Admin page then)."""
+        return JSONResponse({"email": user.email, "admin": is_admin(user)}, headers=NO_STORE)
+
+    @app.get(ADMIN_STATS_PATH)
+    def get_admin_stats(user: AppUser = Depends(app_user)):
+        """The operator's view (SPEC "Operator stats"): ASKS_ADMIN_EMAILS only."""
+        if not is_admin(user):
+            raise HTTPException(403, "only the operator's admins see the stats")
+        stats = admin_stats(accounts.store.all("users").values(), accounts.store.all("agents").values(),
+                            datetime.now(timezone.utc), internal)
+        return JSONResponse(stats, headers=NO_STORE)
 
     @app.get("/api/connect-info")
     def get_connect_info(user: AppUser = Depends(app_user)):

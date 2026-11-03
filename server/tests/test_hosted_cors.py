@@ -13,7 +13,8 @@ DEV = "http://localhost:5173"  # its development server
 # the App API with the method a browser asks for in its preflight
 APP_ROUTES = (("/api/agents", "GET"), ("/api/agents/ag_x", "PATCH"), ("/api/agents/ag_x", "DELETE"),
               ("/api/agents/keys", "POST"), ("/api/connect-info", "GET"), ("/api/events", "POST"),
-              ("/api/drive/token", "POST"), ("/api/me", "DELETE"))
+              ("/api/drive/token", "POST"), ("/api/me", "DELETE"), ("/api/account", "GET"),
+              ("/api/admin/stats", "GET"))
 
 
 @pytest.fixture
