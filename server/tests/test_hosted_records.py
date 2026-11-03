@@ -217,6 +217,10 @@ def test_task_replies_from_the_app_and_task_answer(hosted, google):
     assert [(e["kind"], e["actor"]) for e in doc["events"]] == [
         ("created", "allen"), ("replied", "denis"), ("answered", "allen")]
     assert [t["id"] for t in tool_result(mcp(hosted, allen, "tasks_mine"))["tasks"]] == [first["id"], second["id"]]
+    # an update that changes nothing still returns the derived fields, as the single-tenant bridge does
+    app_task_reply(drive, first["id"], "Nudge them again", "nudge")
+    same = tool_result(mcp(hosted, allen, "task_update", {"id": first["id"], "title": first["title"]}))
+    assert same["reply_pending"] is True and same["reply"]["preset"] == "nudge"
     # an agent can't reply (REST); finished tasks take no answer
     auth = {"Authorization": f"Bearer {allen}"}
     assert hosted.post(f"/api/tasks/{first['id']}/reply", json={"text": "hi"}, headers=auth).status_code == 403

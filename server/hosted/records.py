@@ -394,7 +394,10 @@ class DriveCollection:
 
                 current, change = plan(load)
                 if change is None:
-                    return current
+                    # Nothing to write; the task still comes back with its derived fields (only a plan that
+                    # loaded the file can return no change, so the events are at hand).
+                    events = (loaded.get("doc") or {}).get("events")
+                    return self.decorate(current, events if isinstance(events, list) else [])
                 try:
                     return self._write(who, item_id, loaded["meta"], loaded["doc"], change)
                 except _Changed:
