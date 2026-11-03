@@ -16,7 +16,7 @@ from .conftest import ALLEN, DENIS, HAMILTON, auth
 
 TASK_KEYS = {
     "id", "agent", "title", "context", "status", "waiting_on", "next_check", "links", "ref", "resolution",
-    "created_at", "updated_at", "finished_at",
+    "created_at", "updated_at", "finished_at", "reply", "reply_pending",
 }
 
 
@@ -372,6 +372,68 @@ def test_default_limits(tmp_dir):
     assert len(tasks.list("done")["tasks"]) == 100
     assert len(tasks.list("all")["tasks"]) == 102  # 200 otherwise
     assert len(tasks.list("finished", limit=101)["tasks"]) == 101
+
+
+# ---------- replies on tasks (SPEC v5 "1. Replies on tasks") ----------
+
+DENIS_ID, BOT = Identity("denis"), Identity("agent", "allen")
+
+
+def _service(tmp_dir):
+    db = Database(tmp_dir / "r.db")
+    db.init()
+    return TaskService(db)
+
+
+def test_reply_then_answer_clears_pending(tmp_dir):
+    tasks = _service(tmp_dir)
+    task_id = tasks.create(BOT, {"title": "Chase the supplier", "status": "waiting"})["id"]
+    replied = tasks.reply(DENIS_ID, task_id, {"text": "Status?", "preset": "status"})
+    assert replied["reply_pending"] is True and replied["reply"]["text"] == "Status?"
+    assert replied["reply"]["preset"] == "status" and replied["status"] == "waiting" and "events" not in replied
+    answered = tasks.answer(BOT, task_id, {"text": "On it"})
+    assert answered["reply_pending"] is False and answered["reply"]["text"] == "Status?"
+    full = tasks.get(task_id)
+    assert [e["kind"] for e in full["events"]][-2:] == ["replied", "answered"]
+    assert full["events"][-2]["actor"] == "denis" and full["events"][-1]["payload"] == {"text": "On it"}
+    assert (full["reply_pending"], full["reply"]["id"]) == (False, full["events"][-2]["id"])
+
+
+def test_any_owner_action_clears_pending(tmp_dir):
+    tasks = _service(tmp_dir)
+    task_id = tasks.create(BOT, {"title": "Chase the supplier"})["id"]
+    assert tasks.get(task_id)["reply"] is None and tasks.get(task_id)["reply_pending"] is False
+    tasks.reply(DENIS_ID, task_id, {"text": "Nudge them again", "preset": "nudge"})
+    assert tasks.update(BOT, task_id, {"next_check": "2026-12-01"})["reply_pending"] is False
+
+
+def test_list_puts_pending_first_before_limit(tmp_dir):
+    tasks = _service(tmp_dir)
+    ids = [tasks.create(BOT, {"title": f"t{i}", "next_check": f"2026-11-0{i + 1}"})["id"] for i in range(3)]
+    tasks.reply(DENIS_ID, ids[2], {"text": "Is this still needed?", "preset": "still-needed"})
+    listed = tasks.list("open", limit=1)["tasks"]
+    assert [t["id"] for t in listed] == [ids[2]] and listed[0]["reply_pending"] is True
+    everything = tasks.list("all")["tasks"]
+    assert [t["id"] for t in everything] == [ids[2], ids[0], ids[1]]
+    assert [t["reply_pending"] for t in everything] == [True, False, False]
+    tasks.answer(BOT, ids[2], {"text": "Yes, still needed"})
+    assert [t["id"] for t in tasks.list("open")["tasks"]] == ids   # back to next_check order
+
+
+def test_reply_on_finished_task_is_409(tmp_dir):
+    from server.rules import Conflict, Forbidden
+    tasks = _service(tmp_dir)
+    task_id = tasks.create(BOT, {"title": "Chase the supplier"})["id"]
+    with pytest.raises(Forbidden):
+        tasks.reply(BOT, task_id, {"text": "hi"})
+    with pytest.raises(Forbidden):
+        tasks.answer(Identity("agent", "hamilton"), task_id, {"text": "hi"})
+    tasks.done(BOT, task_id)
+    with pytest.raises(Conflict):
+        tasks.reply(DENIS_ID, task_id, {"text": "hi"})
+    with pytest.raises(Conflict):
+        tasks.answer(BOT, task_id, {"text": "hi"})
+    assert [e["kind"] for e in tasks.get(task_id)["events"]] == ["created", "done"]
 
 
 # ---------- schema migration ----------

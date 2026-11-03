@@ -16,6 +16,7 @@ from .task_rules import (  # noqa: F401  (re-exported: older imports use server.
     EDITABLE,
     FINISHED,
     LIMIT_DEFAULT,
+    OWNER_KINDS,
     LIMIT_FINISHED,
     OPEN,
     STATUS_FILTERS,
@@ -25,9 +26,12 @@ from .task_rules import (  # noqa: F401  (re-exported: older imports use server.
     clean_task_fields,
     default_limit,
     plan_finish,
+    plan_task_answer,
     plan_task_create,
     plan_task_reopen,
+    plan_task_reply,
     plan_task_update,
+    reply_state,
 )
 from .tokens import Identity
 
@@ -44,6 +48,7 @@ class TaskService:
     def get(self, task_id: int, with_events: bool = True) -> dict:
         with self.db.transaction() as conn:
             task = self._load(conn, task_id)
+            self._with_reply(conn, [task])
             if with_events:
                 rows = conn.execute("SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,))
                 task["events"] = [event_from_row(r, "task_id") for r in rows]
@@ -58,12 +63,22 @@ class TaskService:
         if agent:
             where += " AND agent = ?"
             params.append(agent)
-        # open: next check first (no date last), then the longest-running; finished: latest first
-        # (task_rules.task_order is the same order for stores without SQL)
+        # open: a pending reply first, then next check (no date last), then the longest-running; finished:
+        # latest first (task_rules.task_order is the same order for stores without SQL). The pending sort
+        # happens before LIMIT, so a reply on a task beyond the limit still comes back first.
+        owner_kinds = ", ".join(f"'{k}'" for k in OWNER_KINDS)
         query = f"""
-            SELECT * FROM tasks WHERE {where}
+            WITH r AS (
+                SELECT task_id,
+                       MAX(CASE WHEN kind = 'replied' THEN id END) AS last_reply,
+                       MAX(CASE WHEN kind IN ({owner_kinds}) THEN id END) AS last_owner
+                FROM task_events WHERE kind IN ('replied', {owner_kinds}) GROUP BY task_id
+            )
+            SELECT tasks.* FROM tasks LEFT JOIN r ON r.task_id = tasks.id WHERE {where}
             ORDER BY
                 CASE WHEN status IN ('active', 'waiting') THEN 0 ELSE 1 END,
+                CASE WHEN status IN ('active', 'waiting')
+                          AND r.last_reply > COALESCE(r.last_owner, 0) THEN 0 ELSE 1 END,
                 CASE WHEN status IN ('active', 'waiting') THEN next_check IS NULL END,
                 CASE WHEN status IN ('active', 'waiting') THEN next_check END ASC,
                 CASE WHEN status IN ('active', 'waiting') THEN created_at END ASC,
@@ -74,6 +89,7 @@ class TaskService:
         """
         with self.db.transaction() as conn:
             tasks = [task_from_row(r) for r in conn.execute(query, (*params, limit))]
+            self._with_reply(conn, tasks)
             if agent:
                 rows = conn.execute("SELECT status, COUNT(*) FROM tasks WHERE agent = ? GROUP BY status", (agent,))
             else:
@@ -110,6 +126,14 @@ class TaskService:
             self._changed(task_id)
         return self.get(task_id, with_events=False)
 
+    def reply(self, who: Identity, task_id: int, data: dict) -> dict:
+        """The user replies on an open task (SPEC v5): an event only, the status stays."""
+        return self._event_only(plan_task_reply, who, task_id, data)
+
+    def answer(self, who: Identity, task_id: int, data: dict) -> dict:
+        """The owner answers the user's reply."""
+        return self._event_only(plan_task_answer, who, task_id, data)
+
     def done(self, who: Identity, task_id: int, resolution=None) -> dict:
         return self._finish(who, task_id, "done", resolution)
 
@@ -133,6 +157,33 @@ class TaskService:
             self._apply(conn, task_id, who, change)
         self._changed(task_id)
         return self.get(task_id, with_events=False)
+
+    def _event_only(self, plan, who: Identity, task_id: int, data: dict) -> dict:
+        now = utc_now()
+        with self.db.transaction(write=True) as conn:
+            _, change = plan(who, data, lambda: self._load(conn, task_id), now)
+            self._apply(conn, task_id, who, change)
+        self._changed(task_id)
+        return self.get(task_id, with_events=False)
+
+    @staticmethod
+    def _with_reply(conn, tasks: list[dict]) -> None:
+        """Set the derived `reply` / `reply_pending` (task_rules.reply_state) on each task, in place."""
+        if not tasks:
+            return
+        kinds = ("replied", *OWNER_KINDS)
+        ids = [t["id"] for t in tasks]
+        rows = conn.execute(
+            f"SELECT * FROM task_events WHERE task_id IN ({', '.join('?' * len(ids))}) "
+            f"AND kind IN ({', '.join('?' * len(kinds))}) ORDER BY id",
+            (*ids, *kinds),
+        )
+        events: dict[int, list] = {}
+        for row in rows:
+            event = event_from_row(row, "task_id")
+            events.setdefault(event["task_id"], []).append(event)
+        for task in tasks:
+            task.update(reply_state(events.get(task["id"], [])))
 
     def _apply(self, conn, task_id: int, who: Identity, change: Change) -> None:
         """Write a transition's field updates and its event."""
