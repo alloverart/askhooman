@@ -64,6 +64,9 @@ class FirestoreStore:
         query = self.client.collection(collection).where(filter=FieldFilter(field, "==", value))
         return [(snap.id, _plain(snap.to_dict())) for snap in query.stream()]
 
+    def all(self, collection: str) -> dict[str, dict]:
+        return {snap.id: _plain(snap.to_dict()) for snap in self.client.collection(collection).stream()}
+
     def transact(self, collection: str, key: str, fn):
         ref = self._ref(collection, key)
 

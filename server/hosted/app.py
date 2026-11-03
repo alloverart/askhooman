@@ -34,10 +34,12 @@ from .config import HostedSettings
 from .crypto import Keyring
 from .google import GoogleError, GoogleOAuth
 from .looks import AGENT_COLORS, own_look
+from .operator import OperatorPing, telegram_sender
 from .oauth import AuthServer
 from .ratelimit import RateLimiter, client_ip
 from .records import DrivePool, HostedAsks, HostedTasks
 from .safe_http import public_client
+from .stats import internal_check
 from .store import MemoryStore
 from .webhooks import WebhookSender
 
@@ -123,7 +125,8 @@ def make_store(settings: HostedSettings):
 
 
 def create_hosted_app(settings: HostedSettings | None = None, *, store=None, http: httpx.Client | None = None,
-                      public_http: httpx.Client | None = None, webhooks: WebhookSender | None = None) -> FastAPI:
+                      public_http: httpx.Client | None = None, webhooks: WebhookSender | None = None,
+                      operator: OperatorPing | None = None) -> FastAPI:
     """Tests pass an in-memory store, `http` (Google + Drive) and `public_http` (CIMD documents, webhooks)
     with fake transports; production builds the real ones."""
     setup_logging()
@@ -132,7 +135,11 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     store = store if store is not None else make_store(settings)
     http = http or httpx.Client(timeout=20.0)
     public_http = public_http or public_client()
-    accounts = Accounts(store, keyring, settings)
+    internal = internal_check(settings.admin_emails, settings.internal_emails)
+    if operator is None and settings.operator_chat and settings.operator_token:
+        operator = OperatorPing(telegram_sender(settings.operator_token, http), settings.operator_chat, internal,
+                                site.WEB_APP)
+    accounts = Accounts(store, keyring, settings, on_new_user=operator.new_user if operator else None)
     google = GoogleOAuth(settings.web_client_id, settings.web_client_secret, settings.google_redirect_uri, http)
     limiter = RateLimiter()
     pool = DrivePool(accounts, settings.web_client_id, settings.web_client_secret, http,
@@ -173,7 +180,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         except Exception as exc:
             log.exception("app user lookup failed: %s", type(exc).__name__)
             raise HTTPException(503, "temporarily unavailable, try again", headers={"Retry-After": "5"}) from None
-        return AppUser(claims["sub"], claims.get("email"))
+        return AppUser(claims["sub"], claims.get("email"), claims.get("email_verified") in (True, "true"))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

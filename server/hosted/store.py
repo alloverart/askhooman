@@ -47,6 +47,9 @@ class Store(Protocol):
     def find(self, collection: str, field: str, value) -> list[tuple[str, dict]]:
         """(key, document) of every document whose top-level `field` equals `value`."""
 
+    def all(self, collection: str) -> dict[str, dict]:
+        """Every document of a collection by key (the operator's stats read users and agents this way)."""
+
     def transact(self, collection: str, key: str, fn: Callable[[dict | None], tuple[Any, T]]) -> T:
         """Atomically: fn(current document or None) -> (new document | UNCHANGED | DELETE, result); returns
         result. fn may run more than once (Firestore retries contended transactions), so it must not have
@@ -108,7 +111,6 @@ class MemoryStore:
                 docs[key] = copy.deepcopy(new)
             return result
 
-    # test helper
     def all(self, collection: str) -> dict[str, dict]:
         with self._lock:
             return copy.deepcopy(self._collection(collection))

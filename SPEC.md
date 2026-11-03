@@ -264,6 +264,26 @@ Resolved where the contract above was silent; the app (build 4) and agents may r
 - **Drive reads are bounded** (*review*): listings ask for `size` and stop at 5000 ask/task files; files over 256 KB are skipped as unreadable (by `size`, and again while reading); downloads say `Accept-Encoding: identity`, refuse compressed bodies and read raw up to the cap. Counts come from `appProperties`. A list downloads only the files its `limit` can need: when more than `limit` + 50 files match, they are first ordered from `appProperties` alone (status block; open ones by id, others by `modifiedTime`, latest first), so for very long lists the order of items whose last write isn't their answer/close can be approximate. The per-instance cache holds validated records only (32 MB budget).
 - **Rate limits** (per instance; client IP = Cloud Run's last `X-Forwarded-For` entry, IPv6 counted per /64): `/authorize` + `/oauth/link` 30/min, Google callback + consent 30/min, `/token` 60/min, `/register` 10/min, `/revoke` 30/min, App API 120/min per user, of which Google refreshes for `POST /api/drive/token` 10 per 10 min per user; `set_my_look` image fetches 10 per 10 min per agent; `/mcp` and agents' REST 300/min per agent and 1200/min per user, and 60 failed bearer checks/min per address (after that 429 before any lookup). When the limiter's table is full, idle keys go first, then the least recently used (*review*).
 
+## Operator stats (03.11.2026)
+
+The operator of a hosted bridge sees who signed up and who uses it, and gets a ping on every new external user.
+
+- **Only what is already kept.** Users (email, sign-up time, whether the Google grant is held, the ask/task id
+  counters) and agents (client, key, webhook, last seen). Nothing from anyone's Drive, no tokens or secrets.
+- **Internal or external.** `ASKS_ADMIN_EMAILS` and `ASKS_INTERNAL_EMAILS` (emails or `@domain`) are the operator's
+  own people. The stats count all users and external users apart.
+- **Active** in a window (1, 7 or 30 days) means a connected, not revoked agent of the user was seen in it.
+- **App API.**
+  - `GET /api/account` → `{email, admin}`.
+  - `GET /api/admin/stats` → `{generated_at, all, external, accounts}`. It answers only for `ASKS_ADMIN_EMAILS`
+    with a verified Google email; everyone else gets 403.
+  - The web app shows an Admin page to admins.
+- **Ping.** The first sign-in of an external user, through the app or an agent's OAuth, sends a Telegram message
+  to `ASKS_OPERATOR_TELEGRAM_CHAT` (bot token in `ASKS_OPERATOR_TELEGRAM_TOKEN`). It goes from a background thread,
+  never blocks the sign-in, and carries no email; who it was is on the Admin page.
+- **Later:** activity per day (calls, asks and tasks created). That needs new counters and a line in the privacy
+  policy.
+
 ## Replies, wake-up, agent self-service and images (v5, draft 02.11.2026)
 
 Goal: the user can talk back on tasks; whatever the user does reaches the agent as soon as the agent's environment allows, and the user controls that; agents name and wire themselves; a question can show pictures. The contract stays **MCP + Google only**: no messenger (Telegram, Slack) is part of it, because users' agents may live in Claude on the web, Codex desktop or anywhere else. Ships in four steps, each on its own (see the end).

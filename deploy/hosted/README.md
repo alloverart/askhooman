@@ -129,6 +129,9 @@ Logs: `gcloud run services logs read qtracker --region=$REGION --limit=100`. Tok
 | `ASKS_FIRESTORE_DATABASE` | `(default)` |
 | `ASKS_TRUST_FORWARDED` | `1` (default): the client IP for rate limits is the last `X-Forwarded-For` entry, which Cloud Run's frontend sets |
 | `ASKS_CORS_ORIGINS` | optional, comma-separated: origins of a web app that calls the App API from the browser, e.g. `https://app.<PUBLIC_HOST>`; exact `https://` origins, or `http://localhost:<port>` for development. Empty (default): CORS stays closed. It opens CORS for the App API only; put the web app's OAuth client id into `ASKS_GOOGLE_APP_CLIENT_IDS` too |
+| `ASKS_ADMIN_EMAILS` | optional, comma-separated Google account emails that see the operator's stats in the web app (Admin page, `GET /api/admin/stats`). Empty (default): nobody |
+| `ASKS_INTERNAL_EMAILS` | optional, comma-separated emails or `@domain` entries of your own people: the stats show them apart from external users, and they get no sign-up ping |
+| `ASKS_OPERATOR_TELEGRAM_CHAT`, `ASKS_OPERATOR_TELEGRAM_TOKEN` | optional: a Telegram chat id and a bot token (inline or a mounted secret file) for a ping on every new external user; the message carries no email |
 
 Local run without Google Cloud (in-memory store; Google sign-in works only if the Web client's redirect URI points at localhost):
 
