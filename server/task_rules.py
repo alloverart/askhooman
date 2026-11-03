@@ -39,6 +39,17 @@ STATUS_FILTERS = {
 }
 LIMIT_DEFAULT = 200
 LIMIT_FINISHED = 100  # default when only finished tasks are listed
+# Replies on tasks (SPEC v5 "1. Replies on tasks"): the user replies on an open task, the owner answers.
+REPLY_MAX = 2000
+PRESETS = {  # ids and texts are part of the contract: agents match them, the apps show them as buttons
+    "status": "What's the status?",
+    "still-needed": "Is this still needed?",
+    "done": "This is done, please close it",
+    "not-needed": "Not needed, please drop it",
+    "nudge": "Nudge them again",
+}
+# The owner's own events: any of them after the user's reply means the agent has acted on it.
+OWNER_KINDS = ("answered", "edited", "status", "done", "dropped", "reopened")
 DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
@@ -151,6 +162,65 @@ def plan_task_reopen(who: Identity, load: Loader, now: str) -> tuple[dict, Chang
     return task, Change(updates, "reopened", payload, now)
 
 
+def plan_task_reply(who: Identity, data: dict, load: Loader, now: str) -> tuple[dict, Change]:
+    """The user replies on an open task: free text, or a preset (its text, a note on the next line). A reply
+    never changes the status; only the user's token replies."""
+    text, preset = _reply_fields(data, ("text", "preset"))
+    if preset is not None and preset not in PRESETS:
+        raise Invalid(f"unknown preset {preset!r}; one of: {', '.join(PRESETS)}")
+    task = load()
+    if not who.is_denis:
+        raise Forbidden("only the user replies on tasks; the owner answers a reply with task_answer")
+    _check_open(task, "replies go to open tasks")
+    return task, Change({"updated_at": now}, "replied", {"text": text, "preset": preset}, now)
+
+
+def plan_task_answer(who: Identity, data: dict, load: Loader, now: str) -> tuple[dict, Change]:
+    """The owner answers the user's reply on an open task."""
+    text, _ = _reply_fields(data, ("text",))
+    task = load()
+    check_owner(who, task, "answer")
+    _check_open(task, "answers go to open tasks")
+    return task, Change({"updated_at": now}, "answered", {"text": text}, now)
+
+
+def _reply_fields(data: dict, allowed: tuple[str, ...]) -> tuple[str, str | None]:
+    unknown = set(data) - set(allowed)
+    if unknown:
+        raise Invalid(f"unknown fields: {', '.join(sorted(unknown))}")
+    text = _text(data.get("text"), "text", REPLY_MAX, required=True)
+    preset = data.get("preset")
+    if preset is not None and not isinstance(preset, str):
+        raise Invalid("preset must be a string or null")
+    return text, preset
+
+
+def _check_open(task: dict, why: str) -> None:
+    if task["status"] not in OPEN:
+        raise Conflict(f"task #{task['id']} is {task['status']}; {why}")
+
+
+def reply_state(events: list) -> dict:
+    """`reply` = the user's latest reply {id, at, text, preset} or None; `reply_pending` while it is newer than
+    every event of the owner. Derived from the events, never stored. Non-dict events and events without an int
+    id don't count."""
+    last_reply, last_owner = None, 0
+    for event in events:
+        if not isinstance(event, dict) or not isinstance(event.get("id"), int) or isinstance(event.get("id"), bool):
+            continue
+        if event.get("kind") == "replied":
+            if last_reply is None or event["id"] > last_reply["id"]:
+                last_reply = event
+        elif event.get("kind") in OWNER_KINDS:
+            last_owner = max(last_owner, event["id"])
+    if last_reply is None:
+        return {"reply": None, "reply_pending": False}
+    payload = last_reply.get("payload") if isinstance(last_reply.get("payload"), dict) else {}
+    reply = {"id": last_reply["id"], "at": last_reply.get("at"), "text": payload.get("text"),
+             "preset": payload.get("preset")}
+    return {"reply": reply, "reply_pending": last_reply["id"] > last_owner}
+
+
 def check_owner(who: Identity, task: dict, action: str) -> None:
     if who.is_denis:
         raise Forbidden(f"the human's token can read tasks but not {action} them; "
@@ -162,8 +232,10 @@ def check_owner(who: Identity, task: dict, action: str) -> None:
 # ---------- listing (stores without SQL; must match tasks.TaskService.list) ----------
 
 def task_order(task: dict) -> tuple:
-    """open ones by next_check (none last), then the longest-running; finished ones latest first."""
+    """open ones with a pending reply first, then by next_check (none last), then the longest-running;
+    finished ones latest first."""
     if task["status"] in OPEN:
         next_check = task.get("next_check")
-        return (0, next_check is None, next_check or "", task.get("created_at") or "", task["id"])
-    return (1, False, _Desc(task.get("finished_at") or ""), _Desc(""), _Desc(task["id"]))
+        return (0, not task.get("reply_pending"), next_check is None, next_check or "",
+                task.get("created_at") or "", task["id"])
+    return (1, False, False, _Desc(task.get("finished_at") or ""), _Desc(""), _Desc(""), _Desc(task["id"]))
