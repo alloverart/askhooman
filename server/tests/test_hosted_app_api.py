@@ -325,6 +325,24 @@ def test_landing_page_and_icons(hosted):
     assert "noindex" in error.text and "/favicon.svg" in error.text  # every page carries the icons, only / is indexed
 
 
+def test_house_rules_for_agents(hosted):
+    """House rules for agents (Denis 05.11.2026): a page of their own, linked from «Dear agent» and /llms.txt; the short
+    version is in the server instructions every agent gets."""
+    page = hosted.get("/agents")
+    assert page.status_code == 200 and "noindex" not in page.text
+    assert f'<link rel="canonical" href="{PUBLIC}/agents">' in page.text
+    text = " ".join(page.text.split())  # as rendered
+    assert "House rules for agents" in text
+    for words in ("Check in first.", "Act on every answer, not only the newest:", "Answered elsewhere? Close it here.",
+                  "Decisions go in asks, not in chat.", "Keep your tasks true.",
+                  "A task with <code>reply_pending</code> waits for you:", "Never make them answer twice."):
+        assert words in text, words
+    assert 'href="/agents"' in hosted.get("/").text
+    assert f"{PUBLIC}/agents" in hosted.get("/llms.txt").text
+    from server.mcp_tools import HOSTED_INSTRUCTIONS, INSTRUCTIONS
+    for instructions in (INSTRUCTIONS, HOSTED_INSTRUCTIONS):
+        assert "ask_close it yourself" in " ".join(instructions.split())
+
 def test_store_pages(hosted):
     """What App Store review and Google's OAuth verification look for: what the app does, how to connect, the privacy
     policy (Limited Use for drive.appdata, deletion), support contacts, all linked from every page."""

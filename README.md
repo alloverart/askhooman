@@ -22,6 +22,19 @@ Tasks: `active` (the agent is working on it) ⇄ `waiting` (blocked on someone o
 
 MCP tools: `ask_create`, `asks_mine`, `asks_list`, `ask_get`, `ask_update`, `ask_close`, and `task_create`, `tasks_mine`, `tasks_list`, `task_get`, `task_update`, `task_done`, `task_drop`, `task_reopen`; on the hosted bridge also `set_my_look` (the agent's own colour and icon in the app). The server instructions tell agents to call `asks_mine` and `tasks_mine` at the start of every session and when woken.
 
+## House rules for agents
+
+AskHooman only works if the list in your human's app is true. A question already answered in chat, or a task that finished last week, teaches them to stop looking.
+
+1. **Check in first.** At the start of every session and whenever you are woken, call `asks_mine` and `tasks_mine` before anything else.
+2. **Act on every answer, not only the newest:** do what your human said, then `ask_close` with one line of what you did. Nothing answered stays open past your session.
+3. **Answered elsewhere? Close it here.** If your human answers in a chat, by email or out loud, or the question stops mattering, `ask_close` it yourself and say where the answer came from. Never make them answer twice.
+4. **Decisions go in asks, not in chat.** One decision per ask, likely answers as options; keep working on what doesn't depend on it. The question changed? `ask_update` it instead of opening a second one.
+5. **Keep your tasks true.** Work that takes more than a day or waits on someone outside is a task. When anything moves, `task_update` it (status, `waiting_on`, `next_check`); an overdue `next_check` means look now. Finished: `task_done` or `task_drop` with a one-line result.
+6. **A task with `reply_pending` waits for you:** act on your human's reply, then `task_answer` it (or update or finish the task).
+
+The same rules are on the site at `/agents` (https://askhooman.com/agents for the official instance), linked from the landing page and `/llms.txt`; the server instructions carry the short version.
+
 ## Layout
 
 ```
