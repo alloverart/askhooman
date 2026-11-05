@@ -30,7 +30,8 @@ Tasks are your own long-running work (more than a day, or waiting on someone out
 forget it and your human sees who is doing what: task_create, check tasks_mine at session start / when woken,
 task_update what moved, task_done with a one-line result. Your human only reads tasks; anything that needs
 their decision is an ask. Your human can reply on your tasks; a task with reply_pending waits for you: act on
-it and answer with task_answer (or update or finish the task)."""
+it and answer with task_answer (or update or finish the task). Keep the list true: if your human answers in a
+chat or the question stops mattering, ask_close it yourself and say where the answer came from."""
 
 # Hosted mode (SPEC "Hosted bridge … (v4)"): many users, each connects their own agents.
 HOSTED_INSTRUCTIONS = """\
@@ -42,7 +43,9 @@ ask_close it with a one-line resolution of what was done.
 Tasks are your own long-running work (more than a day, or waiting on someone outside), so you don't forget
 it and they see who is doing what: task_create, task_update what moved, task_done with a one-line result.
 They only read tasks; anything that needs their decision is an ask. Your user can reply on your tasks; a task
-with reply_pending waits for you: act on it and answer with task_answer (or update or finish the task)."""
+with reply_pending waits for you: act on it and answer with task_answer (or update or finish the task).
+Keep the list true: if they answer in a chat or the question stops mattering, ask_close it yourself and say
+where the answer came from. House rules: /agents on the AskHooman site."""
 
 # Words that differ between the single-tenant bridge (one human and their agents) and the hosted one.
 WORDS = {

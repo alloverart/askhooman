@@ -212,7 +212,8 @@ need a decision:</p>
 you did.</li></ol>
 <p>Working on something for days, or waiting on someone outside? <code>task_create</code>, so your human sees who is doing
 what. If your human keeps missing your questions in chat, show them this page.</p>
-<p class="sig">Connect: <code>{url}</code> · your human signs in once · <a href="/llms.txt">/llms.txt</a></p></div>
+<p class="sig">Connect: <code>{url}</code> · your human signs in once · <a href="/agents">House rules</a> ·
+<a href="/llms.txt">/llms.txt</a></p></div>
 </section>
 
 <section id="connect"><h2>Connect an agent</h2><p class="lead">AskHooman is a remote MCP server. One URL: your agent opens a
@@ -431,6 +432,34 @@ a pull request.</p>
 """
 
 
+def agents_html(settings: HostedSettings) -> str:
+    """/agents: the house rules for agents (Denis 05.11.2026). The short version is in the MCP server instructions."""
+    return """
+<div class="doc card"><h1>House rules for agents</h1>
+<p>AskHooman only works if the list in your human's app is true. A question already answered in chat, or a task that
+finished last week, teaches them to stop looking.</p>
+<ol>
+<li><b>Check in first.</b> At the start of every session and whenever you are woken, call <code>asks_mine</code> and
+<code>tasks_mine</code> before anything else.</li>
+<li><b>Act on every answer, not only the newest:</b> do what your human said, then <code>ask_close</code> with one line of
+what you did. Nothing answered stays open past your session.</li>
+<li><b>Answered elsewhere? Close it here.</b> If your human answers in a chat, by email or out loud, or the question stops
+mattering, <code>ask_close</code> it yourself and say where the answer came from. Never make them answer twice.</li>
+<li><b>Decisions go in asks, not in chat.</b> One decision per ask, likely answers as options; keep working on what doesn't
+depend on it. The question changed? <code>ask_update</code> it instead of opening a second one.</li>
+<li><b>Keep your tasks true.</b> Work that takes more than a day or waits on someone outside is a task. When anything
+moves, <code>task_update</code> it (status, <code>waiting_on</code>, <code>next_check</code>); an overdue
+<code>next_check</code> means look now. Finished: <code>task_done</code> or <code>task_drop</code> with a one-line
+result.</li>
+<li><b>A task with <code>reply_pending</code> waits for you:</b> act on your human's reply, then <code>task_answer</code>
+it (or update or finish the task).</li>
+</ol>
+<p>How to connect is on the <a href="/#connect">home page</a>; the short version for agents is
+<a href="/llms.txt">/llms.txt</a>.</p>
+</div>
+"""
+
+
 def _doc_page(settings: HostedSettings, path: str, title: str, render):
     """/privacy and /support: rendered once at startup from the settings."""
     body = render(settings)
@@ -464,6 +493,7 @@ def llms_txt(settings: HostedSettings):
 - task_create, task_update, task_done, task_drop, task_reopen, tasks_mine, tasks_list, task_get: your long-running work
 - set_my_look: your colour and icon (one emoji, or a small image) in your human's app, so they can tell you apart
 - At the start of every session call asks_mine and tasks_mine; act on answers, then ask_close with what you did.
+- House rules (keep the list in your human's app true): {settings.public_url}/agents
 
 ## When it helps
 
@@ -477,6 +507,7 @@ def llms_txt(settings: HostedSettings):
 - Web app, where your human answers: {WEB_APP}
 - Privacy policy: {settings.public_url}/privacy
 - Support: {settings.public_url}/support
+- House rules for agents: {settings.public_url}/agents
 - Source (Apache-2.0): {GITHUB}
 """
 
@@ -491,4 +522,6 @@ def routes(settings: HostedSettings) -> list[Route]:
                Route("/privacy", _doc_page(settings, "/privacy", "Privacy policy", privacy_html),
                      methods=["GET", "HEAD"]),
                Route("/support", _doc_page(settings, "/support", "Support", support_html), methods=["GET", "HEAD"]),
+               Route("/agents", _doc_page(settings, "/agents", "House rules for agents", agents_html),
+                     methods=["GET", "HEAD"]),
                Route("/llms.txt", llms_txt(settings), methods=["GET", "HEAD"])])
