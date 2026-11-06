@@ -20,7 +20,9 @@ Asks: `open` (waits for the human) → `answered` (the agent acts on the answer)
 
 Tasks: `active` (the agent is working on it) ⇄ `waiting` (blocked on someone outside; `waiting_on` says who, `next_check` when to look again) → `done` or `dropped`, with a one-line result. Only the agent that owns a task writes it; the human only reads tasks. Anything that needs the human's decision is an ask, not a task.
 
-MCP tools: `ask_create`, `asks_mine`, `asks_list`, `ask_get`, `ask_update`, `ask_close`, and `task_create`, `tasks_mine`, `tasks_list`, `task_get`, `task_update`, `task_done`, `task_drop`, `task_reopen`; on the hosted bridge also `set_my_look` (the agent's own colour and icon in the app). The server instructions tell agents to call `asks_mine` and `tasks_mine` at the start of every session and when woken.
+MCP tools: `ask_create`, `asks_mine`, `asks_list`, `ask_get`, `ask_update`, `ask_close`, and `task_create`, `tasks_mine`, `tasks_list`, `task_get`, `task_update`, `task_done`, `task_drop`, `task_reopen`; on the hosted bridge also `set_my_look` (the agent's own colour and icon in the app), `ask_wait`, `set_my_webhook` and `test_my_webhook` (below). The server instructions tell agents to call `asks_mine` and `tasks_mine` at the start of every session and when woken.
+
+Waking the agent (hosted): when the user answers, closes or reopens an ask or replies on a task, the app tells the bridge, and the bridge puts a short event (type and ids) into the owner agent's feed and calls its webhook if it has one. The agent's side reads the feed over a connection it opens itself, so no public URL is needed: the Claude Code channel plugin in `plugins/claude-code` (see its README), MCP `ask_wait`, `askhooman listen --exec` (the CLI below) or `GET /api/agent/events?after=<cursor>&wait=50` directly. Agents with a server wire their own webhook with `set_my_webhook`. The user can turn waking off per agent in the app.
 
 ## House rules for agents
 
@@ -32,6 +34,7 @@ AskHooman only works if the list in your human's app is true. A question already
 4. **Decisions go in asks, not in chat.** One decision per ask, likely answers as options; keep working on what doesn't depend on it. The question changed? `ask_update` it instead of opening a second one.
 5. **Keep your tasks true.** Work that takes more than a day or waits on someone outside is a task. When anything moves, `task_update` it (status, `waiting_on`, `next_check`); an overdue `next_check` means look now. Finished: `task_done` or `task_drop` with a one-line result.
 6. **A task with `reply_pending` waits for you:** act on your human's reply, then `task_answer` it (or update or finish the task).
+7. **Wake up when they answer.** In Claude Code, suggest the AskHooman plugin to your human (one install, no server). Elsewhere, call `ask_wait` while you wait for an answer. If you can receive an HTTPS POST, ask your human (with `ask_create`) whether to set up `set_my_webhook`, and check it with `test_my_webhook`.
 
 The same rules are on the site at `/agents` (https://askhooman.com/agents for the official instance), linked from the landing page and `/llms.txt`; the server instructions carry the short version.
 
@@ -41,7 +44,8 @@ The same rules are on the site at `/agents` (https://askhooman.com/agents for th
 server/              FastAPI app: REST /api, MCP /mcp (uvicorn server.app:app)
 server/hosted/       hosted multi-tenant mode: OAuth server, agents and tokens, Drive records, app API, webhooks
 server/tests/        pytest suite, no network (fake Google, Drive and Firestore)
-cli/asks.py          stdlib-only CLI for the single-tenant bridge's REST API
+cli/asks.py          stdlib-only CLI for the REST API (and `listen` on the hosted bridge's event feed)
+plugins/claude-code/ the AskHooman channel plugin for Claude Code (marketplace: .claude-plugin/marketplace.json)
 deploy/hosted/       Dockerfile, Cloud Build config and the Cloud Run guide
 ```
 

@@ -45,7 +45,10 @@ it and they see who is doing what: task_create, task_update what moved, task_don
 They only read tasks; anything that needs their decision is an ask. Your user can reply on your tasks; a task
 with reply_pending waits for you: act on it and answer with task_answer (or update or finish the task).
 Keep the list true: if they answer in a chat or the question stops mattering, ask_close it yourself and say
-where the answer came from. House rules: /agents on the AskHooman site."""
+where the answer came from. Your user may want you to wake up when they answer. In Claude Code, suggest the
+AskHooman plugin (one install, no server). Elsewhere, call ask_wait while you wait for an answer, or, if you can
+receive an HTTPS POST, ask your user with ask_create whether to set up set_my_webhook. Either way, read asks_mine
+and tasks_mine when you start. House rules: /agents on the AskHooman site."""
 
 # Words that differ between the single-tenant bridge (one human and their agents) and the hosted one.
 WORDS = {

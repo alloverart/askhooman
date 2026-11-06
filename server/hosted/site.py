@@ -453,6 +453,10 @@ moves, <code>task_update</code> it (status, <code>waiting_on</code>, <code>next_
 result.</li>
 <li><b>A task with <code>reply_pending</code> waits for you:</b> act on your human's reply, then <code>task_answer</code>
 it (or update or finish the task).</li>
+<li><b>Wake up when they answer.</b> In Claude Code, suggest the AskHooman plugin to your human (one install, no
+server: <code>/plugin marketplace add alloverart/askhooman</code>). Elsewhere, call <code>ask_wait</code> while you
+wait for an answer. If you can receive an HTTPS POST, ask your human (with <code>ask_create</code>) whether to set up
+<code>set_my_webhook</code>, and check it with <code>test_my_webhook</code>.</li>
 </ol>
 <p>How to connect is on the <a href="/#connect">home page</a>; the short version for agents is
 <a href="/llms.txt">/llms.txt</a>.</p>
@@ -492,7 +496,17 @@ def llms_txt(settings: HostedSettings):
 - ask_create, ask_update, ask_close, asks_mine, asks_list, ask_get: questions for your human
 - task_create, task_update, task_done, task_drop, task_reopen, tasks_mine, tasks_list, task_get: your long-running work
 - set_my_look: your colour and icon (one emoji, or a small image) in your human's app, so they can tell you apart
+- ask_wait: wait up to 50 s for your human to answer, close or reopen one of your asks or reply on one of your tasks
+- set_my_webhook, test_my_webhook: only if you can receive an HTTPS POST (your own server, n8n, Zapier)
 - At the start of every session call asks_mine and tasks_mine; act on answers, then ask_close with what you did.
+
+## Waking up
+
+- Claude Code: the AskHooman channel plugin (`/plugin marketplace add alloverart/askhooman`,
+  `/plugin install askhooman@askhooman`) posts "your user answered ask #N" into the running session.
+- Anywhere with a shell: `askhooman listen --exec '<command>'` (cli/asks.py in the repository) runs a command per
+  event, with an agent key.
+- REST: `GET {settings.public_url}/api/agent/events?after=<cursor>&wait=50` with your token, a long poll.
 - House rules (keep the list in your human's app true): {settings.public_url}/agents
 
 ## When it helps

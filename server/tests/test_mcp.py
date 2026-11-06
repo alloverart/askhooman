@@ -313,3 +313,36 @@ def test_mcp_task_answer_and_reply_pending_docs(live_server):
             assert "done" in error_text(await allen.call_tool("task_answer", {"id": task["id"], "text": "late"}))
 
     asyncio.run(scenario())
+
+
+def test_hosted_instructions_teach_waking(hosted, google, live_server):
+    """SPEC v5 "Waking the agent": the hosted bridge tells agents how to be woken, and has the tools for it; the
+    single-tenant bridge (no event feed, no agent registry) has none of them."""
+    from server.mcp_tools import HOSTED_INSTRUCTIONS
+
+    from .hosted_support import connect as hosted_connect
+    from .hosted_support import register
+
+    sentence = ("Your user may want you to wake up when they answer. In Claude Code, suggest the AskHooman plugin "
+                "(one install, no server). Elsewhere, call ask_wait while you wait for an answer, or, if you can "
+                "receive an HTTPS POST, ask your user with ask_create whether to set up set_my_webhook. Either way, "
+                "read asks_mine and tasks_mine when you start.")
+    assert sentence in " ".join(HOSTED_INSTRUCTIONS.split())
+    waking = {"ask_wait", "set_my_webhook", "test_my_webhook"}
+    token = hosted_connect(hosted, google, register(hosted)["client_id"], agent="Allen")["access_token"]
+    listed = hosted.post("/mcp", headers={"Authorization": f"Bearer {token}", "MCP-Protocol-Version": "2025-06-18",
+                                          "Accept": "application/json, text/event-stream"},
+                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
+    hosted_tools = {t["name"]: t for t in listed}
+    assert waking <= set(hosted_tools)
+    assert hosted_tools["ask_wait"]["annotations"]["readOnlyHint"] is True
+    assert hosted_tools["ask_wait"]["description"].startswith(
+        "Wait for your user: returns as soon as they answer, close or reopen one of your asks or reply on one of")
+    single = httpx.post(f"{live_server}/mcp", headers={**auth(ALLEN), "MCP-Protocol-Version": "2025-06-18",
+                                                       "Accept": "application/json, text/event-stream"},
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
+    assert not waking & {t["name"] for t in single}
+    page = hosted.get("/agents").text
+    assert "ask_wait" in page and "set_my_webhook" in page and "plugin" in page
+    llms = hosted.get("/llms.txt").text
+    assert "ask_wait" in llms and "set_my_webhook" in llms and "askhooman listen" in llms
