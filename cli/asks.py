@@ -22,6 +22,10 @@ Tasks (long-running work an agent does itself; the human only reads them):
           --waiting-on "Supplier support reply" --next-check 2026-11-03 --ref "chat 5591"
   asks.py task update 3 --status active --next-check ""     ("" clears a field)
   asks.py task done 3 --resolution "Supplier confirmed"
+
+Waking up (the hosted bridge, ASKS_URL=https://askhooman.com with an agent key): wait for the user's answers and
+replies and run a command per event, with ASKHOOMAN_EVENT and ASKHOOMAN_ASK_ID / ASKHOOMAN_TASK_ID set:
+  asks.py listen --exec 'claude -p "check asks_mine and tasks_mine"'
 """
 
 from __future__ import annotations  # keeps it runnable on macOS /usr/bin/python3 (3.9)
@@ -32,7 +36,9 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,7 +55,11 @@ CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 class CliError(Exception):
-    """Printed as `error: ...` with exit code 1."""
+    """Printed as `error: ...` with exit code 1. `status`: the HTTP status, if the server answered."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def scrub(value):
@@ -87,7 +97,7 @@ class Client:
         self.base_url = base_url.rstrip("/")
         self.token = token
 
-    def request(self, method: str, path: str, body=None, query: dict | None = None):
+    def request(self, method: str, path: str, body=None, query: dict | None = None, timeout: float = TIMEOUT):
         url = self.base_url + path
         if query:
             query = {k: v for k, v in query.items() if v is not None}
@@ -104,14 +114,14 @@ class Client:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
-            raise CliError(f"HTTP {exc.code}: {error_detail(exc)}")
+            raise CliError(f"HTTP {exc.code}: {error_detail(exc)}", status=exc.code)
         except urllib.error.URLError as exc:
             raise CliError(f"cannot reach {self.base_url}: {exc.reason} (is the server running? is ASKS_URL right?)")
         except (TimeoutError, socket.timeout):  # separate classes before Python 3.10
-            raise CliError(f"{self.base_url} did not answer in {TIMEOUT} s")
+            raise CliError(f"{self.base_url} did not answer in {timeout:g} s")
         except OSError as exc:  # e.g. connection reset mid-response
             raise CliError(f"connection to {self.base_url} failed: {exc}")
         if not raw:
@@ -584,6 +594,63 @@ def cmd_task_reopen(client, args):
     show_task(client.request("POST", f"/api/tasks/{args.id}/reopen", body={}), args, "reopened")
 
 
+# ---------- listen: wake on the user's actions (hosted bridge, SPEC v5) ----------
+
+LISTEN_WAIT = 50  # seconds the bridge holds each long poll
+LISTEN_HTTP_TIMEOUT = 70
+LISTEN_BACKOFF = (5, 10, 20, 40, 60)  # seconds between retries after errors; then every 60 s
+SLEEP = time.sleep  # tests replace it
+
+
+def run_for_event(command: str, event: dict, timeout: float) -> None:
+    """Run the user's command for one event, with only the event type and ids in the environment (never text the
+    user or an agent wrote: nothing to inject). A failing or hanging command is reported and listening goes on."""
+    env = dict(os.environ, ASKHOOMAN_EVENT=str(event.get("type", "")))
+    for field, name in (("ask_id", "ASKHOOMAN_ASK_ID"), ("task_id", "ASKHOOMAN_TASK_ID")):
+        env.pop(name, None)
+        if isinstance(event.get(field), int):
+            env[name] = str(event[field])
+    try:
+        done = subprocess.run(command, shell=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"listen: command timed out after {timeout:g} s", file=sys.stderr, flush=True)
+        return
+    if done.returncode != 0:
+        print(f"listen: command exited {done.returncode}", file=sys.stderr, flush=True)
+
+
+def cmd_listen(client, args):
+    """Long-poll the agent's event feed (GET /api/agent/events); per event print one JSON line and, with --exec,
+    run the command. Starts now (no replay); network errors, 429 and 5xx back off and retry from the same cursor;
+    other HTTP errors (401: the key is wrong or revoked) stop with exit code 1."""
+    cursor = None
+    failures = 0
+    while True:
+        try:
+            page = client.request("GET", "/api/agent/events", query={"after": cursor, "wait": LISTEN_WAIT},
+                                  timeout=LISTEN_HTTP_TIMEOUT)
+        except CliError as exc:
+            if exc.status is not None and exc.status != 429 and exc.status < 500:
+                raise
+            delay = LISTEN_BACKOFF[min(failures, len(LISTEN_BACKOFF) - 1)]
+            failures += 1
+            print(f"listen: {exc}; retrying in {delay} s", file=sys.stderr, flush=True)
+            SLEEP(delay)
+            continue
+        failures = 0
+        page = page if isinstance(page, dict) else {}
+        events = [e for e in page.get("events") or [] if isinstance(e, dict)]
+        if page.get("missed"):
+            events = [{"type": "missed"}]
+        for event in events:
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+            if args.exec:
+                run_for_event(args.exec, event, args.timeout)
+        cursor = str(page["cursor"]) if page.get("cursor") is not None else cursor
+        if args.once and events:
+            return
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -703,6 +770,15 @@ def build_parser() -> argparse.ArgumentParser:
     q = tsub.add_parser("reopen", parents=[raw], help="reopen my done or dropped task")
     q.add_argument("id", type=int)
     q.set_defaults(func=cmd_task_reopen)
+
+    p = sub.add_parser("listen", help="wait for the user's answers and replies (hosted bridge, agent key); "
+                                      "one JSON line per event")
+    p.add_argument("--exec", metavar="COMMAND", help="run COMMAND per event, with ASKHOOMAN_EVENT and "
+                                                     "ASKHOOMAN_ASK_ID / ASKHOOMAN_TASK_ID set")
+    p.add_argument("--timeout", type=float, default=900.0, metavar="SECONDS",
+                   help="stop a command that runs longer (default 900)")
+    p.add_argument("--once", action="store_true", help="stop after the first events")
+    p.set_defaults(func=cmd_listen)
 
     return parser
 
