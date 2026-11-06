@@ -141,3 +141,105 @@ def test_mcp_cursor_and_forget():
     feed.forget(AGENT)
     assert store.get("feeds", AGENT) is None and feed.mcp_cursor(AGENT) is None
     feed.forget(AGENT)  # nothing left: no error
+
+
+# ---------- the agent's side: GET /api/agent/events and MCP ask_wait ----------
+
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+
+import httpx  # noqa: E402
+
+from .conftest import _free_port  # noqa: E402
+from .fake_drive import app_action  # noqa: E402
+from .fake_google import FakeGoogle  # noqa: E402
+from .hosted_support import (  # noqa: E402
+    DENIS_SUB,
+    build,
+    connect,
+    id_token,
+    mcp,
+    register,
+    tool_error,
+    tool_result,
+)
+from .test_mcp_listen import _serve  # noqa: E402
+
+
+def agent_key(client, google, name: str = "Allen") -> tuple[dict, dict]:
+    made = client.post("/api/agents/keys", json={"name": name}, headers=id_token(google)).json()
+    return made["agent"], {"Authorization": f"Bearer {made['key']}"}
+
+
+def answer_in_app(client, google, token: str, title: str = "Ship?") -> dict:
+    ask = tool_result(mcp(client, token, "ask_create", {"title": title}))
+    app_action(google.drive(DENIS_SUB), ask["id"], "answered", answer="Yes")
+    sent = client.post("/api/events", json={"ask_id": ask["id"], "kind": "answered"}, headers=id_token(google))
+    assert sent.json()["fed"] == 1
+    return ask
+
+
+def test_feed_long_poll_returns_on_event(hosted, google):
+    tokens = connect(hosted, google, register(hosted)["client_id"], agent="Allen")
+    bearer = {"Authorization": f"Bearer {tokens['access_token']}"}
+    first = hosted.get("/api/agent/events", headers=bearer)
+    assert first.status_code == 200 and first.json() == {"events": [], "cursor": "0"}
+    assert first.headers["cache-control"] == "no-store"
+    with ThreadPoolExecutor(1) as pool:
+        start = time.monotonic()
+        pending = pool.submit(hosted.get, "/api/agent/events", params={"after": "0", "wait": 5}, headers=bearer)
+        time.sleep(0.3)
+        ask = answer_in_app(hosted, google, tokens["access_token"])
+        page = pending.result(timeout=10).json()
+    assert time.monotonic() - start < 2.5
+    assert page["cursor"] == "1" and [(e["type"], e["ask_id"]) for e in page["events"]] == [("ask.answered", ask["id"])]
+    assert hosted.get("/api/agent/events", params={"after": "1"}, headers=bearer).json() == {"events": [], "cursor": "1"}
+
+
+def test_feed_rules(hosted, google):
+    allen, allen_auth = agent_key(hosted, google, "Allen")
+    ogilvy, ogilvy_auth = agent_key(hosted, google, "Ogilvy")
+    assert hosted.get("/api/agent/events", params={"wait": 51}, headers=allen_auth).status_code == 422
+    assert hosted.get("/api/agent/events", params={"wait": -1}, headers=allen_auth).status_code == 422
+    assert hosted.get("/api/agent/events").status_code == 401
+    assert hosted.get("/api/agent/events", headers=id_token(google)).status_code == 401  # the app's token: no
+    hosted.app.state.feed.publish(allen["id"], {"type": "ask.answered", "ask_id": 1, "event": None})
+    assert len(hosted.get("/api/agent/events", params={"after": "0"}, headers=allen_auth).json()["events"]) == 1
+    assert hosted.get("/api/agent/events", params={"after": "0"}, headers=ogilvy_auth).json()["events"] == []
+    listed = {a["name"]: a for a in hosted.get("/api/agents", headers=id_token(google)).json()["agents"]}
+    assert listed["Allen"]["last_listen"] and listed["Ogilvy"]["last_listen"]
+    hosted.delete(f"/api/agents/{allen['id']}", headers=id_token(google))
+    assert hosted.get("/api/agent/events", headers=allen_auth).status_code == 401
+
+
+def test_many_waiters_do_not_block_the_app():
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    google = FakeGoogle(f"{base}/oauth/google/callback")
+    app, _ = build(google, public=base)
+    with _serve(app, port), httpx.Client(base_url=base, timeout=20) as http:
+        _, bearer = agent_key(http, google)
+
+        def poll(_):
+            return http.get("/api/agent/events", params={"wait": 1}, headers=bearer).status_code
+
+        start = time.monotonic()
+        with ThreadPoolExecutor(60) as pool:
+            polls = pool.map(poll, range(60))
+            time.sleep(0.3)
+            asked = time.monotonic()
+            agents = http.get("/api/agents", headers=id_token(google))
+            answered = time.monotonic() - asked
+            codes = list(polls)
+        assert agents.status_code == 200 and answered < 1.0
+        assert codes == [200] * 60 and time.monotonic() - start < 3.0
+
+
+def test_ask_wait_mcp(hosted, google):
+    tokens = connect(hosted, google, register(hosted)["client_id"], agent="Allen")
+    token = tokens["access_token"]
+    assert tool_result(mcp(hosted, token, "ask_wait", {"timeout": 0})) == {"events": []}
+    ask = answer_in_app(hosted, google, token)
+    got = tool_result(mcp(hosted, token, "ask_wait", {"timeout": 5}))
+    assert [(e["type"], e["ask_id"]) for e in got["events"]] == [("ask.answered", ask["id"])]
+    assert tool_result(mcp(hosted, token, "ask_wait", {"timeout": 0})) == {"events": []}  # the bridge kept the cursor
+    assert "timeout" in tool_error(mcp(hosted, token, "ask_wait", {"timeout": 51})).lower()

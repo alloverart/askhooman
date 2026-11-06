@@ -7,7 +7,7 @@ into the ASGI scope; the tools read it back through the request context.
 import logging
 from dataclasses import dataclass
 from string import Template
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Awaitable, Callable, Literal
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -137,12 +137,20 @@ class LookTool:
     change: Callable[[Identity, dict], dict]
 
 
+@dataclass(frozen=True)
+class FeedTool:
+    """ask_wait (hosted only: the event feed lives in the hosted bridge). wait(identity, timeout) waits up to
+    `timeout` seconds for the caller's next events and returns {events} (+ missed: true)."""
+    wait: Callable[[Identity, float], Awaitable[dict]]
+
+
 def build_mcp(service: AskService | None = None, tasks: TaskService | None = None, *,
-              services: Services | None = None, hosted: bool = False, look: LookTool | None = None) -> MCPServer:
+              services: Services | None = None, hosted: bool = False, look: LookTool | None = None,
+              feed: FeedTool | None = None) -> MCPServer:
     """The MCP server. Single-tenant: one AskService/TaskService for everyone. Hosted: `services(identity)`
     returns the services of the caller's user (their Drive), the wording speaks of "your user" instead of
     "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app).
-    `look`: adds set_my_look (hosted)."""
+    `look`: adds set_my_look (hosted). `feed`: adds ask_wait (hosted)."""
     if services is None:
         def services(who: Identity):
             return service, tasks
@@ -366,6 +374,25 @@ ${mine_tasks_note}"""
         """Reopen your done or dropped task: back to active (the old resolution stays in its history)."""
         who = caller(ctx)
         return call(task_service(who).reopen, who, id)
+
+    # ---------- waiting for the user (hosted) ----------
+
+    if feed is not None:
+        WaitSeconds = Annotated[float, Field(ge=0, le=50,  # noqa: N806
+                                             description="How long to wait, in seconds (0–50)")]
+
+        @tool(f"Wait for {words['human'].replace('your ', 'my ')}", read_only=True)
+        async def ask_wait(ctx: Context, timeout: WaitSeconds = 50) -> dict[str, Any]:
+            """Wait for ${human}: returns as soon as they answer, close or reopen one of your asks or reply on one of
+            your tasks. Then call asks_mine / tasks_mine.
+            Returns {"events": [...]}: empty when nothing happened within the timeout (call it again to keep
+            waiting); "missed": true means read asks_mine and tasks_mine in full."""
+            who = caller(ctx)
+            try:
+                return await feed.wait(who, timeout)
+            except Exception as exc:
+                log.exception("tool ask_wait failed")
+                raise ToolError(f"server error ({type(exc).__name__}); try again later") from None
 
     # ---------- the agent's look in the app (hosted) ----------
 

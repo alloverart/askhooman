@@ -24,7 +24,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from ..app import RequestGuard, add_api_routes, add_error_handlers, setup_logging
-from ..mcp_tools import IDENTITY_SCOPE_KEY, LookTool, build_mcp
+from ..mcp_tools import IDENTITY_SCOPE_KEY, FeedTool, LookTool, build_mcp
 from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
@@ -32,7 +32,7 @@ from .app_api import AppCors, AppUser, add_app_api, is_account_deletion, is_app_
 from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
-from .feed import EventFeed
+from .feed import EventFeed, add_feed_route
 from .google import GoogleError, GoogleOAuth
 from .looks import AGENT_COLORS, own_look
 from .operator import OperatorPing, telegram_sender
@@ -158,7 +158,16 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         return HostedAsks(records), HostedTasks(records)
 
     look = LookTool(AGENT_COLORS, lambda who, changes: own_look(accounts, public_http, limiter, who, changes))
-    mcp = build_mcp(services=services, hosted=True, look=look)
+
+    async def wait_for_user(who: HostedIdentity, timeout: float) -> dict:
+        """ask_wait: the caller's feed from the cursor the bridge keeps for MCP (MCP clients keep no state)."""
+        await anyio.to_thread.run_sync(accounts.listened, who.agent_id)
+        cursor = await anyio.to_thread.run_sync(feed.mcp_cursor, who.agent_id)
+        page = await feed.wait(who.agent_id, cursor, timeout)
+        await anyio.to_thread.run_sync(feed.set_mcp_cursor, who.agent_id, page["cursor"])
+        return {"events": page["events"], **({"missed": True} if page.get("missed") else {})}
+
+    mcp = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user))
     mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,
@@ -216,6 +225,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     add_api_routes(app, services)
     add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed)
+    add_feed_route(app, feed, accounts)
     app.router.routes.extend(auth_server.routes())
     app.router.routes.extend(site.routes(settings))
     app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, settings.trust_forwarded),

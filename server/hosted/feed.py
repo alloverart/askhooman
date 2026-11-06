@@ -22,7 +22,10 @@ import time
 from datetime import datetime, timezone
 
 import anyio.to_thread
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
+from ..mcp_tools import IDENTITY_SCOPE_KEY
 from .store import UNCHANGED, Store
 
 FEED_MAX = 200
@@ -139,3 +142,20 @@ class EventFeed:
             except RuntimeError:  # that loop is closed: its waiter is gone
                 pass
 
+
+
+def add_feed_route(app: FastAPI, feed: EventFeed, accounts) -> None:
+    """GET /api/agent/events?after=<cursor>&wait=<seconds> with the agent's token (OAuth access token or agent key)
+    -> {events, cursor} (+ missed). A long poll: it answers at once when there are events after `after`, else it
+    holds the request up to `wait` seconds (≤ WAIT_MAX). Only the calling agent's own events."""
+
+    @app.get("/api/agent/events")
+    async def agent_events(request: Request, after: str | None = None,
+                           wait: float = Query(0, ge=0, le=WAIT_MAX)):
+        who = request.scope.get(IDENTITY_SCOPE_KEY)  # set by RequestGuard from the agent's bearer token
+        agent_id = getattr(who, "agent_id", None)
+        if not agent_id:
+            raise HTTPException(401, "call this with your agent token", headers={"WWW-Authenticate": "Bearer"})
+        await anyio.to_thread.run_sync(accounts.listened, agent_id)
+        page = await feed.wait(agent_id, after, wait)
+        return JSONResponse(page, headers={"Cache-Control": "no-store"})
