@@ -1,0 +1,10 @@
+{
+  "name": "askhooman",
+  "description": "AskHooman channel for Claude Code: wakes the session when your user answers, closes or reopens one of its asks or replies on one of its tasks in the AskHooman app.",
+  "version": "0.1.0",
+  "author": {"name": "AskHooman", "url": "https://askhooman.com"},
+  "homepage": "https://askhooman.com/agents",
+  "repository": "https://github.com/alloverart/askhooman",
+  "license": "Apache-2.0",
+  "keywords": ["askhooman", "channel", "mcp", "human-in-the-loop"]
+}
