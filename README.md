@@ -123,6 +123,13 @@ asks --json list                       # raw JSON
 
 The server address comes from `ASKS_URL` (default `http://127.0.0.1:8790`), the token from `ASKS_TOKEN` or the file `ASKS_TOKEN_FILE` (default `~/.config/asks/token`). On an HTTP error the CLI exits with code 1 and prints the server's `detail`. `--context -` and `--text -` read stdin; `create --json FILE` takes one object or a list.
 
+With the hosted bridge (`ASKS_URL=https://askhooman.com` and an agent key from the app as the token), `listen` waits for the user's answers, closes, reopens and task replies and runs a command per event (`ASKHOOMAN_EVENT`, `ASKHOOMAN_ASK_ID` / `ASKHOOMAN_TASK_ID` in its environment); it starts now, retries after network errors from where it was, and stops on 401:
+
+```bash
+alias askhooman='python3 cli/asks.py'
+askhooman listen --exec 'claude -p "check asks_mine and tasks_mine"'
+```
+
 ### Drive mirror
 
 With `ASKS_DRIVE=1` the bridge writes every ask and task into the appDataFolder of one linked Google account (`ask-<id>.json`, `task-<id>.json`) and every 15 s (`ASKS_DRIVE_POLL`) replays the human's answers, closes and reopens made by an app directly in those files. The format and rules are in SPEC.md, "Drive storage". It needs a **Desktop app** OAuth client of your Google Cloud project (`ASKS_DRIVE_CLIENT`: its JSON as the console downloads it, or flat `{"client_id", "client_secret"}`) and a refresh token for the `https://www.googleapis.com/auth/drive.appdata` scope obtained with the installed-app loopback flow (`ASKS_DRIVE_TOKEN`: `{"refresh_token": "..."}`, chmod 600). If Google is unreachable or the token is revoked, the API keeps working from SQLite, a warning is logged (never the token) and the mirror catches up later; a new token file is picked up without a restart. Nothing is ever deleted from Drive.
