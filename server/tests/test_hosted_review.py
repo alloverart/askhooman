@@ -243,6 +243,48 @@ def test_webhook_schedule_is_bounded_and_retry_after_capped():
     assert flood._attempt(item) == 300.0  # capped (it could be 600 s and slept in the only worker before)
 
 
+def outcomes_of(statuses, retry_delays=(0.01, 0.01, 0.01)):
+    """Deliver once through a receiver answering `statuses` in turn (an int, or an exception to raise)."""
+    replies = list(statuses)
+    calls, results = [], []
+
+    def handle(request):
+        calls.append(request)
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return httpx.Response(reply)
+    sender = WebhookSender(httpx.Client(transport=httpx.MockTransport(handle)), retry_delays=retry_delays)
+    sender.on_result = lambda *outcome: results.append(outcome)
+    sender.send("https://hook.example/x", "whsec_x", "ask.answered", "d1", {}, agent_id="ag_1")
+    assert sender.flush(5)
+    return calls, results
+
+
+def test_final_outcome_is_reported_once():
+    calls, results = outcomes_of([500, 200])
+    assert len(calls) == 2 and results == [("ag_1", True, 200, None)]
+    calls, results = outcomes_of([404])
+    assert len(calls) == 1 and results == [("ag_1", False, 404, "HTTP 404")]
+    down = httpx.ConnectError("refused")
+    calls, results = outcomes_of([down, down, down, down])
+    assert len(calls) == 4 and results == [("ag_1", False, None, "ConnectError")]
+
+
+def test_try_once_does_not_retry():
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        return httpx.Response(503)
+    sender = WebhookSender(httpx.Client(transport=httpx.MockTransport(handle)))
+    result = sender.try_once("https://hook.example/x", "whsec_x", "ping", "d2", {"type": "ping"})
+    assert result == {"ok": False, "status": 503, "error": "HTTP 503"} and len(calls) == 1
+    assert calls[0].headers["askhooman-event"] == "ping" and calls[0].headers["askhooman-delivery"] == "d2"
+    ok = WebhookSender(httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(204))))
+    assert ok.try_once("https://hook.example/x", "s", "ping", "d3", {}) == {"ok": True, "status": 204, "error": None}
+
+
 # ---------- M1: no open redirect before the user acted ----------
 
 def test_no_redirect_to_a_cimd_redirect_uri_on_bad_requests(hosted, google):

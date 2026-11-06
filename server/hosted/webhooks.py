@@ -24,6 +24,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -79,6 +80,7 @@ class Delivery:
     attempt: int = 1
     due: float = 0.0
     seq: int = field(default=0)
+    agent_id: str | None = None
 
 
 class WebhookSender:
@@ -96,14 +98,16 @@ class WebhookSender:
         self._cond = threading.Condition()
         self._threads: list[threading.Thread] = []
         self._seq = itertools.count()
+        # Called once per delivery with its final outcome: (agent_id, ok, status, error). The hosted app writes it
+        # to the agent as last_delivery (SPEC v5), so the app can show "Last ping ok" / "Last ping failed: 404".
+        self.on_result: Callable[[str | None, bool, int | None, str | None], None] | None = None
 
     # ---------- queueing ----------
 
-    def send(self, url: str, secret: str, event_type: str, delivery_id: str, payload: dict) -> bool:
+    def send(self, url: str, secret: str, event_type: str, delivery_id: str, payload: dict,
+             agent_id: str | None = None) -> bool:
         """Schedule one delivery (returns at once); False if the schedule is full and it was dropped."""
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        item = Delivery(url, secret, event_type, delivery_id, body, urlsplit(url).hostname or "?",
-                        due=time.monotonic(), seq=next(self._seq))
+        item = self._item(url, secret, event_type, delivery_id, payload, agent_id)
         with self._cond:
             if len(self._pending) >= self.queue_max:
                 log.error("webhook %s to %s dropped: %d deliveries already waiting", delivery_id, item.host,
@@ -113,6 +117,25 @@ class WebhookSender:
             self._start_workers()
             self._cond.notify()
         return True
+
+    def _item(self, url: str, secret: str, event_type: str, delivery_id: str, payload: dict,
+              agent_id: str | None = None) -> Delivery:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return Delivery(url, secret, event_type, delivery_id, body, urlsplit(url).hostname or "?",
+                        due=time.monotonic(), seq=next(self._seq), agent_id=agent_id)
+
+    def try_once(self, url: str, secret: str, event_type: str, delivery_id: str, payload: dict) -> dict:
+        """One attempt now, in this thread, no retries (test_my_webhook): {ok, status, error}."""
+        status, problem, _ = self._post(self._item(url, secret, event_type, delivery_id, payload))
+        return {"ok": problem is None, "status": status, "error": problem}
+
+    def _report(self, item: Delivery, ok: bool, status: int | None, error: str | None) -> None:
+        if self.on_result is None:
+            return
+        try:
+            self.on_result(item.agent_id, ok, status, error)
+        except Exception:
+            log.exception("recording the outcome of webhook %s failed", item.delivery_id)
 
     def _start_workers(self) -> None:
         self._threads = [t for t in self._threads if t.is_alive()]
@@ -161,9 +184,8 @@ class WebhookSender:
 
     # ---------- one attempt ----------
 
-    def _attempt(self, item: Delivery) -> float | None:
-        """POST once; the delay before the next attempt, or None when finished (delivered or given up)."""
-        attempts = len(self.retry_delays) + 1
+    def _post(self, item: Delivery) -> tuple[int | None, str | None, float | None]:
+        """POST once: (HTTP status or None, problem or None when delivered, Retry-After seconds or None)."""
         timestamp = int(self.clock())
         signature = sign(item.secret, item.body, timestamp)
         headers = {"Content-Type": "application/json", "Accept-Encoding": "identity",
@@ -186,15 +208,22 @@ class WebhookSender:
                 except ValueError:
                     retry_after = None
         except httpx.HTTPError as exc:
-            problem, final = type(exc).__name__, False
-        else:
-            if 200 <= status < 300:
-                log.info("webhook %s delivered to %s (attempt %d)", item.delivery_id, item.host, item.attempt)
-                return None
-            problem, final = f"HTTP {status}", status != 429 and status < 500
+            return None, type(exc).__name__, None
+        return status, None if 200 <= status < 300 else f"HTTP {status}", retry_after
+
+    def _attempt(self, item: Delivery) -> float | None:
+        """POST once; the delay before the next attempt, or None when finished (delivered or given up)."""
+        attempts = len(self.retry_delays) + 1
+        status, problem, retry_after = self._post(item)
+        if problem is None:
+            log.info("webhook %s delivered to %s (attempt %d)", item.delivery_id, item.host, item.attempt)
+            self._report(item, True, status, None)
+            return None
+        final = status is not None and status != 429 and status < 500
         if final or item.attempt >= attempts:
             log.error("webhook %s to %s failed (attempt %d of %d, giving up): %s",
                       item.delivery_id, item.host, item.attempt, attempts, problem)
+            self._report(item, False, status, problem)
             return None
         delay = self.retry_delays[item.attempt - 1]
         if retry_after and retry_after > 0:

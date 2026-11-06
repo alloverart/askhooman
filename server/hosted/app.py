@@ -148,6 +148,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     pool = DrivePool(accounts, settings.web_client_id, settings.web_client_secret, http,
                      link_url=f"{settings.public_url}/oauth/link")
     webhooks = webhooks or WebhookSender(public_http)
+    if webhooks.on_result is None:  # each delivery's outcome becomes the agent's last_delivery
+        webhooks.on_result = accounts.record_delivery
     auth_server = AuthServer(settings, accounts, google, CimdResolver(public_http), limiter)
     resource_auth = ResourceAuth(settings, accounts, limiter)
 
