@@ -303,7 +303,21 @@ Server implemented 03.11.2026 (SQLite, hosted Drive records, REST, MCP `task_ans
 
 ### 2. Waking the agent
 
-Rewritten 03.11.2026 (Denis: «relay внутри AskHooman»). Most agents run where nothing can reach them: a Claude Code
+Rewritten 03.11.2026 (Denis: «relay внутри AskHooman»). Server, CLI and the Claude Code plugin implemented
+06.11.2026; the apps follow. Decided while building it (part of the contract):
+
+- Feed events are slim: `{id, type, ask_id | task_id, event: {id, at}, at}`; `id` is the agent's sequence number
+  and the cursor is its string. No `after` = start now (`{events: [], cursor: <latest>}`; with `wait` it holds
+  until the next event). A cursor older than what is kept, newer than the latest or not a number: `missed: true`.
+- `POST /api/events` answers `{queued, fed}` (webhook deliveries, feed events).
+- The agent's existing `last_seen` keeps meaning its last call of any kind; the last read of its feed (REST or
+  `ask_wait`) is the new **`last_listen`**, written at most once a minute.
+- `webhook_set_by` is `null` without a webhook; `set_my_webhook(url="")` removes it. `last_delivery` is written on
+  a delivery's final outcome (delivered or given up after the retries) and by `test_my_webhook`.
+- `test_my_webhook()` sends one attempt, no retries, of `{type: "ping", agent: {id, name, slug}, delivery_id,
+  sent_at}` and returns `{ok, status, error}`.
+- The CLI is `cli/asks.py listen` (alias `askhooman`); it kills a command after `--timeout` (900 s), retries network
+  errors, 429 and 5xx from the same cursor and stops on other HTTP errors. Most agents run where nothing can reach them: a Claude Code
 session on a laptop behind NAT, Codex on a desktop. A webhook needs a public HTTPS receiver, and most users have none.
 So the bridge keeps each agent's events, and the agent's side fetches them over a connection it opens itself. Nobody
 needs a public URL. Webhooks stay for agents that do have a server.
