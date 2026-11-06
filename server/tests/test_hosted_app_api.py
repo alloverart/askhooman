@@ -425,3 +425,21 @@ def test_revoke_and_delete_account_drop_the_feed(hosted, google):
     assert hosted.store.get("feeds", second["id"]) is not None
     assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
     assert hosted.store.get("feeds", second["id"]) is None
+
+
+def test_last_delivery_on_the_agent(hosted, google):
+    tokens = connect(hosted, google, register(hosted)["client_id"], agent="Allen")
+    agent_id = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["id"]
+    hosted.patch(f"/api/agents/{agent_id}", json={"webhook_url": "https://hooks.example/qt"}, headers=id_token(google))
+    ask = tool_result(mcp(hosted, tokens["access_token"], "ask_create", {"title": "Ship?"}))
+    app_action(google.drive(DENIS_SUB), ask["id"], "answered", answer="Yes")
+    google.webhook_statuses.extend([404])
+    hosted.post("/api/events", json={"ask_id": ask["id"], "kind": "answered"}, headers=id_token(google))
+    assert hosted.app.state.webhooks.flush(5)
+    last = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["last_delivery"]
+    assert last["ok"] is False and last["status"] == 404 and last["error"] == "HTTP 404" and last["at"]
+    google.webhook_statuses.extend([200])
+    hosted.post("/api/events", json={"ask_id": ask["id"], "kind": "answered"}, headers=id_token(google))
+    assert hosted.app.state.webhooks.flush(5)
+    last = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["last_delivery"]
+    assert (last["ok"], last["status"], last["error"]) == (True, 200, None)

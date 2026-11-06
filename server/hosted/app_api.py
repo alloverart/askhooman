@@ -411,7 +411,8 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             if not secret:
                 continue
             delivery = uuid.uuid4().hex
-            webhooks.send(agent["webhook_url"], secret, payload["type"], delivery, {**payload, "delivery_id": delivery})
+            webhooks.send(agent["webhook_url"], secret, payload["type"], delivery, {**payload, "delivery_id": delivery},
+                          agent_id=agent["id"])
             queued += 1
         return {"queued": queued}
 
