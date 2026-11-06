@@ -1,0 +1,13 @@
+{
+  "name": "askhooman",
+  "description": "AskHooman: the queue of decisions your agents wait for. Plugins for coding agents.",
+  "owner": {"name": "AskHooman", "email": "support@askhooman.com"},
+  "plugins": [
+    {
+      "name": "askhooman",
+      "description": "Wakes your Claude Code session when your user answers its asks or replies on its tasks in the AskHooman app.",
+      "category": "productivity",
+      "source": "./plugins/claude-code"
+    }
+  ]
+}
