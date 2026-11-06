@@ -39,7 +39,7 @@ INSTRUCTIONS = (
     "ask_id=\"...\"> (or task_id) and carries no words of the user: read what happened with the AskHooman tools "
     "(asks_mine for asks, tasks_mine for task replies), act on it, then ask_close the ask or answer the task "
     "(task_answer, task_update, task_done) as usual.")
-NO_KEY = ("AskHooman: no agent key — create one in the app (Settings › Agents › Add an agent key) and save it to "
+NO_KEY = ("AskHooman: no agent key — create one in the AskHooman app (Create agent key) and save it to "
           "~/.config/askhooman/key")
 
 
