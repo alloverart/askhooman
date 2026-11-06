@@ -376,3 +376,52 @@ def test_store_pages(hosted):
     # the old domain serves the same pages, pointing at the public URL
     alias = hosted.get("/privacy", headers={"Host": "old.qtracker.test"})
     assert alias.status_code == 200 and f'<link rel="canonical" href="{PUBLIC}/privacy">' in alias.text
+
+
+# ---------- SPEC v5 step 2: the wake switch and the agent's wake-up fields ----------
+
+def new_agent(hosted, google, name: str = "Allen") -> dict:
+    made = hosted.post("/api/agents/keys", json={"name": name}, headers=id_token(google))
+    assert made.status_code == 201
+    return {**made.json()["agent"], "key": made.json()["key"]}
+
+
+def test_agent_shape_has_wake_fields(hosted, google):
+    agent = new_agent(hosted, google)
+    listed = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]
+    for shape in (agent, listed):
+        assert shape["wake"] is True
+        assert shape["webhook_set_by"] is None and shape["last_delivery"] is None and shape["last_listen"] is None
+
+
+def test_patch_wake_off_and_on(hosted, google):
+    agent = new_agent(hosted, google)
+    off = hosted.patch(f"/api/agents/{agent['id']}", json={"wake": False}, headers=id_token(google))
+    assert off.status_code == 200 and off.json()["agent"]["wake"] is False
+    assert hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["wake"] is False
+    on = hosted.patch(f"/api/agents/{agent['id']}", json={"wake": True}, headers=id_token(google))
+    assert on.json()["agent"]["wake"] is True
+    bad = hosted.patch(f"/api/agents/{agent['id']}", json={"wake": "no"}, headers=id_token(google))
+    assert bad.status_code == 422
+
+
+def test_webhook_set_from_app_is_set_by_user(hosted, google):
+    agent = new_agent(hosted, google)
+    set_hook = hosted.patch(f"/api/agents/{agent['id']}", json={"webhook_url": "https://hooks.example/a"},
+                            headers=id_token(google))
+    assert set_hook.json()["agent"]["webhook_set_by"] == "user"
+    cleared = hosted.patch(f"/api/agents/{agent['id']}", json={"webhook_url": None}, headers=id_token(google))
+    assert cleared.json()["agent"]["webhook_url"] is None and cleared.json()["agent"]["webhook_set_by"] is None
+
+
+def test_revoke_and_delete_account_drop_the_feed(hosted, google):
+    feed = hosted.app.state.feed
+    first, second = new_agent(hosted, google, "Allen"), new_agent(hosted, google, "Ogilvy")
+    for agent in (first, second):
+        feed.publish(agent["id"], {"type": "ask.answered", "ask_id": 1, "event": {"id": 2, "at": "x"}})
+        assert hosted.store.get("feeds", agent["id"]) is not None
+    assert hosted.delete(f"/api/agents/{first['id']}", headers=id_token(google)).status_code == 200
+    assert hosted.store.get("feeds", first["id"]) is None
+    assert hosted.store.get("feeds", second["id"]) is not None
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    assert hosted.store.get("feeds", second["id"]) is None

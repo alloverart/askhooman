@@ -39,6 +39,7 @@ log = logging.getLogger("asks.hosted.accounts")
 
 AGENT_NAME_MAX = 40
 SEEN_EVERY = 300.0  # write an agent's last_seen at most this often (seconds)
+LISTEN_EVERY = 60.0  # write an agent's last_listen (it read its event feed) at most this often (seconds)
 SCOPE = "qtracker"  # OAuth scope from before the rename to AskHooman: clients and tokens carry it, kept as is
 ACCESS_PREFIX, REFRESH_PREFIX, KEY_PREFIX = "qta_", "qtr_", "qtk_"
 ACCESS_FORMAT = re.compile(r"^qta_[A-Za-z0-9_-]{43}$")  # new_secret(ACCESS_PREFIX): 32 random bytes
@@ -107,6 +108,10 @@ def agent_json(agent: dict) -> dict:
         "created_at": agent.get("created_at"), "last_seen": agent.get("last_seen"),
         "webhook_url": agent.get("webhook_url"), "webhook_secret_set": bool(agent.get("webhook_secret")),
         "revoked_at": agent.get("revoked_at"),
+        # SPEC v5 "Waking the agent": the wake switch (absent = on), who set the webhook ("user" in the app,
+        # "agent" with set_my_webhook), the last webhook outcome, and when the agent last read its event feed.
+        "wake": agent.get("wake") is not False, "webhook_set_by": agent.get("webhook_set_by"),
+        "last_delivery": agent.get("last_delivery"), "last_listen": agent.get("last_listen"),
         "color": color_key(agent.get("color")), "avatar": avatar_json(agent.get("avatar")),
         "clients": [{"client_id": c.get("client_id"), "client_name": c.get("client_name"),
                      "connected_at": c.get("connected_at")} for c in agent.get("clients") or []],
@@ -115,13 +120,15 @@ def agent_json(agent: dict) -> dict:
 
 class Accounts:
     def __init__(self, store: Store, keyring: Keyring, settings: HostedSettings, clock=time.time,
-                 on_new_user: Callable[[dict], None] | None = None):
+                 on_new_user: Callable[[dict], None] | None = None, feed=None):
         self.store = store
         self.keyring = keyring
         self.settings = settings
         self.clock = clock
         self.on_new_user = on_new_user  # the operator's sign-up ping (operator.OperatorPing.new_user)
+        self.feed = feed  # feed.EventFeed: an agent's event feed goes with the agent
         self._seen: dict[str, float] = {}
+        self._listened: dict[str, float] = {}
         self._seen_lock = threading.Lock()
 
     # ---------- users ----------
@@ -199,6 +206,9 @@ class Accounts:
                 if collection == "agents":
                     with self._seen_lock:
                         self._seen.pop(key, None)
+                        self._listened.pop(key, None)
+                    if self.feed is not None:
+                        self.feed.forget(key)
         self.store.delete("users", sub)
         if found or removed:
             log.info("account deleted: %s", ", ".join(f"{n} {c}" for c, n in removed.items()) or "no agents")
@@ -288,6 +298,7 @@ class Accounts:
         agent = {"id": "ag_" + new_secret(nbytes=12), "user": sub, "name": name, "slug": slug,
                  "client_id": client_id, "client_name": client_name, "clients": clients, "created_at": now,
                  "last_seen": None, "webhook_url": None, "webhook_secret": None, "revoked_at": None,
+                 "wake": True, "webhook_set_by": None, "last_delivery": None, "last_listen": None,
                  "key_prefix": None, "color": least_used(a.get("color") for a in active), "avatar": None}
         self.store.put("agents", agent["id"], agent)
         log.info("agent %s (%s) connected for a user via %s", agent["id"], slug, "oauth" if client_id else "key")
@@ -330,10 +341,11 @@ class Accounts:
         self.store.update("agents", agent["id"], fields)
         return {**agent, **fields}
 
-    def set_webhook(self, agent: dict, url: str | None, rotate: bool = False) -> tuple[dict, str | None]:
+    def set_webhook(self, agent: dict, url: str | None, rotate: bool = False,
+                    by: str = "user") -> tuple[dict, str | None]:
         """Set/clear the webhook URL. A new signing secret is made (and returned, once) when the agent gets a
-        webhook and has none yet, or on rotate."""
-        fields: dict = {"webhook_url": url}
+        webhook and has none yet, or on rotate. `by`: "user" (the app) or "agent" (set_my_webhook)."""
+        fields: dict = {"webhook_url": url, "webhook_set_by": by if url else None}
         secret = None
         if url is None:
             fields["webhook_secret"] = None
@@ -347,9 +359,32 @@ class Accounts:
         sealed = agent.get("webhook_secret")
         return self.keyring.decrypt(sealed, f"webhook:{agent['id']}") if sealed else None
 
+    def set_wake(self, agent: dict, wake: bool) -> dict:
+        """The wake switch: off = no feed events and no webhook calls for this agent."""
+        self.store.update("agents", agent["id"], {"wake": bool(wake)})
+        return {**agent, "wake": bool(wake)}
+
+    def record_delivery(self, agent_id: str | None, ok: bool, status: int | None, error: str | None) -> None:
+        """The final outcome of a webhook delivery (or of test_my_webhook), shown in the app as the last ping."""
+        if agent_id:
+            self.store.update("agents", agent_id, {"last_delivery": {"at": utc_now(), "ok": bool(ok),
+                                                                     "status": status, "error": error}})
+
+    def listened(self, agent_id: str) -> None:
+        """The agent read its event feed (REST long poll or ask_wait): last_listen, written at most once a minute."""
+        now = time.monotonic()
+        with self._seen_lock:
+            if now - self._listened.get(agent_id, -LISTEN_EVERY) < LISTEN_EVERY:
+                return
+            self._listened[agent_id] = now
+        self.store.update("agents", agent_id, {"last_listen": utc_now()})
+
     def revoke_agent(self, agent: dict) -> dict:
         now = utc_now()
-        self.store.update("agents", agent["id"], {"revoked_at": now, "webhook_url": None, "webhook_secret": None})
+        self.store.update("agents", agent["id"], {"revoked_at": now, "webhook_url": None, "webhook_secret": None,
+                                                  "webhook_set_by": None})
+        if self.feed is not None:
+            self.feed.forget(agent["id"])
         for collection in ("tokens", "keys"):  # tidy up; the agent check alone already rejects them
             for key, _ in self.store.find(collection, "agent_id", agent["id"]):
                 self.store.update(collection, key, {"revoked": True})
