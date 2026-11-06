@@ -117,3 +117,25 @@ def test_marketplace_points_to_the_plugin():
     assert manifest["name"] == "askhooman" and manifest["version"] == plugin.VERSION
     servers = json.loads((PLUGIN / ".mcp.json").read_text())["mcpServers"]
     assert servers["askhooman"]["args"] == ["${CLAUDE_PLUGIN_ROOT}/server.py"]
+
+
+class Stop(BaseException):
+    """Ends plugin.poll from the test once the first channel message is out."""
+
+
+def test_poll_survives_a_cut_response():
+    sent, slept = [], []
+
+    class Out:
+        def channel(self, params):
+            sent.append(params)
+            raise Stop
+
+    replies = [(200, {"events": [], "cursor": "2"}), "cut", (200, {"events": [event(3, ask_id=4)], "cursor": "3"})]
+    with feed_stub(replies) as (url, queries):
+        try:
+            plugin.poll(Out(), url, "qtk_key", sleep=slept.append)
+        except Stop:
+            pass
+    assert sent and sent[0]["content"] == "AskHooman: your user answered ask #4 — call asks_mine"
+    assert slept == [5] and [q.get("after") for q in queries] == [None, "2", "2"]

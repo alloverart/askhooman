@@ -31,6 +31,7 @@ replies and run a command per event, with ASKHOOMAN_EVENT and ASKHOOMAN_ASK_ID /
 from __future__ import annotations  # keeps it runnable on macOS /usr/bin/python3 (3.9)
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -124,6 +125,8 @@ class Client:
             raise CliError(f"{self.base_url} did not answer in {timeout:g} s")
         except OSError as exc:  # e.g. connection reset mid-response
             raise CliError(f"connection to {self.base_url} failed: {exc}")
+        except http.client.HTTPException as exc:  # IncompleteRead, BadStatusLine: not OSErrors
+            raise CliError(f"connection to {self.base_url} failed: {type(exc).__name__}")
         if not raw:
             return None
         try:
