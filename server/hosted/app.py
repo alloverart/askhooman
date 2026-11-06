@@ -32,6 +32,7 @@ from .app_api import AppCors, AppUser, add_app_api, is_account_deletion, is_app_
 from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
+from .feed import EventFeed
 from .google import GoogleError, GoogleOAuth
 from .looks import AGENT_COLORS, own_look
 from .operator import OperatorPing, telegram_sender
@@ -139,7 +140,9 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     if operator is None and settings.operator_chat and settings.operator_token:
         operator = OperatorPing(telegram_sender(settings.operator_token, http), settings.operator_chat, internal,
                                 site.WEB_APP)
-    accounts = Accounts(store, keyring, settings, on_new_user=operator.new_user if operator else None)
+    feed = EventFeed(store)  # SPEC v5: each agent's events, read by its long poll / ask_wait
+    accounts = Accounts(store, keyring, settings, on_new_user=operator.new_user if operator else None,
+                        feed=feed)
     google = GoogleOAuth(settings.web_client_id, settings.web_client_secret, settings.google_redirect_uri, http)
     limiter = RateLimiter()
     pool = DrivePool(accounts, settings.web_client_id, settings.web_client_secret, http,
@@ -199,6 +202,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.state.store = store
     app.state.pool = pool
     app.state.webhooks = webhooks
+    app.state.feed = feed
     app.state.limiter = limiter
     app.state.auth_server = auth_server
     app.state.mcp = mcp

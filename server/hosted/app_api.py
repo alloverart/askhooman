@@ -2,7 +2,7 @@
 "Connected agents" screens. Authenticated with the user's Google ID token (audience = the iOS client).
 
   GET    /api/agents             the user's connected agents (each with its look: color, avatar)
-  PATCH  /api/agents/{id}        {name?, webhook_url?, rotate_webhook_secret?, color?, avatar?}
+  PATCH  /api/agents/{id}        {name?, webhook_url?, rotate_webhook_secret?, wake?, color?, avatar?}
                                  -> agent (+ webhook_secret, once)
   DELETE /api/agents/{id}        revoke: every token and key of the agent stops working at once
   POST   /api/agents/keys        {name} -> 201 {agent, key}: an agent key (qtk_…), shown only in this response
@@ -35,7 +35,7 @@ from typing import Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictBool
 from starlette.datastructures import Headers, MutableHeaders
 
 from ..db import utc_now
@@ -253,6 +253,7 @@ class AgentPatch(BaseModel):
     name: str | None = None
     webhook_url: str | None = None
     rotate_webhook_secret: bool = False
+    wake: StrictBool | None = None  # SPEC v5: off = no feed events, no webhook calls
     color: str | None = None  # a palette key (looks.AGENT_COLORS)
     avatar: dict | None = None  # {kind: robot} | {kind: emoji, emoji} | {kind: image, data: data URL}
 
@@ -344,6 +345,8 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             elif body.rotate_webhook_secret:
                 raise Invalid("set a webhook_url to have a webhook secret")
             agent, secret = accounts.set_webhook(agent, url or None, rotate=body.rotate_webhook_secret)
+        if body.wake is not None:
+            agent = accounts.set_wake(agent, body.wake)
         if look:
             agent = accounts.set_look(agent, **look)
         reply = {"agent": agent_json(agent)}
