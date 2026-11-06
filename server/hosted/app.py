@@ -24,7 +24,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from ..app import RequestGuard, add_api_routes, add_error_handlers, setup_logging
-from ..mcp_tools import IDENTITY_SCOPE_KEY, FeedTool, LookTool, build_mcp
+from ..mcp_tools import IDENTITY_SCOPE_KEY, FeedTool, LookTool, WebhookTool, build_mcp
 from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
@@ -40,6 +40,7 @@ from .oauth import AuthServer
 from .ratelimit import RateLimiter, client_ip
 from .records import DrivePool, HostedAsks, HostedTasks
 from .safe_http import public_client
+from .self_webhook import ping_own_webhook, set_own_webhook
 from .stats import internal_check
 from .store import MemoryStore
 from .webhooks import WebhookSender
@@ -167,7 +168,10 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         await anyio.to_thread.run_sync(feed.set_mcp_cursor, who.agent_id, page["cursor"])
         return {"events": page["events"], **({"missed": True} if page.get("missed") else {})}
 
-    mcp = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user))
+    own_webhook = WebhookTool(
+        lambda who, url, rotate: set_own_webhook(accounts, limiter, who, url, rotate),
+        lambda who: ping_own_webhook(accounts, webhooks, limiter, who))
+    mcp = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user), webhook=own_webhook)
     mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,

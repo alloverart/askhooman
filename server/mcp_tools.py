@@ -144,13 +144,21 @@ class FeedTool:
     wait: Callable[[Identity, float], Awaitable[dict]]
 
 
+@dataclass(frozen=True)
+class WebhookTool:
+    """set_my_webhook / test_my_webhook (hosted only). set(identity, url, rotate_secret) -> {webhook_url,
+    webhook_set_by, webhook_secret?}; test(identity) -> {ok, status, error}."""
+    set: Callable[[Identity, str, bool], dict]
+    test: Callable[[Identity], dict]
+
+
 def build_mcp(service: AskService | None = None, tasks: TaskService | None = None, *,
               services: Services | None = None, hosted: bool = False, look: LookTool | None = None,
-              feed: FeedTool | None = None) -> MCPServer:
+              feed: FeedTool | None = None, webhook: WebhookTool | None = None) -> MCPServer:
     """The MCP server. Single-tenant: one AskService/TaskService for everyone. Hosted: `services(identity)`
     returns the services of the caller's user (their Drive), the wording speaks of "your user" instead of
     "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app).
-    `look`: adds set_my_look (hosted). `feed`: adds ask_wait (hosted)."""
+    `look`: adds set_my_look (hosted). `feed`: adds ask_wait, `webhook`: set_my_webhook and test_my_webhook (hosted)."""
     if services is None:
         def services(who: Identity):
             return service, tasks
@@ -393,6 +401,32 @@ ${mine_tasks_note}"""
             except Exception as exc:
                 log.exception("tool ask_wait failed")
                 raise ToolError(f"server error ({type(exc).__name__}); try again later") from None
+
+    if webhook is not None:
+        WebhookUrl = Annotated[str, Field(  # noqa: N806
+            description="https URL on port 443 of a public host that accepts a POST; \"\" removes your webhook")]
+
+        @tool("Set my webhook")
+        def set_my_webhook(
+            url: WebhookUrl,
+            ctx: Context,
+            rotate_secret: Annotated[bool, Field(description="true: a new signing secret")] = False,
+        ) -> dict[str, Any]:
+            """Only if you can receive an HTTPS POST (your own server, n8n, Zapier): set the URL AskHooman calls when
+            ${human} answers, closes or reopens one of your asks or replies on one of your tasks. Ask ${human}
+            first (ask_create). Without a server, use ask_wait instead. The body is JSON {type, ask or task, event,
+            delivery_id, sent_at}, signed in the AskHooman-Signature header (t=<unix seconds>,v1=<hex
+            HMAC-SHA256(secret, "<t>.<raw body>")>). webhook_secret (whsec_…) is returned only when it is new:
+            store it. At most 10 calls an hour. Returns {webhook_url, webhook_set_by, webhook_secret?}."""
+            who = caller(ctx)
+            return call(webhook.set, who, url, rotate_secret)
+
+        @tool("Test my webhook")
+        def test_my_webhook(ctx: Context) -> dict[str, Any]:
+            """Send one signed {"type": "ping"} to your webhook now (no retries) and see what it answered: {ok, status,
+            error}. At most 10 calls an hour."""
+            who = caller(ctx)
+            return call(webhook.test, who)
 
     # ---------- the agent's look in the app (hosted) ----------
 

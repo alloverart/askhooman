@@ -24,6 +24,8 @@ LIMITS = {
     "user": (1200, 60.0),  # MCP/REST requests of all agents of one user
     "bearer_fail": (60, 60.0),  # failed bearer checks from one address
     "look_fetch": (10, 600.0),  # set_my_look image_url fetches of one agent (looks.own_look)
+    "webhook_set": (10, 3600.0),  # set_my_webhook calls of one agent (self_webhook.py)
+    "webhook_test": (10, 3600.0),  # test_my_webhook calls of one agent
 }
 MAX_KEYS = 20000
 
