@@ -43,9 +43,10 @@ jobs:
             --config deploy/hosted/cloudbuild.yaml --ignore-file deploy/hosted/.gcloudignore \
             --substitutions "_IMAGE=$IMAGE" .
       - name: Deploy (env vars and secrets of the service are kept)
+        # --concurrency: agents' long polls hold requests (deploy/hosted/README.md, "Why these flags")
         run: |
           gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE }}" --project "${{ vars.GCP_PROJECT }}" \
-            --region "${{ vars.GCP_REGION }}" --image "$IMAGE" --quiet
+            --region "${{ vars.GCP_REGION }}" --image "$IMAGE" --concurrency=1000 --quiet
       - name: Smoke check
         run: |
           URL=$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE }}" --project "${{ vars.GCP_PROJECT }}" \

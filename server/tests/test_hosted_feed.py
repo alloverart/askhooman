@@ -8,7 +8,7 @@ import time
 import anyio
 import pytest
 
-from server.hosted.feed import FEED_MAX, EventFeed
+from server.hosted.feed import FEED_MAX, MAX_WAITERS, EventFeed
 from server.hosted.store import MemoryStore
 
 AGENT = "ag_one"
@@ -127,6 +127,28 @@ async def test_waiting_does_not_block_other_tasks():
         tg.start_soon(feed.wait, AGENT, None, 0.3)
         tg.start_soon(ticker)
     assert len(ticks) == 5 and ticks[-1] - ticks[0] < 0.25
+
+
+@pytest.mark.anyio
+async def test_one_agent_cannot_hold_more_than_a_few_polls():
+    """A held poll costs one request slot for up to 50 s; a looping script or a leaked key must not take them all
+    (review 06.11.2026). Beyond MAX_WAITERS per agent (per instance) a poll answers at once."""
+    feed = EventFeed(MemoryStore(), poll_every=0.05)
+    done = {}
+
+    async def poll(n):
+        start = time.monotonic()
+        await feed.wait(AGENT, None, 1.0)
+        done[n] = time.monotonic() - start
+    async with anyio.create_task_group() as tg:
+        for n in range(MAX_WAITERS):
+            tg.start_soon(poll, n)
+        await anyio.sleep(0.1)
+        tg.start_soon(poll, "extra")
+        await anyio.sleep(0.1)
+        assert done.get("extra", 99) < 0.1  # answered at once
+        tg.start_soon(feed.wait, OTHER, None, 0.2)  # another agent still waits normally
+    assert all(done[n] >= 0.9 for n in range(MAX_WAITERS))
 
 
 def test_mcp_cursor_and_forget():

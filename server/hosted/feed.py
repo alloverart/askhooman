@@ -32,6 +32,7 @@ FEED_MAX = 200
 FEED_DAYS = 7
 WAIT_MAX = 50  # seconds; well under Cloud Run's request timeout
 POLL_EVERY = 3.0  # seconds between store re-reads while waiting (events from other instances)
+MAX_WAITERS = 4  # held polls per agent on one instance; more answer at once (a looping script must not hold every slot)
 COLLECTION = "feeds"
 
 
@@ -110,7 +111,10 @@ class EventFeed:
         signal = asyncio.Event()
         entry = (asyncio.get_running_loop(), signal)
         with self._lock:  # registered before the first read, so an event in between is not slept through
-            self._waiters.setdefault(agent_id, set()).add(entry)
+            waiters = self._waiters.setdefault(agent_id, set())
+            if len(waiters) >= MAX_WAITERS:  # this agent already holds enough polls here: answer at once
+                wait = 0.0
+            waiters.add(entry)
         try:
             page = await anyio.to_thread.run_sync(self.read, agent_id, after)
             deadline = time.monotonic() + wait

@@ -317,8 +317,12 @@ Rewritten 03.11.2026 (Denis: «relay внутри AskHooman»). Server, CLI and 
 - `test_my_webhook()` sends one attempt, no retries, of `{type: "ping", agent: {id, name, slug}, delivery_id,
   sent_at}` and returns `{ok, status, error}`.
 - The CLI is `cli/asks.py listen` (alias `askhooman`); it kills a command after `--timeout` (900 s), retries network
-  errors, 429 and 5xx from the same cursor and stops on other HTTP errors. Most agents run where nothing can reach them: a Claude Code
-session on a laptop behind NAT, Codex on a desktop. A webhook needs a public HTTPS receiver, and most users have none.
+  errors, 429 and 5xx from the same cursor and stops on other HTTP errors.
+- One agent holds at most 4 waiting polls per instance; more answer at once. The service allows 1000 concurrent
+  requests per instance (held polls use no CPU), set by the deploy.
+
+Most agents run where nothing can reach them: a Claude Code session on a laptop behind NAT, Codex on a desktop.
+A webhook needs a public HTTPS receiver, and most users have none.
 So the bridge keeps each agent's events, and the agent's side fetches them over a connection it opens itself. Nobody
 needs a public URL. Webhooks stay for agents that do have a server.
 
@@ -351,8 +355,9 @@ needs a public URL. Webhooks stay for agents that do have a server.
   `webhook_set_by: "agent"`).
 - **Per-agent switch `wake`** (default on): off = no events in the feed and no webhook calls for that agent.
   `PATCH /api/agents/{id} {wake}`. The agent shape adds `wake`, `webhook_set_by`, `last_delivery` = `{at, ok, status,
-  error}` (webhook) and `last_seen` = when the agent last read its feed.
-- **Apps, Agents screen, per agent:** a **Wake-up** switch. "Wakes through the plugin, last seen 11:20", or "Webhook →
+  error}` (webhook) and `last_listen` = when the agent last read its feed (`last_seen` stays: its last call of
+  any kind).
+- **Apps, Agents screen, per agent:** a **Wake-up** switch. "Wakes through the plugin, last listened 11:20", or "Webhook →
   <host> · set by the agent". "Last ping ok, 11:20" or "Last ping failed: 404, 11:20". The existing Webhook button edits
   or removes the address.
 - **Server instructions (to agents):** "Your user may want you to wake up when they answer. In Claude Code, suggest

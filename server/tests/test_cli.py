@@ -68,7 +68,16 @@ def feed_stub(replies):
             parts = urllib.parse.urlsplit(self.path)
             queries.append({**dict(urllib.parse.parse_qsl(parts.query)), "path": parts.path,
                             "auth": self.headers.get("Authorization")})
-            status, body = replies.pop(0) if replies else (200, {"events": [], "cursor": "0"})
+            reply = replies.pop(0) if replies else (200, {"events": [], "cursor": "0"})
+            if reply == "cut":  # headers promise a body that never comes: the client sees IncompleteRead
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b'{"events": [')
+                self.close_connection = True
+                return
+            status, body = reply
             raw = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -133,3 +142,15 @@ def test_listen_kills_a_command_that_hangs(tmp_path, capsys, monkeypatch):
         code, _, err = run(capsys, monkeypatch, url, "qtk_key", "listen", "--once", "--timeout", "0.5",
                            "--exec", "sleep 30")
     assert code == 0 and "timed out after 0.5 s" in err
+
+
+def test_listen_survives_a_cut_response(capsys, monkeypatch):
+    """IncompleteRead / BadStatusLine are not OSErrors: a body cut by an instance shutdown must back off and resume,
+    not crash the listener (review 06.11.2026)."""
+    slept = []
+    monkeypatch.setattr(cli, "SLEEP", slept.append)
+    replies = [(200, {"events": [], "cursor": "4"}), "cut", (200, {"events": [event(5, ask_id=1)], "cursor": "5"})]
+    with feed_stub(replies) as (url, queries):
+        code, out, err = run(capsys, monkeypatch, url, "qtk_key", "listen", "--once")
+    assert code == 0 and "IncompleteRead" in err and slept == [5]
+    assert [q.get("after") for q in queries] == [None, "4", "4"] and json.loads(out)["id"] == 5

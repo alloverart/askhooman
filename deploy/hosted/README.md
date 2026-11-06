@@ -66,7 +66,7 @@ gcloud builds submit --config deploy/hosted/cloudbuild.yaml --ignore-file deploy
 
 # 6. The service
 gcloud run deploy qtracker --image=$IMAGE --region=$REGION --service-account=$SA \
-  --allow-unauthenticated --no-cpu-throttling --min-instances=0 --max-instances=3 --memory=512Mi \
+  --allow-unauthenticated --no-cpu-throttling --min-instances=0 --max-instances=3 --concurrency=1000 --memory=512Mi \
   --set-env-vars=ASKS_PUBLIC_URL=https://<PUBLIC_HOST>,ASKS_GOOGLE_APP_CLIENT_IDS=<APP_CLIENT_ID>,ASKS_FIRESTORE_PROJECT=$PROJECT \
   --set-secrets=ASKS_GOOGLE_WEB_CLIENT=qtracker-google-web-client:latest,ASKS_ENCRYPTION_KEY=qtracker-encryption-key:latest
 
@@ -82,6 +82,7 @@ Why these flags:
 - `--allow-unauthenticated`: the service is public and does all authorization itself (OAuth, agent keys, ID tokens). If an organization policy forbids `allUsers`, the deploy says so and the project needs an exception.
 - `--no-cpu-throttling`: webhooks to agents and their retries (5 s, 30 s, 2 min) run in the background after the response. With throttling, the background thread stalls until the next request. Cost: the instance is billed while it is alive (up to ~15 minutes after the last request).
 - `--max-instances=3`: rate limits are counted per instance, so their overall ceiling grows with the number of instances.
+- `--concurrency=1000`: agents waiting for their user hold a request for up to 50 s (`GET /api/agent/events`, `ask_wait`, the Claude Code plugin, `asks.py listen`), essentially all the time. With the default of 80 per instance, about 240 listening agents would take every slot and stall the apps; held polls use no CPU. One agent holds at most 4 polls per instance. The deploy workflow sets it on every rollout. Cost: while any agent listens, an instance stays alive (billed all the time with `--no-cpu-throttling`).
 - Agent webhooks and client metadata documents are accepted only on https port 443.
 
 If `gcloud builds submit` fails on permissions: the build service account (in new projects `<PROJECT_NUMBER>-compute@developer.gserviceaccount.com`) needs `roles/artifactregistry.writer` and `roles/logging.logWriter`.

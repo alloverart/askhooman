@@ -15,6 +15,7 @@ injected into the session through it. Stdlib only (Python 3.9+): nothing to inst
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -129,7 +130,9 @@ def poll(out: Output, base_url: str, key: str, sleep=time.sleep) -> None:
                                     "app and save it to ~/.config/askhooman/key, then restart Claude Code",
                          "meta": {"event": "error"}})
             return
-        except (OSError, ValueError) as exc:  # URLError, timeouts and resets are OSErrors; bad JSON is ValueError
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            # URLError, timeouts and resets are OSErrors; a body cut short (IncompleteRead) or a garbled status line
+            # are HTTPExceptions; bad JSON is a ValueError. All of them: back off and poll again from the cursor.
             delay = BACKOFF[min(failures, len(BACKOFF) - 1)]
             failures += 1
             log(f"{type(exc).__name__}: {exc}; retrying in {delay} s")
