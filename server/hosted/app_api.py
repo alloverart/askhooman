@@ -7,8 +7,9 @@
   DELETE /api/agents/{id}        revoke: every token and key of the agent stops working at once
   POST   /api/agents/keys        {name} -> 201 {agent, key}: an agent key (qtk_…), shown only in this response
   GET    /api/connect-info       the MCP URL and per-client setup snippets
-  POST   /api/events             {ask_id, kind: answered|closed|reopened} after the user acted in the app
-                                 -> the asking agent's webhook is called (webhooks.py)
+  POST   /api/events             {ask_id, kind: answered|closed|reopened} or {task_id, kind: replied} after the user
+                                 acted in the app -> an event in the owner agent's feed (feed.py) and a call to its
+                                 webhook (webhooks.py), unless its wake switch is off -> {queued, fed}
   POST   /api/drive/token        a Drive access token (drive.appdata) made with the Google grant the bridge holds for
                                  the user, so the web app keeps reading their Drive after its own token ran out
                                  (DriveTokens) -> {access_token, expires_in, scope}; 409 {detail, error} without a
@@ -35,7 +36,7 @@ from typing import Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel, ConfigDict, StrictBool, model_validator
 from starlette.datastructures import Headers, MutableHeaders
 
 from ..db import utc_now
@@ -44,10 +45,11 @@ from ..rules import Conflict, Invalid, NotFound
 from .accounts import Accounts, NameTaken, agent_json
 from .config import HostedSettings
 from .crypto import CryptoError
+from .feed import EventFeed
 from .google import DRIVE_SCOPE, GoogleError, GoogleOAuth
 from .looks import clean_avatar, clean_color
 from .ratelimit import RateLimiter
-from .records import DrivePool, HostedAsks
+from .records import DrivePool, HostedAsks, HostedTasks
 from .stats import admin_stats, internal_check
 from .webhooks import WebhookSender, check_webhook_url
 
@@ -265,9 +267,19 @@ class KeyIn(BaseModel):
 
 
 class EventIn(BaseModel):
+    """The user acted in the app: answered, closed or reopened an ask, or replied on a task (SPEC v5)."""
     model_config = ConfigDict(extra="forbid")
-    ask_id: int
-    kind: Literal["answered", "closed", "reopened"]
+    ask_id: int | None = None
+    task_id: int | None = None
+    kind: Literal["answered", "closed", "reopened", "replied"]
+
+    @model_validator(mode="after")
+    def one_record(self):
+        if (self.ask_id is None) == (self.task_id is None):
+            raise ValueError("send exactly one of ask_id and task_id")
+        if (self.kind == "replied") != (self.task_id is not None):
+            raise ValueError("replied is a task event; answered, closed and reopened are ask events")
+        return self
 
 
 def connect_info(settings: HostedSettings, drive_linked: bool) -> dict:
@@ -299,7 +311,8 @@ def connect_info(settings: HostedSettings, drive_linked: bool) -> dict:
 
 
 def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool: DrivePool,
-                webhooks: WebhookSender, limiter: RateLimiter, google: GoogleOAuth) -> None:
+                webhooks: WebhookSender, limiter: RateLimiter, google: GoogleOAuth,
+                feed: EventFeed | None = None) -> None:
     drive_tokens = DriveTokens(accounts, google, limiter, f"{settings.public_url}/oauth/link")
     app.state.drive_tokens = drive_tokens
 
@@ -393,28 +406,48 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
 
     @app.post("/api/events", status_code=202)
     def post_event(body: EventIn = Body(...), user: AppUser = Depends(app_user)):
-        ask = HostedAsks(pool.records(user.sub)).get(body.ask_id)
-        if ask["status"] != EVENT_STATUS[body.kind]:
-            raise Conflict(f"ask #{ask['id']} is {ask['status']} now, not {body.kind}")
-        events = [e for e in ask.pop("events") if e.get("kind") == body.kind]
-        event = {"id": events[-1].get("id"), "at": events[-1].get("at")} if events else None
-        payload = {"type": f"ask.{body.kind}", "ask": ask, "event": event, "sent_at": utc_now()}
-        if body.kind == "answered":
-            payload["answer"] = ask["answer"]
-        elif body.kind == "closed":
-            payload["resolution"] = ask["resolution"]
-        queued = 0
+        """Wake the owner agent (SPEC v5 "Waking the agent"): a slim event into its feed and, if it has one, a
+        call to its webhook. Nothing for an agent whose wake switch is off. -> {queued: webhook deliveries,
+        fed: feed events}."""
+        records = pool.records(user.sub)
+        if body.task_id is not None:
+            task = HostedTasks(records).get(body.task_id)
+            replies = [e for e in task.pop("events") if e.get("kind") == "replied"]
+            if not replies:
+                raise Conflict(f"task #{task['id']} has no reply")
+            last = replies[-1]
+            reply = last.get("payload") if isinstance(last.get("payload"), dict) else {}
+            payload = {"type": "task.replied", "task": task,
+                       "reply": {"text": reply.get("text"), "preset": reply.get("preset")},
+                       "event": {"id": last.get("id"), "at": last.get("at")}, "sent_at": utc_now()}
+            owner, record = task["agent"], {"task_id": task["id"]}
+        else:
+            ask = HostedAsks(records).get(body.ask_id)
+            if ask["status"] != EVENT_STATUS[body.kind]:
+                raise Conflict(f"ask #{ask['id']} is {ask['status']} now, not {body.kind}")
+            events = [e for e in ask.pop("events") if e.get("kind") == body.kind]
+            event = {"id": events[-1].get("id"), "at": events[-1].get("at")} if events else None
+            payload = {"type": f"ask.{body.kind}", "ask": ask, "event": event, "sent_at": utc_now()}
+            if body.kind == "answered":
+                payload["answer"] = ask["answer"]
+            elif body.kind == "closed":
+                payload["resolution"] = ask["resolution"]
+            owner, record = ask["agent"], {"ask_id": ask["id"]}
+        queued = fed = 0
         for agent in accounts.agents(user.sub):
-            if agent["slug"] != ask["agent"] or not agent.get("webhook_url"):
+            if agent["slug"] != owner or agent.get("wake") is False:
                 continue
-            secret = accounts.webhook_secret(agent)
+            if feed is not None:
+                feed.publish(agent["id"], {"type": payload["type"], **record, "event": payload["event"]})
+                fed += 1
+            secret = accounts.webhook_secret(agent) if agent.get("webhook_url") else None
             if not secret:
                 continue
             delivery = uuid.uuid4().hex
             webhooks.send(agent["webhook_url"], secret, payload["type"], delivery, {**payload, "delivery_id": delivery},
                           agent_id=agent["id"])
             queued += 1
-        return {"queued": queued}
+        return {"queued": queued, "fed": fed}
 
     @app.post(DRIVE_TOKEN_PATH)
     def drive_token(user: AppUser = Depends(app_user)):
