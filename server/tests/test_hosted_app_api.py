@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from server.hosted.webhooks import verify
 
-from .fake_drive import app_action
+from .fake_drive import app_action, app_task_reply
 from .fake_google import DRIVE_SCOPE, GRANT_SCOPES, WEB_CLIENT_ID
 from .hosted_support import (
     DENIS_EMAIL,
@@ -118,7 +118,7 @@ def test_events_call_the_agents_webhook_signed_and_retried(hosted, google):
     app_action(google.drive(DENIS_SUB), ask["id"], "answered", answer="Yes, ship")
     google.webhook_statuses.extend([500, 200])  # first delivery fails, the retry succeeds
     sent = hosted.post("/api/events", json={"ask_id": ask["id"], "kind": "answered"}, headers=id_token(google))
-    assert sent.status_code == 202 and sent.json() == {"queued": 1}
+    assert sent.status_code == 202 and sent.json() == {"queued": 1, "fed": 1}
     assert hosted.app.state.webhooks.flush(5)
     assert len(google.webhook_calls) == 2
     call = google.webhook_calls[-1]
@@ -443,3 +443,81 @@ def test_last_delivery_on_the_agent(hosted, google):
     assert hosted.app.state.webhooks.flush(5)
     last = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["last_delivery"]
     assert (last["ok"], last["status"], last["error"]) == (True, 200, None)
+
+
+
+# ---------- SPEC v5 step 2: events reach the agent's feed; task.replied ----------
+
+def agent_named(hosted, google, name: str) -> dict:
+    return next(a for a in hosted.get("/api/agents", headers=id_token(google)).json()["agents"] if a["name"] == name)
+
+
+def test_ask_event_goes_to_the_feed(hosted, google):
+    tokens = connect(hosted, google, register(hosted)["client_id"], agent="Allen")
+    agent = agent_named(hosted, google, "Allen")
+    ask = tool_result(mcp(hosted, tokens["access_token"], "ask_create", {"title": "Ship?"}))
+    app_action(google.drive(DENIS_SUB), ask["id"], "answered", answer="Yes")
+    sent = hosted.post("/api/events", json={"ask_id": ask["id"], "kind": "answered"}, headers=id_token(google))
+    assert sent.status_code == 202 and sent.json() == {"queued": 0, "fed": 1}
+    events = hosted.app.state.feed.read(agent["id"], "0")["events"]
+    assert len(events) == 1
+    event = events[0]
+    assert (event["id"], event["type"], event["ask_id"]) == (1, "ask.answered", ask["id"])
+    assert event["event"]["id"] == 2 and event["event"]["at"] and event["at"]
+    assert "answer" not in event and "ask" not in event  # slim: the agent reads asks_mine
+
+
+def test_task_reply_event_feed_and_webhook(hosted, google):
+    tokens = connect(hosted, google, register(hosted)["client_id"], agent="Allen")
+    agent = agent_named(hosted, google, "Allen")
+    secret = hosted.patch(f"/api/agents/{agent['id']}", json={"webhook_url": "https://hooks.example/t"},
+                          headers=id_token(google)).json()["webhook_secret"]
+    task = tool_result(mcp(hosted, tokens["access_token"], "task_create", {"title": "Get the fabric"}))
+    no_reply = hosted.post("/api/events", json={"task_id": task["id"], "kind": "replied"}, headers=id_token(google))
+    assert no_reply.status_code == 409
+    doc = app_task_reply(google.drive(DENIS_SUB), task["id"], "What's the status?", preset="status")
+    replied = doc["events"][-1]
+    sent = hosted.post("/api/events", json={"task_id": task["id"], "kind": "replied"}, headers=id_token(google))
+    assert sent.status_code == 202 and sent.json() == {"queued": 1, "fed": 1}
+    assert hosted.app.state.webhooks.flush(5)
+    call = google.webhook_calls[-1]
+    assert verify(secret, call.content, call.headers["askhooman-signature"])
+    body = json.loads(call.content)
+    assert body["type"] == "task.replied" and call.headers["askhooman-event"] == "task.replied"
+    assert body["task"]["id"] == task["id"] and "events" not in body["task"]
+    assert body["reply"] == {"text": "What's the status?", "preset": "status"}
+    assert body["event"] == {"id": replied["id"], "at": replied["at"]}
+    assert body["delivery_id"] == call.headers["askhooman-delivery"] and body["sent_at"]
+    fed = hosted.app.state.feed.read(agent["id"], "0")["events"]
+    assert [(e["type"], e["task_id"], e["event"]["id"]) for e in fed] == [("task.replied", task["id"], replied["id"])]
+    for wrong in ({"task_id": 999, "kind": "replied"},):
+        assert hosted.post("/api/events", json=wrong, headers=id_token(google)).status_code == 404
+    for bad in ({"ask_id": 1, "kind": "replied"}, {"task_id": task["id"], "kind": "answered"},
+                {"ask_id": 1, "task_id": task["id"], "kind": "replied"}, {"kind": "closed"}):
+        assert hosted.post("/api/events", json=bad, headers=id_token(google)).status_code == 422, bad
+
+
+def test_wake_off_means_no_feed_and_no_webhook(hosted, google):
+    tokens = connect(hosted, google, register(hosted)["client_id"], agent="Allen")
+    agent = agent_named(hosted, google, "Allen")
+    hosted.patch(f"/api/agents/{agent['id']}", json={"webhook_url": "https://hooks.example/w", "wake": False},
+                 headers=id_token(google))
+    ask = tool_result(mcp(hosted, tokens["access_token"], "ask_create", {"title": "Ship?"}))
+    app_action(google.drive(DENIS_SUB), ask["id"], "answered", answer="Yes")
+    calls = len(google.webhook_calls)
+    sent = hosted.post("/api/events", json={"ask_id": ask["id"], "kind": "answered"}, headers=id_token(google))
+    assert sent.json() == {"queued": 0, "fed": 0}
+    assert hosted.app.state.webhooks.flush(5) and len(google.webhook_calls) == calls
+    assert hosted.app.state.feed.read(agent["id"], "0")["events"] == []
+
+
+def test_event_wakes_only_the_owner(hosted, google):
+    client_id = register(hosted)["client_id"]
+    allen = connect(hosted, google, client_id, agent="Allen")
+    connect(hosted, google, register(hosted)["client_id"], agent="Ogilvy")
+    ask = tool_result(mcp(hosted, allen["access_token"], "ask_create", {"title": "Ship?"}))
+    app_action(google.drive(DENIS_SUB), ask["id"], "closed", resolution="done")
+    hosted.post("/api/events", json={"ask_id": ask["id"], "kind": "closed"}, headers=id_token(google))
+    feed = hosted.app.state.feed
+    assert [e["type"] for e in feed.read(agent_named(hosted, google, "Allen")["id"], "0")["events"]] == ["ask.closed"]
+    assert feed.read(agent_named(hosted, google, "Ogilvy")["id"], "0")["events"] == []

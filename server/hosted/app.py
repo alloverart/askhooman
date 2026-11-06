@@ -215,7 +215,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         return {"ok": True}
 
     add_api_routes(app, services)
-    add_app_api(app, settings, accounts, pool, webhooks, limiter, google)
+    add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed)
     app.router.routes.extend(auth_server.routes())
     app.router.routes.extend(site.routes(settings))
     app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, settings.trust_forwarded),
