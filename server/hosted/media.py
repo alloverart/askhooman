@@ -231,6 +231,8 @@ def check_video(raw: bytes) -> Checked:
     if info is None:
         raise Invalid("the MP4 can't be read: no movie header or video track, or its boxes are damaged")
     width, height, duration_ms = info
+    if duration_ms == 0:  # fragmented MP4s leave it to the fragments, so the 180 s cap couldn't hold
+        raise Invalid("the video's duration is missing: export a regular (not fragmented) MP4")
     if duration_ms > VIDEO_MAX_MS:
         raise Invalid(f"the video must be at most {VIDEO_MAX_MS // 1000} s long (it is {duration_ms / 1000:g} s)")
     _check_sides("video", width, height)
@@ -275,7 +277,10 @@ def ext_of(mime: str) -> str:
 def clean_link_url(url: str, what: str) -> str:
     """A link card's url or an attachment's source_url, which the apps open: safe_http.check_url's rules (https on
     port 443, at most 2000 chars, a public DNS name, no user info), never an IP address even a public one, and no
-    character that URL parsers read differently. Returns it stripped."""
+    character that URL parsers read differently. Returns it stripped.
+
+    The IP check runs on the host as browsers resolve it, after IDNA mapping: full-width digits and the dots
+    。．｡ become ASCII, so "１９２.１６８.１.１" is 192.168.1.1; a real IDN host (пример.рф) stays a name."""
     if not isinstance(url, str):
         raise Invalid(f"{what} must be a string")
     url = url.strip()
@@ -285,7 +290,11 @@ def clean_link_url(url: str, what: str) -> str:
         host = check_url(url, what)
     except UnsafeURL as exc:
         raise Invalid(str(exc)) from None
-    if ":" in host or _NUMERIC_LABEL.fullmatch(host.rstrip(".").rsplit(".", 1)[-1]):
+    try:
+        ascii_host = host.encode("idna").decode("ascii").lower()
+    except UnicodeError:  # an empty label, a label over 63 chars, a character IDNA prohibits
+        raise Invalid(f"{what} must have a valid host name") from None
+    if ":" in ascii_host or _NUMERIC_LABEL.fullmatch(ascii_host.rstrip(".").rsplit(".", 1)[-1]):
         raise Invalid(f"{what} must name a host, not an IP address")
     return url
 

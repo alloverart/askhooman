@@ -139,6 +139,7 @@ def _refusals():
     cases = [
         ("no moov", ftyp + mdat, "movie"),
         ("181 s", mp4(640, 360, 181), "180 s"),
+        ("duration 0, as fragmented MP4s write it", mp4(640, 360, 0), "duration is missing"),
         ("QuickTime", mp4(640, 360, 12, brand=b"qt  "), "remux it to MP4"),
         ("size 0 in the middle", ftyp + size_0 + moov + mdat, "movie"),
         ("size 0 inside moov", ftyp + box(b"moov", mvhd + audio + video + size_0) + mdat, "movie"),
@@ -233,6 +234,12 @@ def test_link_urls():
                        ("https://1.2.3.4/x", "IP address"), ("https://8.8.8.8/x", "IP address"),
                        ("https://[2001:4860:4860::8888]/x", "IP address"), ("https://1.2.3.4./x", "IP address"),
                        ("https://0x7f.1/x", "IP address"), ("https://127.0.0.1/x", "non-public"),
+                       # what browsers read as an IPv4 address after IDNA mapping: full-width digits and dots
+                       ("https://１９２.１６８.１.１/x", "IP address"), ("https://192.168.1.1\u3002/x", "IP address"),
+                       ("https://192.168.1\uff0e1/x", "IP address"),
+                       ("https://192\uff0e168\uff0e1\uff0e1/x", "public host name"),  # no ASCII dot: check_url
+                       ("https://192.168.1.1\uff61/x", "IP address"), ("https://０Ｘ７Ｆ.１/x", "IP address"),
+                       ("https://a..b.com/", "valid host name"), ("https://" + "a" * 64 + ".com/", "valid host name"),
                        ("https://u:p@h.com", "user name"), ("https://u@h.com", "user name"),
                        (too_long, "2000"), ("https://localhost/", "public host"),
                        ("https://intranet/", "public host"), ("https://example.com:8443/", "443"),
