@@ -284,9 +284,9 @@ The operator of a hosted bridge sees who signed up and who uses it, and gets a p
 - **Later:** activity per day (calls, asks and tasks created). That needs new counters and a line in the privacy
   policy.
 
-## Replies, wake-up, agent self-service and images (v5, draft 02.11.2026)
+## Replies, wake-up, agent self-service, pictures and voice (v5, draft 02.11.2026)
 
-Goal: the user can talk back on tasks; whatever the user does reaches the agent as soon as the agent's environment allows, and the user controls that; agents name and wire themselves; a question can show pictures. The contract stays **MCP + Google only**: no messenger (Telegram, Slack) is part of it, because users' agents may live in Claude on the web, Codex desktop or anywhere else. Ships in four steps, each on its own (see the end).
+Goal: the user can talk back on tasks; whatever the user does reaches the agent as soon as the agent's environment allows, and the user controls that; agents name and wire themselves; a question can show pictures and video; the user can answer by voice. The contract stays **MCP + Google only**: no messenger (Telegram, Slack) is part of it, because users' agents may live in Claude on the web, Codex desktop or anywhere else. Ships in five steps, each on its own (see the end).
 
 ### 1. Replies on tasks
 
@@ -371,13 +371,261 @@ needs a public URL. Webhooks stay for agents that do have a server.
 
 - MCP `set_my_name(name)` (hosted): the calling agent's display name, 1–40 chars, the app's rename rules; the slug (the `agent` field on asks and tasks) never changes. Returns `{name, slug}`. 10 per hour per agent. Server instructions: "If your name in AskHooman is your client's (e.g. 'Claude Code', 'Claude'), call set_my_name once with your own name." The consent page keeps prefilling the client's name: the authorization request carries no agent name, so the agent fixes it after connecting.
 
-### 4. Images in asks
+### 4. Pictures and video in asks
 
-- The owner attaches images to an open ask: MCP `ask_attach(id, image_url=None, data=None, caption="")` with exactly one of `image_url` (https, public host, fetched once like `set_my_look`'s image: no redirects, identity encoding, 15 s, ≤ 5 MB) or `data` (`data:image/png|jpeg|webp|gif;base64,…`, ≤ 5 MB decoded). Format and size are read from the bytes and must match; ≤ 4096 px per side; ≤ 6 attachments per ask. `ask_create` also takes `attachments: [{image_url | data, caption}]`, so a question with pictures is one call. `ask_detach(id, attachment_id)` removes one from the ask (the file stays in Drive).
-- Stored in the **user's Drive appDataFolder** as `media-<ask id>-<n>.<ext>` (appProperties `ask_id`, `kind: "media"`); the ask gets `attachments: [{id, kind: "image", mime, width, height, bytes, caption, file_id}]` and an `attached` / `detached` event. Nothing leaves the user's Google account; the apps download the files with the user's Drive token and cache them per device.
-- Apps: thumbnails under the context (tap → full size, captions under them). Video is not stored: an agent attaches a still and puts the video in `links`.
-- Hosted only; the single-tenant bridge returns `attachments: []`. Media files are never deleted automatically (Drive → Manage apps → Delete hidden app data removes everything).
+Refined 11.11.2026 (Denis, TG 16914 and ask #1166: an agent shows pictures, even videos, for example files on its
+Google Drive, right in the question; the user opens them bigger and chooses; the options stay text). Not built yet.
+Hosted only: the single-tenant bridge returns `attachments: []` and has no attachment tools.
+
+AskHooman keeps asking Google for `drive.appdata` only, so neither the bridge nor the apps can read files in anyone's
+Drive. What the user sees inside the app is stored in the user's own appDataFolder, next to the ask. A private file
+reaches the app only if the agent, which can read it, sends its bytes; otherwise it is a link card that opens in
+Google Drive, where the user is signed in. The bridge never fetches a Drive link and never unfurls a page.
+
+- **Kinds.** `image` (stored: PNG, JPEG, WebP), `video` (stored: MP4) and `link` (a card: nothing is fetched or stored
+  but an optional poster). The ask object gets `attachments` (array, never null; `[]` on older asks), in the order
+  they were added:
+  - image: `{id, kind: "image", mime, width, height, bytes, caption, source_url, file_id, added_at}`
+  - video: `{id, kind: "video", mime: "video/mp4", width, height, duration_ms, bytes, caption, source_url, file_id,
+    poster, added_at}`
+  - link: `{id, kind: "link", url, title, provider, caption, poster, added_at}`; `provider` comes from the host:
+    `drive` (drive.google.com), `docs` / `sheets` / `slides` (docs.google.com, by path), `youtube` (youtube.com,
+    youtu.be), `figma` (figma.com), else `web`
+  - `poster`: `null` or `{file_id, mime, width, height, bytes}`, a still shown for a video or a link
+  - `id`: 1, 2, 3… per ask, never reused. `caption` (≤ 300 chars) and `source_url` (where the original lives, e.g.
+    its Drive link; the apps show "Open original") are optional, `null` when empty, cleaned like every text field.
+- **Checks**, by the bytes, never by a file name or the sender's word (the agent look's header readers are reused):
+  - image: PNG, JPEG or WebP read from its own header, ≤ 5 MB, ≤ 4096 px per side. SVG, GIF, HEIC, AVIF and anything
+    else → 422 / tool error with a hint: "convert to PNG, JPEG or WebP; send motion as MP4".
+  - video: MP4 only: an ISO BMFF file whose `ftyp` brand is `isom`, `iso2`–`iso6`, `mp41`, `mp42`, `avc1` or `M4V `.
+    The top-level boxes are walked (32- and 64-bit sizes, at most 10 000 boxes, nesting ≤ 6) to find `moov` wherever
+    it is; `mvhd` gives the duration (≤ 180 s), the first video track's `tkhd` the size (≤ 4096 px per side);
+    ≤ 20 MB. QuickTime `.mov` is refused (remux it to MP4). Codecs are not checked: H.264 + AAC plays in every app;
+    HEVC may not play in Chrome on Android or Windows, and the apps then offer a download.
+  - poster: an image under the image rules, ≤ 1 MB.
+  - link `url` and `source_url`: `https`, default port, ≤ 2000 chars, a DNS host with a dot (no IP literal, no
+    `localhost`), no user info. A link's `title` is 1–200 chars (default: the host).
+  - per ask: ≤ 6 attachments (posters don't count) and ≤ 40 MB stored in all. A bigger video goes as a Drive link
+    with a poster.
+- **How the bytes get in.** A model can't stream a file through its own output, so there are three ways:
+  - `url`: fetched once by the bridge like a client metadata document or `set_my_look`'s image (`safe_http`): https
+    on port 443, every resolved address public, no redirects, `Accept-Encoding: identity`, compressed bodies refused,
+    5 s per socket operation and 30 s for the whole fetch, read raw up to the cap. The `Content-Type` must be an
+    allowed type and match the bytes. A `url` on `drive.google.com` or `docs.google.com` is refused before any
+    connection: "AskHooman can't open files in Google Drive: download it and use ask_upload, or attach the link with
+    link=true".
+  - `data`: `data:image/png|jpeg|webp;base64,…`, ≤ 180 KB decoded (the request stays under the 256 KB body cap), for
+    scripts and SDK clients that build the image themselves.
+  - **upload**, for a file on the agent's disk: `ask_upload` returns a one-time upload and the agent's shell sends
+    the file with `curl`: `PUT /api/uploads` with `Authorization: Bearer qtu_<43 chars>` (in a header, not the URL,
+    so request logs never keep it) and the declared `Content-Type`. The body must be exactly the declared `bytes`
+    (more → 413 without reading on, less → 422). An upload token is bound to the user, the agent, the ask, the type,
+    the size, `caption`, `source_url` and `poster_for`; single use; 15 minutes; stored as SHA-256 in
+    `uploads/{digest}` (deleted with the account). `qtu_` bearers work on this route only, and only they do. → 201
+    `{ask_id, attachment}`; the ask must still be open (409 otherwise).
+  - Every way ends the same: the checks above, the file written to Drive, then the ask with an `attached` event.
+- **MCP** (hosted; the owner agent, open asks only, like `ask_update`: otherwise 409; another agent or the user's
+  token 403):
+  - `ask_create(…, attachments=[])`: items `{url, link?, title?, caption?, source_url?}` or `{data, caption?,
+    source_url?}` (an upload needs the ask id, so it comes after). Items are fetched one after another and all are
+    checked before anything is written; a bad item fails the call (`attachments[2]: …`) and nothing is created. The
+    fetches give up after 60 s in all.
+  - `ask_attach(id, url="", data="", link=False, title="", caption="", source_url="", poster_for=0)` → ask. Exactly
+    one of `url` / `data`. `link=True`: a link card for `url`, never fetched. `poster_for=<attachment id>`: the image
+    becomes that video's or link's poster (replacing an earlier one) instead of a new item.
+  - `ask_upload(id, mime, bytes, caption="", source_url="", poster_for=0)` → `{upload: {url, method: "PUT", headers,
+    expires_at}, curl}`; `curl` is the ready command, with `@FILE` for the agent to replace:
+    `curl -sS --fail-with-body -X PUT -H 'Authorization: Bearer qtu_…' -H 'Content-Type: image/png' --data-binary
+    @FILE https://askhooman.com/api/uploads`.
+  - `ask_detach(id, attachment_id)` → ask: the item and its files (the poster too) are deleted from Drive; event
+    `detached`.
+  - `asks_mine`, `ask_get`, `asks_list` return `attachments` as metadata: never bytes, never links to the bytes.
+  - Docstrings teach: "Show, don't describe: attach the picture or clip your user decides on. The apps number
+    attachments 1, 2, 3 in order, so options can say 'Take #2'. A file on Google Drive your user can open: link=true
+    with a poster. A file you can read and they can't: upload its bytes and set source_url to the original. Prefer
+    ask_create(attachments=…), so the question appears with its pictures."
+- **REST** (agents' tokens, hosted): `POST /api/asks` takes `attachments` as above; `POST /api/asks/{id}/attachments
+  {url | data, link?, title?, caption?, source_url?, poster_for?}` → 201 + ask; `POST /api/asks/{id}/uploads {mime,
+  bytes, caption?, source_url?, poster_for?}` → 201 `{upload, curl}`; `PUT /api/uploads` (upload token) → 201;
+  `DELETE /api/asks/{id}/attachments/{n}` → ask. The 256 KB body cap stays everywhere except `PUT /api/uploads`
+  (capped at the declared size). CLI: `askhooman attach ID FILE [--caption C] [--source URL]` (an upload),
+  `askhooman attach ID --url URL [--link] [--title T] [--caption C]`, `askhooman detach ID N`.
+- **Limits** (per instance, like the others): 60 attachment calls (attach, upload, detach, each item of a create) per
+  hour per agent; at most 4 fetches or uploads in flight (more → tool error `busy, try again in a few seconds`, REST
+  503 with `Retry-After: 5`), so a 512 MB instance holds at most 80 MB of media at once.
+- **Storage:** the user's appDataFolder, written by the bridge with the user's grant before the ask file:
+  `media-<ask id>-<n>.<png|jpg|webp|mp4>`, a poster `media-<ask id>-<n>-poster.<ext>`; appProperties `ask_id`,
+  `kind: "media"`, `attachment` (= `n`). Multipart upload up to 5 MB, resumable above. If the ask write then fails,
+  the bridge deletes the files it has just written (best effort). Ask listings (`name contains 'ask-'`) never see
+  them. Events `attached` / `detached`, payload `{attachment}`, actor = the owner agent; the apps skip event kinds
+  they don't know. The apps never write `attachments` and keep them on their own writes (unknown fields survive).
+  Media files are deleted only by `ask_detach` and by Drive → Manage apps → Delete hidden app data; Delete Account
+  leaves them, as it leaves the asks.
+- **Apps** (the web app, which is also the Android app; iOS; macOS):
+  - List: a paperclip with the count on the row. The list downloads nothing.
+  - Detail: under the context, a row of tiles in order, each numbered 1, 2, 3 in a corner. Image → its thumbnail;
+    video → its poster (or a plain tile) with ▶ and the duration; link → a card with the provider's icon, the title,
+    the host and the poster. Captions under the tiles, two lines.
+  - Tap an image or a video → a full-screen viewer: swipe between items, pinch or scroll to zoom, video in the system
+    player (AVKit `VideoPlayer`; `<video controls playsinline>`), the caption and "Open original" (`source_url`)
+    below, and the ask's option buttons at the bottom, so the user chooses without leaving the picture. Esc or a
+    swipe down closes it.
+  - Tap a link card → it opens outside the app: `openURL` on iOS and macOS (Drive and Docs open in the Google Drive
+    app or the browser, where the user is signed in), `<a target="_blank" rel="noopener noreferrer">` on the web, and
+    Chrome or the Drive app from the Android app. The card always shows the host, and the app checks again that the
+    URL is https before opening it.
+  - Files come from Drive (`files.get?alt=media`) with the user's Drive token, like the asks (the web and Android get
+    it through `POST /api/drive/token`). Before downloading, the app reads the file's metadata: `size` within the
+    caps and appProperties `ask_id` = this ask. Media never change, so they are cached by file id: on Apple an
+    on-disk LRU of 200 MB in Caches, on the web Cache Storage with an LRU of 100 MB. Images are decoded at the size
+    shown (ImageIO thumbnails on Apple; `<img decoding="async">` from a blob URL on the web, revoked on leaving). A
+    video is downloaded whole (≤ 20 MB, with progress) and played from the local file or blob; if the player fails:
+    "Can't play this video here" + Download.
+  - Unknown kinds are skipped; nothing from an attachment is ever inserted as HTML. The web app sets no CSP today; if
+    it gets one, it needs `img-src blob:` and `media-src blob:`.
+- **Tests.** Server (fake Drive, fake fetch): each image type by its bytes, a declared type that doesn't match the
+  bytes, 5 MB + 1, 4097 px, truncated headers, SVG / GIF / HEIC refused; MP4 with `moov` first and last, 64-bit box
+  sizes, no `moov`, 181 s, a `.mov` brand, box loops and absurd sizes; fetch refusals (private and mixed DNS answers,
+  a redirect, gzip, a slow drip past 30 s, an oversize body, Drive hosts refused before any connection); link URLs
+  (`http:`, `javascript:`, an IP literal, user info, 2001 chars); a 7th attachment and 40 MB per ask; upload tokens
+  (single use, expiry, wrong size, wrong type, another ask, a closed ask, refused on every other route); a create
+  with one bad item writes nothing and leaves no media; detach deletes the files; owner only, open only, the user's
+  token 403; `attachments: []` single-tenant; the rate limit and the busy cap. Apps: decoding every kind and an
+  unknown one, the numbering, the viewer's options answer the ask, link opening re-checks https, the metadata check
+  before a download, cache eviction, the video fallback; one manual pass on an iPhone, a Mac, Chrome and the Android
+  app with a 20 MB MP4, a Drive link with a poster and a 4096 px PNG.
+
+### 5. Voice answers
+
+Added 11.11.2026 (Denis, TG 16914 and ask #1166: he answers agents by voice in Telegram and wants the same in
+AskHooman; transcription is the connected agent's job for now, but do better where we can). The approach below (a mic
+button, recognition on the device, the recording sent along) is the one he approved. Not built yet. Hosted only.
+
+The user records the answer in the app. Where the device can turn speech into text **on the device**, the text fills
+the answer box and the user checks it before sending. The recording goes with the answer, so the agent can listen
+again or transcribe it itself. Audio leaves the device only to the user's own Drive, and from there to the user's own
+agent.
+
+- **Recording** (every app): a mic button next to Send in the answer box. Tap to start, Stop to end (no hold-to-talk:
+  answers run to minutes). While recording: a timer, a level meter, the language chip (below), Cancel (discards) and
+  Stop. With a recognizer the words appear in the box as they are heard (unsettled words grey). After Stop the box
+  holds the text, editable, with a voice chip above it, "▶ 0:42 · RU · ×" (play back, remove). Recording again
+  replaces the recording: one per answer. Option buttons work as now (the option, then the text on the next line).
+  Send sends the text and the recording. An answered ask keeps the chip under the answer, playing from Drive, until
+  the recording is deleted.
+  - Recording stops by itself at 5:00 (a warning at 4:30), on an audio interruption (a call), and when the app goes
+    to the background or the screen locks; what was recorded is kept. Under 1 s is discarded.
+  - With no text at all (no recognizer, nothing typed, no option) the answer text is `Voice answer (0:42), not
+    transcribed`, so an answer is never empty and old apps, webhooks and Telegram pings show something true.
+  - First use, once per device: "Your agent gets the recording too, so it can listen again or transcribe it. Speech
+    is turned into text on this device." (or "This device can't turn speech into text; your agent will.")
+  - Permissions: iOS and macOS `NSMicrophoneUsageDescription` ("AskHooman records your voice answer to an agent's
+    question.") and `NSSpeechRecognitionUsageDescription` ("Your voice answer is turned into text on this
+    device."), plus the macOS sandbox entitlement `com.apple.security.device.audio-input`. Web: `_headers` gets
+    `Permissions-Policy: camera=(), microphone=(self), geolocation=()` (today's `microphone=()` blocks it). The
+    Android app needs no change: Chrome asks for app.askhooman.com. Refused → the mic button says where to allow it,
+    and typing works as before.
+- **Speech to text, on the device only.** Never a cloud recognizer: Apple's server mode, Chrome's default Google
+  service and Safari's `webkitSpeechRecognition` all send the audio away.
+
+  | where | recognizer | Russian | otherwise |
+  |---|---|---|---|
+  | iOS 26+, macOS 26+ | `SpeechAnalyzer` + `SpeechTranscriber`; the model is installed once through `AssetInventory`, with progress | yes: `ru_RU` is one of its locales | record only |
+  | iOS 17–18, macOS 14–15 | `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true`, only when `supportsOnDeviceRecognition` is true for the locale | as the OS reports | record only |
+  | web on Chrome or Edge 139+, desktop | Web Speech API with `processLocally = true`, fed the recorder's own mic track (`start(track)`); the language pack through `SpeechRecognition.install()` after the user taps Download | when `available()` says so for `ru-RU` | record only |
+  | Safari and Firefox on the web; the Android app (Chrome on Android has neither `processLocally` nor `start(track)`) | none | – | record only |
+
+  Record only = the recording goes to the agent with whatever the user typed; the keyboard's own dictation (iOS,
+  Gboard) still works in the box. Language: a recognizer takes one language per recording, so the chip cycles
+  through the device's preferred languages that the recognizer supports (at most 3), remembered per device.
+- **Audio.** Apple: AAC-LC, mono, 24 kHz, 32 kbit/s, in M4A (`audio/mp4`). Web: `MediaRecorder` with the first
+  supported of `audio/webm;codecs=opus` (Chrome, Edge, Firefox, Android) and `audio/mp4` (Safari),
+  `audioBitsPerSecond: 32000`. Allowed types `audio/mp4` and `audio/webm`; 1 s to 5 min; ≤ 5 MB (5 minutes are about
+  1.2 MB). Until it is sent or discarded the recording stays in the Apple app's temporary directory, or in memory on
+  the web.
+- **Sending** (by the app, like answers today): 1) upload the recording to appDataFolder as
+  `voice-<ask id>-<unix ms>.<m4a|webm>`, appProperties `ask_id`, `kind: "voice"`; 2) write the ask (answer,
+  `answer_voice` and the `answered` event) in one PATCH, as now; 3) `POST /api/events {ask_id, kind: "answered"}`.
+  If 2 fails (409, network), the app deletes the file it uploaded (best effort) and the draft (text and recording)
+  stays on screen to send again.
+- **Data model:** the ask gets `answer_voice`: `null` or
+
+  | field | notes |
+  |---|---|
+  | file_id | the recording's Drive file id; `null` once it is deleted |
+  | mime | `audio/mp4` or `audio/webm` |
+  | bytes | ≤ 5 MB |
+  | duration_ms | 1000–300000 |
+  | lang | BCP-47 (`ru-RU`), ≤ 35 chars: the recognizer's language, or the chip's when none ran |
+  | transcript_source | `on_device` (the device's recognizer made the text, then the user checked it) or `none` |
+  | transcript | what the recognizer heard, before the user's edits; ≤ 4000, cleaned like every text field; `null` with `none` |
+  | answered_at | equals the ask's `answered_at`: the answer it belongs to |
+  | deleted_at | `null`, or when the recording was deleted |
+
+  - Only the user writes it, in the same write as the answer; no MCP or REST parameter sets it. The bridge checks it
+    on every read (shape, types, caps). A bad or stale one (its `answered_at` isn't the ask's: an older app
+    re-answered or reopened and kept it as an unknown field) counts as `null` and is dropped on the bridge's next
+    write of that ask.
+  - Re-answering with the same text and no new recording stays a no-op; a new recording is a change. The `answered`
+    event payload adds `voice` and `previous_voice`; the `reopened` payload adds `answer_voice`.
+  - Reopen (by anyone) clears it. Close (by anyone) keeps it with `file_id: null` and `deleted_at`, and deletes the
+    recording. Whoever makes the transition deletes the file: the app for the user, the bridge for an agent's
+    `ask_close` / `ask_reopen` (best effort; a failure is logged and left to the sweep).
+  - Sweep: at most once a day each app lists the `voice-` files and deletes those older than 30 days, those whose
+    ask is closed and those their ask doesn't point to. So a recording lives until the ask is closed, 30 days at most.
+  - The single-tenant bridge: always `null`.
+- **What the agent gets.** For the **owner agent** only (`asks_mine`, `ask_get`, its REST, the `ask.answered` webhook
+  body), `answer_voice` adds `url` and `url_expires_at`: `<ASKS_PUBLIC_URL>/media/v1/<token>`, where the token is
+  `{user, agent, ask_id, file_id, exp}` sealed with the bridge's key (`ASKS_ENCRYPTION_KEY`, AES-GCM, context
+  `media`), so it reveals nothing; valid 1 h; a new one on every read. Other agents (`asks_list`) get `url: null`, and
+  so does everyone once the recording is deleted. `ask_wait`, the feed events and `POST /api/events` don't change: an
+  event wakes the agent, `asks_mine` says what happened.
+  - `GET /media/v1/<token>`: no Authorization, no CORS. The bridge opens the token, checks `exp`, that the agent
+    isn't revoked and that the ask's current `answer_voice.file_id` is that file, then streams the file from Drive
+    with the user's grant: `Content-Type` from the allowlist (never Drive's), `Content-Length`,
+    `Content-Disposition: attachment; filename="ask-<id>-voice.<ext>"`, `Cache-Control: private, no-store`,
+    `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`. A bad, expired or foreign token → 404 (one
+    message for all); a deleted recording → 410; Drive unreachable → 503. 60 per minute per user. Cloud Run's request
+    log keeps the path; the token in it is dead within the hour.
+  - `asks_mine` docstring: "answer_voice set: your user answered by voice. With transcript_source on_device, answer
+    is their checked text. With none, answer is what they typed or the placeholder 'Voice answer (m:ss), not
+    transcribed': download answer_voice.url (valid 1 h; read the ask again for a new one) and transcribe it, or ask
+    them. The recording is deleted when you close the ask."
+- **Privacy.** A voice recording is personal data. It is stored only in the user's Drive and kept until the ask is
+  closed, 30 days at most; the bridge passes it to the owner agent on request and stores or logs nothing of it (no
+  transcripts in logs either). Recognition runs on the device: no audio goes to Apple's or Google's speech services.
+  What the agent's side does with the recording (a transcription API, for example) is up to the agent, and the
+  first-use note says so. Before the apps ship it: the privacy policy (`server/hosted/site.py`) adds pictures,
+  videos and voice recordings to "What is stored in your Google Drive" (with the retention), and the fetching and
+  passing-through to "What our server stores"; the App Store privacy label adds Audio Data (App Functionality,
+  linked to the user), and Google Play's Data safety form adds Voice or sound recordings.
+- **Tests.** Server: `answer_voice` validation (each field, the caps, an unknown `transcript_source`), a stale
+  `answered_at` ignored and dropped, reopen clears it, close sets `file_id: null` + `deleted_at`, no agent tool or
+  REST body can set it, the no-op rule; the bridge deletes the file on an agent's close or reopen (fake Drive); the
+  media route (tampered, expired, another user's, not the current file, a revoked agent → 404; deleted → 410; the
+  exact headers; `Content-Type` from the allowlist even when Drive says `text/html`; 429); only the owner gets `url`;
+  the webhook body carries it. Apps: the recognizer choice per platform behind a fake (on device, record only),
+  auto-stop at 5:00, an interruption keeps the recording, the placeholder text, the send order and the rollback on
+  409, the sweep's three rules, the Info.plist keys and the entitlement present, `_headers` allows the microphone.
+  Manual: an iPhone on iOS 26 in Russian and English, a Mac, Chrome on a desktop with the Russian pack, the Android
+  app (record only), one 5-minute recording.
+- **Not in v5:** transcription on the server (the voice would go to our server or a third party: a privacy policy
+  change and a cost), cloud recognizers, voice replies on tasks, attachments on tasks.
 
 ### Order
 
-1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the agent's event feed + `ask_wait`, the Claude Code channel plugin, `askhooman listen`, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery` / `last_seen`, the Wake-up row in the apps. 3. `set_my_name`. 4. Images. Each step ships on its own; existing tools and file formats keep working throughout.
+1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the agent's event feed + `ask_wait`, the Claude Code channel plugin, `askhooman listen`, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery` / `last_seen`, the Wake-up row in the apps. 3. `set_my_name`. 4. Pictures and video: the server (media files, `ask_attach` / `ask_upload` / `ask_detach`, `attachments` on create, REST, CLI, docstrings), then the web app (which is the Android app too), then iOS and macOS. 5. Voice answers, after pictures: the server (`answer_voice` rules, the media route, docstrings) and the privacy policy first, then the web app, then iOS and macOS, with the store privacy labels in the same release. Each step ships on its own; existing tools and file formats keep working throughout.
+
+### Open questions (Denis)
+
+1. Android and Safari have no on-device recognizer, so there the app records only (the keyboard's dictation still
+   types text). Should they use the browser's cloud recognizer after a one-time notice ("your recording goes to
+   Google / Apple to be turned into text")? The spec says no.
+2. Voice recordings are deleted when the ask is closed, 30 days at most. Keep them longer, so the user can play back
+   an old answer?
+3. Pictures and videos stay in the user's Drive until the agent detaches them or the user deletes the app data.
+   Delete them automatically some days after the ask is closed?
+4. A stored video is at most 20 MB and 3 minutes; anything bigger is a Drive link with a poster. Enough for the
+   marketing agents' clips?
+5. Transcription on our server (e.g. Whisper) as a later opt-in, for record-only devices: worth the privacy policy
+   change and the cost?
