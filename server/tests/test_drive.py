@@ -6,12 +6,13 @@ import logging
 import sqlite3
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from server.app import create_app
 from server.config import Settings
-from server.drive import DriveClient, DriveError
+from server.drive import FILE_FIELDS, MULTIPART_MAX, DriveClient, DriveError, parse_name
 from server.notify import answer_text, close_text, reopen_text
 
 from .conftest import ALLEN, DENIS, auth
@@ -434,6 +435,148 @@ def test_client_file_formats(tmp_dir, fake, drive_files):
     broken.write_text(json.dumps({"installed": {"client_id": CLIENT_ID}}))
     assert "client_secret" in make_client(fake, broken, drive_files[1]).config_problem()
     assert "ASKS_DRIVE_CLIENT is not set" in make_client(fake, None, drive_files[1]).config_problem()
+
+
+# ---------- media files (SPEC v5 step 4 "Storage"): pictures and video next to the asks ----------
+
+MEDIA_PROPS = {"ask_id": "1", "kind": "media", "attachment": "1"}
+
+
+def media_bytes(size: int, head: bytes = b"\x89PNG\r\n\x1a\n") -> bytes:
+    """`size` bytes holding every byte value, CR LF and something like a boundary, so a body cut on them breaks."""
+    pattern = bytes(range(256)) + b"\r\n--askhooman-0\r\n--\r\n"
+    return (head + pattern * (size // len(pattern) + 1))[:size]
+
+
+def props(n: int) -> dict:
+    return {**MEDIA_PROPS, "attachment": str(n)}
+
+
+def test_upload_media_multipart(fake, drive_client):
+    raw = media_bytes(4 * 1024 * 1024)
+    meta = drive_client.upload_media("media-1-1.png", raw, "image/png", props(1))
+    file = fake.file("media-1-1.png")
+    assert meta == {"id": file["id"], "name": "media-1-1.png", "appProperties": MEDIA_PROPS,
+                    "modifiedTime": file["modifiedTime"]}
+    assert file["content"] == raw and file["mimeType"] == "image/png" and file["parents"] == ["appDataFolder"]
+    assert file["appProperties"] == MEDIA_PROPS
+    assert [(path, q["uploadType"], q["fields"]) for _, path, q in fake.calls("POST", "/upload/")] == \
+        [("/upload/drive/v3/files", "multipart", FILE_FIELDS)]
+    exactly = media_bytes(MULTIPART_MAX)  # Drive's multipart limit, 5 MB, is inclusive
+    drive_client.upload_media("media-1-2.webp", exactly, "image/webp", props(2))
+    assert fake.file("media-1-2.webp")["content"] == exactly and fake.file("media-1-2.webp")["mimeType"] == "image/webp"
+    assert [q["uploadType"] for _, _, q in fake.calls("POST", "/upload/")] == ["multipart", "multipart"]
+    assert fake.calls("PUT") == []
+
+
+def test_upload_media_resumable(fake, drive_client):
+    raw = media_bytes(6 * 1024 * 1024, head=b"\x00\x00\x00\x18ftypisom")
+    meta = drive_client.upload_media("media-1-1.mp4", raw, "video/mp4", props(1))
+    file = fake.file("media-1-1.mp4")
+    assert meta == {"id": file["id"], "name": "media-1-1.mp4", "appProperties": MEDIA_PROPS,
+                    "modifiedTime": file["modifiedTime"]}
+    assert file["content"] == raw and file["mimeType"] == "video/mp4" and file["parents"] == ["appDataFolder"]
+    assert file["appProperties"] == MEDIA_PROPS
+    posts, puts = fake.calls("POST", "/upload/"), fake.calls("PUT")
+    assert [(path, q["uploadType"], q["fields"]) for _, path, q in posts] == \
+        [("/upload/drive/v3/files", "resumable", FILE_FIELDS)]
+    assert len(puts) == 1 and puts[0][1] == "/upload/drive/v3/files" and puts[0][2]["upload_id"]
+    assert fake.sessions == {}
+    just_over = raw[:MULTIPART_MAX + 1]
+    drive_client.upload_media("media-1-2.mp4", just_over, "video/mp4", props(2))
+    assert fake.file("media-1-2.mp4")["content"] == just_over
+    assert [q["uploadType"] for _, _, q in fake.calls("POST", "/upload/")] == ["resumable", "resumable"]
+    assert len(fake.calls("PUT")) == 2
+
+
+def test_upload_media_refreshes_the_token_and_reports_failures(fake, drive_client):
+    big = media_bytes(MULTIPART_MAX + 1)
+    fake.fail_next("PUT", "/upload/", 401)  # the access token expired between the session POST and the PUT
+    drive_client.upload_media("media-1-1.mp4", big, "video/mp4", props(1))
+    assert fake.token_calls == 2 and len(fake.calls("PUT")) == 2 and fake.file("media-1-1.mp4")["content"] == big
+
+    fake.fail_next("PUT", "/upload/", 503)
+    with pytest.raises(DriveError) as raised:
+        drive_client.upload_media("media-1-2.mp4", big, "video/mp4", props(2))
+    assert raised.value.transient and raised.value.status == 503 and fake.named("media-1-2.mp4") == []
+    fake.fail_next("POST", "/upload/", 403)
+    with pytest.raises(DriveError) as raised:
+        drive_client.upload_media("media-1-3.png", b"\x89PNG", "image/png", props(3))
+    assert not raised.value.transient and raised.value.status == 403 and fake.named("media-1-3.png") == []
+    message = str(raised.value)
+    assert REFRESH_TOKEN not in message and CLIENT_SECRET not in message and "ya29." not in message
+
+    # one failure each; `after` lets that many matching requests through first
+    fake.fail_next("POST", "/upload/", 500, after=1)
+    drive_client.upload_media("media-1-4.png", b"\x89PNG", "image/png", props(4))
+    with pytest.raises(DriveError):
+        drive_client.upload_media("media-1-5.png", b"\x89PNG", "image/png", props(5))
+    drive_client.upload_media("media-1-6.png", b"\x89PNG", "image/png", props(6))
+    assert fake.failures == []
+    assert [f["name"] for f in fake.files.values()] == ["media-1-1.mp4", "media-1-4.png", "media-1-6.png"]
+
+
+def test_upload_session_url_must_be_drives(fake, drive_files):
+    """The bytes and the access token go to Drive's own upload URL only, whatever a session answer says."""
+    def handle(request: httpx.Request) -> httpx.Response:
+        response = fake.handle(request)
+        if "location" in response.headers:
+            response.headers["location"] = "https://evil.example/upload/drive/v3/files?uploadType=resumable&upload_id=x"
+        return response
+
+    client = DriveClient(*drive_files, transport=httpx.MockTransport(handle))
+    with pytest.raises(DriveError) as raised:
+        client.upload_media("media-1-1.mp4", media_bytes(MULTIPART_MAX + 1), "video/mp4", props(1))
+    assert "evil" not in str(raised.value)
+    assert fake.calls("PUT") == [] and fake.named("media-1-1.mp4") == []
+
+
+def test_upload_media_sends_the_bytes_without_copying(fake, drive_files):
+    """`raw` goes into the request body as it is, so a 20 MB video is held once (80 MB of media per instance)."""
+    sent = []
+    mock = fake.transport()
+
+    class Spy(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            if request.headers.get("authorization"):  # not the token refresh
+                sent.append((request.method, list(request.stream), request.headers))
+            return mock.handle_request(request)
+
+    client = DriveClient(*drive_files, transport=Spy())
+    small, big = media_bytes(1000), media_bytes(MULTIPART_MAX + 1)
+    client.upload_media("media-1-1.png", small, "image/png", props(1))
+    client.upload_media("media-1-2.mp4", big, "video/mp4", props(2))
+    (_, multipart, headers), (_, _, _), (method, put, _) = sent
+    assert any(chunk is small for chunk in multipart)
+    assert int(headers["content-length"]) == sum(map(len, multipart)) and "transfer-encoding" not in headers
+    assert method == "PUT" and any(chunk is big for chunk in put)
+    assert fake.file("media-1-1.png")["content"] == small and fake.file("media-1-2.mp4")["content"] == big
+
+
+def test_delete_is_idempotent(fake, drive_client):
+    meta = drive_client.upload_media("media-1-1.png", media_bytes(100), "image/png", props(1))
+    assert drive_client.delete(meta["id"]) is None
+    assert meta["id"] not in fake.files and fake.named("media-1-1.png") == []
+    drive_client.delete(meta["id"])  # already gone: done
+    assert [path for _, path, _ in fake.calls("DELETE")] == [f"/drive/v3/files/{meta['id']}"] * 2
+
+    other = drive_client.upload_media("media-1-2.png", media_bytes(100), "image/png", props(2))
+    fake.fail_next("DELETE", "/drive/v3/files/", 503)  # any other failure is the caller's
+    with pytest.raises(DriveError) as raised:
+        drive_client.delete(other["id"])
+    assert raised.value.transient and other["id"] in fake.files
+
+
+def test_media_never_listed(fake, drive_client):
+    drive_client.create("ask-1.json", {"id": 1}, {"ask_id": "1"})
+    drive_client.create("task-1.json", {"id": 1}, {"task_id": "1"})
+    drive_client.upload_media("media-1-1.png", media_bytes(100), "image/png", props(1))
+    drive_client.upload_media("media-1-1-poster.png", media_bytes(100), "image/png", props(1))
+    assert sorted(f["name"] for f in drive_client.list_files()) == ["ask-1.json", "task-1.json"]
+    assert parse_name("media-1-1.png") is None and parse_name("media-1-1-poster.png") is None
+    assert [f["name"] for f in drive_client.find("media-1-1.png")] == ["media-1-1.png"]
+    assert json.loads(fake.file("ask-1.json")["content"]) == {"id": 1}  # JSON files still go up as before
+    assert fake.file("ask-1.json")["mimeType"] == "application/json"
 
 
 # ---------- tasks (v3): task-<id>.json, written only by the bridge ----------
