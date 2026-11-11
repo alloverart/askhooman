@@ -274,6 +274,13 @@ def ext_of(mime: str) -> str:
 
 # ---------- links ----------
 
+def ascii_host(host: str) -> str:
+    """A host name as browsers and httpx resolve it: IDNA maps full-width characters to ASCII and the dots 。．｡
+    to ".", then lowercase, without the trailing dot. UnicodeError if IDNA refuses it (an empty label, a label over
+    63 chars, a character IDNA prohibits)."""
+    return host.encode("idna").decode("ascii").lower().rstrip(".")
+
+
 def clean_link_url(url: str, what: str) -> str:
     """A link card's url or an attachment's source_url, which the apps open: safe_http.check_url's rules (https on
     port 443, at most 2000 chars, a public DNS name, no user info), never an IP address even a public one, and no
@@ -291,10 +298,10 @@ def clean_link_url(url: str, what: str) -> str:
     except UnsafeURL as exc:
         raise Invalid(str(exc)) from None
     try:
-        ascii_host = host.encode("idna").decode("ascii").lower()
-    except UnicodeError:  # an empty label, a label over 63 chars, a character IDNA prohibits
+        name = ascii_host(host)
+    except UnicodeError:
         raise Invalid(f"{what} must have a valid host name") from None
-    if ":" in ascii_host or _NUMERIC_LABEL.fullmatch(ascii_host.rstrip(".").rsplit(".", 1)[-1]):
+    if ":" in name or _NUMERIC_LABEL.fullmatch(name.rsplit(".", 1)[-1]):
         raise Invalid(f"{what} must name a host, not an IP address")
     return url
 
