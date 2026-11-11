@@ -5,12 +5,13 @@ compression, at most 20 MB read, a deadline between chunks, and only public addr
 import gzip
 import socket
 import time
+import tracemalloc
 
 import httpcore
 import httpx
 import pytest
 
-from server.hosted.media import VIDEO_MAX_BYTES
+from server.hosted.media import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES
 from server.hosted.media_fetch import DRIVE_HOSTS, FETCH_DEADLINE, fetch_media
 from server.hosted.safe_http import PublicOnlyTransport, public_client
 from server.rules import Invalid
@@ -21,6 +22,7 @@ URL = "https://pics.example/cat.png"
 DRIVE_REFUSED = ("AskHooman can't open files in Google Drive: download it and use ask_upload, or attach the link "
                  "with link=true")  # Global Constraints, verbatim
 HINT = "convert to PNG, JPEG or WebP; send motion as MP4"
+MB = 1024 * 1024
 
 
 def invalid(call, *args, **kwargs) -> str:
@@ -55,7 +57,8 @@ class FakeClock:
         return self.now
 
 
-def streaming(chunks, content_type: str = "video/mp4", on_chunk=lambda: None) -> tuple[httpx.Client, list[int]]:
+def streaming(chunks, content_type: str = "video/mp4", on_chunk=lambda: None,
+              headers: dict | None = None) -> tuple[httpx.Client, list[int]]:
     """A client whose every response streams `chunks()` one by one (calling on_chunk before each), and the sizes
     of the chunks the server got to send."""
     sent: list[int] = []
@@ -68,7 +71,7 @@ def streaming(chunks, content_type: str = "video/mp4", on_chunk=lambda: None) ->
                 yield chunk
 
     def handle(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, headers={"Content-Type": content_type}, stream=Body())
+        return httpx.Response(200, headers={"Content-Type": content_type, **(headers or {})}, stream=Body())
 
     return httpx.Client(transport=httpx.MockTransport(handle)), sent
 
@@ -158,7 +161,9 @@ def test_unsafe_urls_refused_before_connecting(google):
                       ("https://localhost/cat.png", "public host"),
                       ("https://me:pw@pics.example/cat.png", "user name"),
                       (f"https://{'a' * 2000}.example/", "2000"),
-                      ("https://xn--a.example/cat.png", "not a valid URL")):  # httpx's IDNA decoder refuses it
+                      ("https://xn--a.example/cat.png", "not a valid URL"),  # httpx's IDNA decoder refuses it
+                      ("https://a..example/cat.png", "valid host name"),  # an empty label
+                      (f"https://{'a' * 64}.example/cat.png", "valid host name")):  # a label over 63 chars
         assert said in invalid(fetch_media, http, url, until=soon())
     assert "must be a string" in invalid(fetch_media, http, None, until=soon())
     assert seen == []
@@ -185,17 +190,55 @@ def test_gzip_refused(google):
 def test_oversize_body(google):
     http, _ = internet(google)
     google.publish(URL, b"\x00" * (VIDEO_MAX_BYTES + 1), headers={"Content-Type": "video/mp4"})
-    assert "more than 20 MB" in invalid(fetch_media, http, URL, until=soon())
+    assert "larger than 20 MB" in invalid(fetch_media, http, URL, until=soon())
     # exactly the cap is read whole (the media checks then decide)
     raw = mp4(640, 360, 3.0)
     raw += box(b"free", bytes(VIDEO_MAX_BYTES - len(raw) - 8))
     google.publish(URL, raw, headers={"Content-Type": "video/mp4"})
     assert fetch_media(http, URL, until=soon()).bytes == VIDEO_MAX_BYTES
     # a server that would send 64 MB is cut off right after the cap
-    mb = 1024 * 1024
-    http, sent = streaming(lambda: (b"\x00" * mb for _ in range(64)))
-    assert "more than 20 MB" in invalid(fetch_media, http, URL, until=soon())
-    assert sum(sent) == VIDEO_MAX_BYTES + mb
+    http, sent = streaming(lambda: (b"\x00" * MB for _ in range(64)))
+    assert "larger than 20 MB" in invalid(fetch_media, http, URL, until=soon())
+    assert sum(sent) == VIDEO_MAX_BYTES + MB
+
+
+def test_image_cap_applies_once_the_type_is_known():
+    """A body declared as an image is cut at 5 MB, not at the video's 20 MB."""
+    http, sent = streaming(lambda: (b"\x00" * MB for _ in range(6)), content_type="image/png")
+    message = invalid(fetch_media, http, URL, until=soon())
+    assert "image" in message and "larger than 5 MB" in message
+    assert sum(sent) == IMAGE_MAX_BYTES + MB  # the cap and the one chunk that crossed it
+
+
+@pytest.mark.parametrize("content_type, length, said", [
+    ("image/png", IMAGE_MAX_BYTES + 1, "larger than 5 MB"),
+    ("image/webp", VIDEO_MAX_BYTES, "larger than 5 MB"),
+    ("video/mp4", VIDEO_MAX_BYTES + 1, "larger than 20 MB"),
+])
+def test_content_length_over_the_cap_refused_before_reading(content_type, length, said):
+    http, sent = streaming(lambda: iter([b"\x00"]), content_type, headers={"Content-Length": str(length)})
+    assert said in invalid(fetch_media, http, URL, until=soon())
+    assert sent == []  # not one chunk read
+    # a Content-Length that isn't a plain number is left to the read cap
+    http, sent = streaming(lambda: iter([png(8, 8)]), "image/png", headers={"Content-Length": "9" * 5000})
+    assert fetch_media(http, URL, until=soon()).mime == "image/png"
+
+
+def test_a_fetch_holds_one_copy_of_the_body():
+    """4 fetch slots × 20 MB is the instance's media budget: the body is not copied once read."""
+    raw = mp4(640, 360, 3.0)
+    raw += box(b"free", bytes(VIDEO_MAX_BYTES - len(raw) - 8))
+    view = memoryview(raw)
+    http, _ = streaming(lambda: (bytes(view[i:i + MB]) for i in range(0, len(raw), MB)))
+    tracemalloc.start()
+    try:
+        checked = fetch_media(http, URL, until=soon())
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert checked.raw == raw and type(checked.raw) is bytes
+    # one buffer (grown by ~1/8) and a chunk: ~23.5 MB; a full copy at the end made it ~42.5 MB
+    assert peak < VIDEO_MAX_BYTES * 1.5
 
 
 def test_slow_drip_past_deadline():
