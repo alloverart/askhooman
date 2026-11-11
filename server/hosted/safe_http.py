@@ -123,7 +123,7 @@ def _resolve_bounded(resolve, host: str, port: int, wait: float):
     def run():
         try:
             result["infos"] = resolve(host, port, type=socket.SOCK_STREAM)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:  # ValueError: a name IDNA refuses (UnicodeError "label empty or too long")
             result["error"] = exc
 
     worker = threading.Thread(target=run, name="dns", daemon=True)

@@ -65,6 +65,23 @@ def test_connect_time_check_blocks_private_resolution():
         backend.connect_tcp("mixed.example", 443)
 
 
+def test_names_the_resolver_refuses_are_connect_errors(monkeypatch):
+    """getaddrinfo raises UnicodeError, not OSError, for a name IDNA refuses (an empty label, one over 63 chars):
+    that too is a ConnectError, and nothing escapes the resolver's thread."""
+    escaped = []
+    monkeypatch.setattr("threading.excepthook", escaped.append)
+    for host in ("a..example", f"{'a' * 64}.example"):  # the real resolver: it refuses before any lookup
+        with pytest.raises(httpcore.ConnectError, match="cannot resolve"):
+            PublicOnlyBackend().connect_tcp(host, 443)
+
+    def refuses(host, port, type):
+        raise ValueError("embedded null character")
+
+    with pytest.raises(httpcore.ConnectError, match="cannot resolve"):
+        PublicOnlyBackend(resolve=refuses).connect_tcp("x.example", 443)
+    assert escaped == []
+
+
 # ---------- client metadata documents ----------
 
 def doc(**overrides) -> dict:
