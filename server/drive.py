@@ -1,7 +1,8 @@
 """Minimal Google Drive v3 REST client for the bridge's mirror in the appDataFolder (SPEC.md, "Drive storage").
 
 Only what the mirror needs: refresh the access token, list / read / create / update JSON files in
-appDataFolder. Credentials are read from their files at refresh time, so re-linking the account
+appDataFolder, and for the hosted bridge write media files (pictures, video) there and delete files.
+Credentials are read from their files at refresh time, so re-linking the account
 (writing a new refresh token file) needs no restart. No token or secret ever appears in an error message or log.
 """
 
@@ -12,15 +13,18 @@ import time
 import uuid
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 import httpx
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 API_URL = "https://www.googleapis.com/drive/v3"
 UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3"
+UPLOAD_SESSION = tuple(urlsplit(f"{UPLOAD_URL}/files")[:3])  # (scheme, netloc, path) a resumable session URL must have
 SCOPE = "https://www.googleapis.com/auth/drive.appdata"
 FILE_FIELDS = "id,name,appProperties,modifiedTime"
 LIST_QUERY = "(name contains 'ask-' or name contains 'task-') and trashed = false"  # ask-<id>.json, task-<id>.json
+MULTIPART_MAX = 5 * 1024 * 1024  # bytes: a media file up to this goes up in one multipart request, larger resumable
 REFRESH_MARGIN = 60.0  # refresh the access token this many seconds before Google says it expires
 RATE_LIMIT_REASONS = ("rateLimitExceeded", "userRateLimitExceeded")
 
@@ -216,6 +220,19 @@ class DriveClient:
         ).encode("utf-8")
         return body, f"multipart/related; boundary={boundary}"
 
+    @staticmethod
+    def _media_multipart(metadata: dict, raw: bytes, mime: str) -> tuple[tuple[bytes, bytes, bytes], str, int]:
+        """A multipart/related body as (head, raw, tail) + its type and length: httpx sends the three pieces one after
+        another, so the media bytes are never copied into one body."""
+        boundary = f"askhooman-{uuid.uuid4().hex}"
+        head = (
+            f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(metadata, ensure_ascii=False)}\r\n"
+            f"--{boundary}\r\nContent-Type: {mime}\r\n\r\n"
+        ).encode("utf-8")
+        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        return (head, raw, tail), f"multipart/related; boundary={boundary}", len(head) + len(raw) + len(tail)
+
     # ---------- files in appDataFolder ----------
 
     def list_files(self, query: str | None = None) -> list[dict]:
@@ -306,6 +323,39 @@ class DriveClient:
         return self._request("PATCH", f"{UPLOAD_URL}/files/{file_id}",
                              params={"uploadType": "multipart", "fields": FILE_FIELDS},
                              content=body, headers={"Content-Type": content_type}).json()
+
+    def upload_media(self, name: str, raw: bytes, mime: str, app_properties: dict) -> dict:
+        """A new binary file (a picture, a video, a poster) in appDataFolder -> {id, name, appProperties, modifiedTime}.
+        Up to MULTIPART_MAX bytes in one multipart request; larger in a resumable session: a POST with the metadata,
+        then one PUT of all the bytes to the session URL Drive answers with. `raw` goes into the request as it is,
+        never copied, so a 20 MB video is held once."""
+        metadata = {"name": name, "mimeType": mime, "parents": ["appDataFolder"], "appProperties": app_properties}
+        params = {"uploadType": "multipart", "fields": FILE_FIELDS}
+        if len(raw) <= MULTIPART_MAX:
+            parts, content_type, length = self._media_multipart(metadata, raw, mime)
+            return self._request("POST", f"{UPLOAD_URL}/files", params=params, content=parts,
+                                 headers={"Content-Type": content_type, "Content-Length": str(length)}).json()
+        session = self._request("POST", f"{UPLOAD_URL}/files", params={**params, "uploadType": "resumable"},
+                                content=json.dumps(metadata, ensure_ascii=False).encode("utf-8"),
+                                headers={"Content-Type": "application/json; charset=UTF-8",
+                                         "X-Upload-Content-Type": mime, "X-Upload-Content-Length": str(len(raw))})
+        location = session.headers.get("location", "")
+        place = urlsplit(location)
+        if (place.scheme, place.netloc, place.path) != UPLOAD_SESSION:  # the bytes and the token go to Drive only
+            raise DriveError(f"Drive POST HTTP {session.status_code}: the upload session URL for {name} is missing "
+                             "or not Drive's", status=session.status_code)
+        response = self._request("PUT", location, content=raw, headers={"Content-Type": mime})
+        if response.status_code not in (200, 201):  # e.g. 308: Drive holds only part of the bytes
+            raise DriveError(f"Drive PUT HTTP {response.status_code}: the upload of {name} did not complete",
+                             transient=True, status=response.status_code)
+        return response.json()
+
+    def delete(self, file_id: str) -> None:
+        """Delete a file for good (files.delete skips the trash). Already gone (404) counts as deleted."""
+        try:
+            self._request("DELETE", f"{API_URL}/files/{file_id}")
+        except DriveNotFound:
+            pass
 
     def close(self) -> None:
         if self._owns_http:

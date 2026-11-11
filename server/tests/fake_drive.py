@@ -1,9 +1,11 @@
 """In-memory Google Drive v3 (appDataFolder only) + OAuth token endpoint behind httpx.MockTransport.
 
 Implements just what server/drive.py uses: token refresh, files.list (q, paging), files.get (metadata
-and alt=media), multipart create and multipart PATCH. `name contains 'x'` matches names that start with x,
-as Drive's prefix matching of name terms does (so 'ask-' does not find task-1.json). Every request is recorded; `down` simulates an
-outage. `app_action` plays the Swift app: a read-modify-write of a file as the human (SPEC "Who writes what").
+and alt=media), multipart create (JSON or binary content) and multipart PATCH, resumable uploads (a session POST
+with the metadata, then one PUT of all the bytes to the session's Location) and files.delete. `name contains 'x'`
+matches names that start with x, as Drive's prefix matching of name terms does (so 'ask-' does not find task-1.json).
+Every request is recorded; `down` simulates an outage, `fail_next` refuses one chosen request.
+`app_action` plays the Swift app: a read-modify-write of a file as the human (SPEC "Who writes what").
 """
 
 import copy
@@ -27,20 +29,24 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def parse_multipart(request: httpx.Request) -> tuple[dict, bytes]:
+def parse_multipart(request: httpx.Request) -> tuple[dict, bytes, str]:
+    """A multipart/related upload -> (metadata, content, the content part's type). The metadata part is JSON; the
+    content is JSON (ask and task files) or any bytes (media), taken whole up to the closing delimiter, so bytes that
+    look like CR LF or a boundary don't cut it."""
     content_type = request.headers["content-type"]
     assert content_type.startswith("multipart/related; boundary="), content_type
-    boundary = content_type.split("boundary=", 1)[1].encode()
-    parts = request.content.split(b"--" + boundary)
-    assert len(parts) == 4 and parts[0] == b"" and parts[3] == b"--\r\n", parts
-
-    def body(part: bytes) -> bytes:
-        head, _, data = part.partition(b"\r\n\r\n")
-        assert b"Content-Type: application/json" in head
-        assert data.endswith(b"\r\n")
-        return data[:-2]
-
-    return json.loads(body(parts[1])), body(parts[2])
+    delimiter = b"--" + content_type.split("boundary=", 1)[1].encode()
+    body = request.content
+    assert int(request.headers["content-length"]) == len(body), request.headers
+    opening, closing = delimiter + b"\r\n", b"\r\n" + delimiter + b"--\r\n"
+    assert body.startswith(opening) and body.endswith(closing), body[:200]
+    metadata_part, between, content_part = body[len(opening):-len(closing)].partition(b"\r\n" + delimiter + b"\r\n")
+    assert between, "one metadata part and one content part"
+    head, _, metadata = metadata_part.partition(b"\r\n\r\n")
+    assert head == b"Content-Type: application/json; charset=UTF-8", head
+    head, _, content = content_part.partition(b"\r\n\r\n")
+    assert head.startswith(b"Content-Type: ") and b"\r\n" not in head, head
+    return json.loads(metadata), content, head.removeprefix(b"Content-Type: ").decode()
 
 
 class FakeDrive:
@@ -52,8 +58,11 @@ class FakeDrive:
         self.valid_tokens: set[str] = set()
         self.token_calls = 0
         self.refresh_error: tuple[int, dict] | None = None
+        self.sessions: dict[str, dict] = {}  # upload_id -> {metadata, mime, length, fields}: resumable uploads begun
+        self.failures: list[list] = []  # [method, path_prefix, status, after]: see fail_next
         self.lock = threading.RLock()
         self._ids = 0
+        self._sessions = 0
         self._clock = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
 
     # ---------- store helpers (also used by tests to play other clients) ----------
@@ -62,12 +71,13 @@ class FakeDrive:
         self._clock += timedelta(seconds=1)
         return self._clock.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-    def add(self, name: str, content, app_properties: dict | None = None, parents=("appDataFolder",)) -> str:
+    def add(self, name: str, content, app_properties: dict | None = None, parents=("appDataFolder",),
+            mime: str = "application/json") -> str:
         with self.lock:
             self._ids += 1
             file_id = f"file{self._ids:03d}"
             raw = content if isinstance(content, bytes) else json.dumps(content, ensure_ascii=False).encode()
-            self.files[file_id] = {"id": file_id, "name": name, "mimeType": "application/json",
+            self.files[file_id] = {"id": file_id, "name": name, "mimeType": mime,
                                    "parents": list(parents), "appProperties": dict(app_properties or {}),
                                    "modifiedTime": self._tick(), "content": raw, "trashed": False}
             return file_id
@@ -99,6 +109,25 @@ class FakeDrive:
         with self.lock:
             return [r for r in self.requests if (method is None or r[0] == method) and r[1].startswith(path_prefix)]
 
+    def fail_next(self, method: str, path_prefix: str, status: int, after: int = 0) -> None:
+        """Refuse one request with HTTP `status` (Drive's error shape, nothing applied): the next authorized request
+        with this method whose path starts with path_prefix, after letting `after` such requests through.
+        Several failures queue up in the order they were set; a request counts only for the first one it matches."""
+        with self.lock:
+            self.failures.append([method, path_prefix, status, after])
+
+    def _injected(self, method: str, path: str) -> httpx.Response | None:
+        for failure in self.failures:
+            if failure[0] == method and path.startswith(failure[1]):
+                if failure[3] > 0:
+                    failure[3] -= 1
+                    return None
+                self.failures.remove(failure)
+                status = failure[2]
+                error = {"code": status, "message": f"fake: injected HTTP {status}"}
+                return httpx.Response(status, json={"error": error})
+        return None
+
     # ---------- HTTP ----------
 
     def transport(self) -> httpx.MockTransport:
@@ -116,13 +145,20 @@ class FakeDrive:
             if request.headers.get("authorization", "").removeprefix("Bearer ") not in self.valid_tokens:
                 return httpx.Response(401, json={"error": {"code": 401, "message": "Invalid Credentials"}})
             path = url.path
+            injected = self._injected(request.method, path)
+            if injected is not None:
+                return injected
             if request.method == "GET" and path == "/drive/v3/files":
                 return self._list(params)
             match = re.fullmatch(r"/drive/v3/files/([^/]+)", path)
             if request.method == "GET" and match:
                 return self._get(match.group(1), params)
+            if request.method == "DELETE" and match:
+                return self._delete(match.group(1))
             if request.method == "POST" and path == "/upload/drive/v3/files":
                 return self._create(request, params)
+            if request.method == "PUT" and path == "/upload/drive/v3/files":
+                return self._finish_session(request, params)
             match = re.fullmatch(r"/upload/drive/v3/files/([^/]+)", path)
             if request.method == "PATCH" and match:
                 return self._update(match.group(1), request, params)
@@ -180,23 +216,58 @@ class FakeDrive:
         if file is None:
             return httpx.Response(404, json={"error": {"code": 404, "message": f"File not found: {file_id}."}})
         if params.get("alt") == "media":
-            return httpx.Response(200, content=file["content"], headers={"Content-Type": "application/json"})
+            return httpx.Response(200, content=file["content"], headers={"Content-Type": file["mimeType"]})
         return httpx.Response(200, json=self._fields(file, params.get("fields")))
 
     def _create(self, request: httpx.Request, params: dict) -> httpx.Response:
-        assert params.get("uploadType") == "multipart"
-        metadata, content = parse_multipart(request)
-        assert metadata["parents"] == ["appDataFolder"] and metadata["mimeType"] == "application/json", metadata
-        file_id = self.add(metadata["name"], content, metadata.get("appProperties"))
+        if params.get("uploadType") == "resumable":
+            return self._start_session(request, params)
+        assert params.get("uploadType") == "multipart", params
+        metadata, content, part_type = parse_multipart(request)
+        assert metadata["parents"] == ["appDataFolder"] and metadata["mimeType"] == part_type, (metadata, part_type)
+        file_id = self.add(metadata["name"], content, metadata.get("appProperties"), mime=metadata["mimeType"])
         return httpx.Response(200, json=self._fields(self.files[file_id], params.get("fields")))
+
+    def _start_session(self, request: httpx.Request, params: dict) -> httpx.Response:
+        """A resumable upload's first request: the metadata only. 200, an empty body and the session URL."""
+        assert request.headers["content-type"] == "application/json; charset=UTF-8", request.headers
+        metadata = json.loads(request.content)
+        mime, length = request.headers["x-upload-content-type"], int(request.headers["x-upload-content-length"])
+        assert metadata["parents"] == ["appDataFolder"] and metadata["mimeType"] == mime, (metadata, mime)
+        self._sessions += 1
+        upload_id = f"upload{self._sessions:03d}"
+        self.sessions[upload_id] = {"metadata": metadata, "mime": mime, "length": length,
+                                    "fields": params.get("fields")}
+        location = f"https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id={upload_id}"
+        return httpx.Response(200, headers={"Location": location})
+
+    def _finish_session(self, request: httpx.Request, params: dict) -> httpx.Response:
+        """All the bytes in one PUT to the session URL: the file is created, 200 + its metadata."""
+        session = self.sessions.get(params.get("upload_id", ""))
+        if session is None:
+            return httpx.Response(404, json={"error": {"code": 404, "message": "fake: no such upload session"}})
+        content = request.content
+        assert params.get("uploadType") == "resumable" and len(content) == session["length"], (params, len(content))
+        assert int(request.headers["content-length"]) == len(content), request.headers
+        assert request.headers.get("content-type", session["mime"]) == session["mime"], request.headers
+        del self.sessions[params["upload_id"]]
+        metadata = session["metadata"]
+        file_id = self.add(metadata["name"], content, metadata.get("appProperties"), mime=metadata["mimeType"])
+        return httpx.Response(200, json=self._fields(self.files[file_id], session["fields"]))
+
+    def _delete(self, file_id: str) -> httpx.Response:
+        """For good, skipping the trash, as files.delete does: 204, or 404 if there is no such file."""
+        if self.files.pop(file_id, None) is None:
+            return httpx.Response(404, json={"error": {"code": 404, "message": f"File not found: {file_id}."}})
+        return httpx.Response(204)
 
     def _update(self, file_id: str, request: httpx.Request, params: dict) -> httpx.Response:
         assert params.get("uploadType") == "multipart"
         file = self.files.get(file_id)
         if file is None:
             return httpx.Response(404, json={"error": {"code": 404, "message": f"File not found: {file_id}."}})
-        metadata, content = parse_multipart(request)
-        assert set(metadata) <= {"appProperties"}, metadata
+        metadata, content, part_type = parse_multipart(request)
+        assert set(metadata) <= {"appProperties"} and part_type == "application/json", (metadata, part_type)
         file["content"] = content
         file["appProperties"].update(metadata.get("appProperties") or {})
         file["modifiedTime"] = self._tick()
