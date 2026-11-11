@@ -1,54 +1,14 @@
 """Hosted bridge: agents' looks (SPEC v4 "Agent look"): palette colours given at connection and to older agents,
 the App API to change colour and icon, and set_my_look for an agent's own look."""
 
-import base64
-import struct
-import zlib
-
 import pytest
 
 from server.hosted.looks import AGENT_COLORS, image_info, is_one_emoji
 
 from .hosted_support import DENIS_SUB, OLGA_EMAIL, OLGA_SUB, connect, id_token, mcp, register, tool_error, tool_result
+from .media_samples import data_url, jpeg, png, webp_extended, webp_lossless, webp_lossy
 
 IMAGE_URL = "https://img.example.com/fox.png"
-
-
-def png(width: int, height: int, pad: int = 0) -> bytes:
-    """A real (tiny, valid) RGBA PNG; `pad` adds an ancillary chunk to make it bigger."""
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-    rows = b"".join(b"\x00" + b"\xd0\x60\x9a\xff" * width for _ in range(height))
-    extra = chunk(b"tEXt", b"pad\x00" + b"x" * pad) if pad else b""
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)) + extra
-            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
-
-
-def webp_lossless(width: int, height: int) -> bytes:
-    bits = (width - 1) | ((height - 1) << 14)
-    data = b"\x2f" + bits.to_bytes(4, "little") + b"\x00" * 8
-    return b"RIFF" + struct.pack("<I", 4 + 8 + len(data)) + b"WEBP" + b"VP8L" + struct.pack("<I", len(data)) + data
-
-
-def webp_lossy(width: int, height: int) -> bytes:
-    data = b"\x10\x02\x00" + b"\x9d\x01\x2a" + struct.pack("<HH", width, height) + b"\x00" * 10
-    return b"RIFF" + struct.pack("<I", 4 + 8 + len(data)) + b"WEBP" + b"VP8 " + struct.pack("<I", len(data)) + data
-
-
-def webp_extended(width: int, height: int) -> bytes:
-    data = b"\x10\x00\x00\x00" + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little")
-    return b"RIFF" + struct.pack("<I", 4 + 8 + len(data)) + b"WEBP" + b"VP8X" + struct.pack("<I", len(data)) + data
-
-
-def jpeg(width: int, height: int) -> bytes:
-    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
-    dqt = b"\xff\xdb" + struct.pack(">H", 67) + b"\x00" + b"\x01" * 64
-    sof = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, height, width, 1) + b"\x01\x11\x00"
-    return b"\xff\xd8" + app0 + dqt + sof + b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00" + b"\x00" * 16 + b"\xff\xd9"
-
-
-def data_url(mime: str, raw: bytes) -> str:
-    return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
 
 
 def agents(hosted, google, sub=DENIS_SUB) -> list[dict]:
