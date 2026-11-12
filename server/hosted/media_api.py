@@ -79,7 +79,9 @@ _MB = 1024 * 1024
 
 
 class Busy(Unavailable):
-    """Every media slot of this instance is taken (503 with Retry-After over REST)."""
+    """Every media slot of this instance is taken (503 with Retry-After over REST). No label: the MCP tool error is
+    the message alone, "busy, try again in a few seconds"."""
+    label = ""
     headers = {"Retry-After": "5"}
 
 

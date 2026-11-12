@@ -374,8 +374,9 @@ needs a public URL. Webhooks stay for agents that do have a server.
 ### 4. Pictures and video in asks
 
 Refined 11.11.2026 (Denis, TG 16914 and ask #1166: an agent shows pictures, even videos, for example files on its
-Google Drive, right in the question; the user opens them bigger and chooses; the options stay text). Not built yet.
-Hosted only: the single-tenant bridge returns `attachments: []` and has no attachment tools.
+Google Drive, right in the question; the user opens them bigger and chooses; the options stay text). Server built
+12.11.2026 (media files in Drive, uploads, REST and the MCP tools); the CLI and the apps follow. Hosted only: the
+single-tenant bridge returns `attachments: []` and has no attachment tools.
 
 AskHooman keeps asking Google for `drive.appdata` only, so neither the bridge nor the apps can read files in anyone's
 Drive. What the user sees inside the app is stored in the user's own appDataFolder, next to the ask. A private file
@@ -444,6 +445,17 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
     attachments 1, 2, 3 in order, so options can say 'Take #2'. A file on Google Drive your user can open: link=true
     with a poster. A file you can read and they can't: upload its bytes and set source_url to the original. Prefer
     ask_create(attachments=…), so the question appears with its pictures."
+- **Bridge notes (12.11.2026, the MCP tools: `server/mcp_tools.py`).** Resolved there:
+  - The tools call the same `MediaService` as the REST routes, so the `media` budget and the slots are shared: an
+    agent's MCP and REST calls count against the same 60 an hour.
+  - A tool error reads like every other one (the SDK puts "Error executing tool <name>: " in front), with a label:
+    `invalid: attachments[1]: …`, `rate limited: too many attachment calls: …`; busy is the text alone, `busy, try
+    again in a few seconds`.
+  - An `attachments` item is an object with exactly the fields above (`additionalProperties: false` in the schema;
+    another field is refused by the schema, naming `attachments.<i>.<field>`); `""` means absent, as in `ask_attach`.
+  - `ask_detach` is the one tool with `destructiveHint: true`: it deletes the item's files from Drive.
+  - On the single-tenant bridge `ask_create` has no `attachments` parameter, and the SDK ignores arguments a tool
+    doesn't have, so an agent that sends some there gets a plain ask (REST says 422).
 - **REST** (agents' tokens, hosted): `POST /api/asks` takes `attachments` as above; `POST /api/asks/{id}/attachments
   {url | data, link?, title?, caption?, source_url?, poster_for?}` → 201 + ask; `POST /api/asks/{id}/uploads {mime,
   bytes, caption?, source_url?, poster_for?}` → 201 `{upload, curl}`; `PUT /api/uploads` (upload token) → 201;
@@ -514,8 +526,9 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
     shown (ImageIO thumbnails on Apple; `<img decoding="async">` from a blob URL on the web, revoked on leaving). A
     video is downloaded whole (≤ 20 MB, with progress) and played from the local file or blob; if the player fails:
     "Can't play this video here" + Download.
-  - Unknown kinds are skipped; nothing from an attachment is ever inserted as HTML. The web app sets no CSP today; if
-    it gets one, it needs `img-src blob:` and `media-src blob:`.
+  - Unknown kinds are skipped; nothing from an attachment is ever inserted as HTML. The web app's Content-Security-Policy
+    (`web/vite.config.ts`) needs `blob:` added to `img-src` and a `media-src blob:` (without one, `media-src` falls
+    back to `default-src 'self'`).
 - **Tests.** Server (fake Drive, fake fetch): each image type by its bytes, a declared type that doesn't match the
   bytes, 5 MB + 1, 4097 px, truncated headers, SVG / GIF / HEIC refused; MP4 with `moov` first and last, 64-bit box
   sizes, no `moov`, 181 s, a `.mov` brand, box loops and absurd sizes; fetch refusals (private and mixed DNS answers,

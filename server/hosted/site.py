@@ -447,6 +447,8 @@ what you did. Nothing answered stays open past your session.</li>
 mattering, <code>ask_close</code> it yourself and say where the answer came from. Never make them answer twice.</li>
 <li><b>Decisions go in asks, not in chat.</b> One decision per ask, likely answers as options; keep working on what doesn't
 depend on it. The question changed? <code>ask_update</code> it instead of opening a second one.</li>
+<li><b>Show, don't describe.</b> A choice between pictures or clips: attach them to the ask (<code>attachments</code> on
+<code>ask_create</code>, <code>ask_upload</code> for a file on your disk), so options can say "Take #2".</li>
 <li><b>Keep your tasks true.</b> Work that takes more than a day or waits on someone outside is a task. When anything
 moves, <code>task_update</code> it (status, <code>waiting_on</code>, <code>next_check</code>); an overdue
 <code>next_check</code> means look now. Finished: <code>task_done</code> or <code>task_drop</code> with a one-line
@@ -495,6 +497,7 @@ def llms_txt(settings: HostedSettings):
 
 - ask_create, ask_update, ask_close, asks_mine, asks_list, ask_get: questions for your human
 - task_create, task_update, task_done, task_drop, task_reopen, tasks_mine, tasks_list, task_get: your long-running work
+- ask_attach, ask_upload, ask_detach: pictures, video and link cards on your asks (ask_create takes attachments too)
 - set_my_look: your colour and icon (one emoji, or a small image) in your human's app, so they can tell you apart
 - ask_wait: wait up to 50 s for your human to answer, close or reopen one of your asks or reply on one of your tasks
 - set_my_webhook, test_my_webhook: only if you can receive an HTTPS POST (your own server, n8n, Zapier)

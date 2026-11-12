@@ -128,6 +128,23 @@ def test_every_tool_has_a_title_and_explicit_hints(live_server):
     asyncio.run(scenario())
 
 
+def test_single_tenant_has_no_attachment_tools(live_server):
+    """Pictures in asks are hosted only (SPEC v5 step 4): the single-tenant bridge lists no attachment tools, its
+    ask_create takes no `attachments` and its docstring doesn't teach them; its asks say `attachments: []`."""
+    async def scenario():
+        async with connect(live_server, ALLEN) as allen:
+            tools = {t.name: t for t in (await allen.list_tools()).tools}
+            assert set(tools) == TOOLS and not {"ask_attach", "ask_upload", "ask_detach"} & set(tools)
+            create = tools["ask_create"]
+            assert set(create.input_schema["properties"]) == {"title", "context", "options", "links", "priority", "ref"}
+            assert "attachment" not in json.dumps(create.input_schema) and "Show, don't describe" not in \
+                create.description
+            assert create.description.rstrip().endswith("act on it, then ask_close.")
+            assert payload(await allen.call_tool("ask_create", {"title": "Plain?"}))["attachments"] == []
+
+    asyncio.run(scenario())
+
+
 def test_mcp_errors_are_tool_errors(live_server):
     async def scenario():
         async with connect(live_server, ALLEN) as allen:
