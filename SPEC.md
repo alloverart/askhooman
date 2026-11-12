@@ -485,8 +485,10 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
     the PUT checks it all again against the bytes and the ask as it is then.
   - `PUT /api/uploads` needs a `Content-Length` (411 otherwise; `curl --data-binary @FILE` sends one), so no body is
     buffered before the PUT holds its slot; its `Content-Type` must be the declared type (any case, parameters
-    ignored), else 422. Any PUT that presents a token uses it up, a refused or busy one too: ask for a new upload. A
-    token of an agent disconnected meanwhile is refused (401). The reply's `attachment` is the new item, or for a
+    ignored), else 422. Any PUT that presents a token uses it up, a refused or busy one too: ask for a new upload (a
+    busy PUT says "busy: request a new upload in a few seconds"). A body that stalls 20 s, or takes more than 120 s
+    in all, is a 408 "upload too slow: request a new upload", so a slow client can't hold a slot. A token of an
+    agent disconnected meanwhile is refused (401). The reply's `attachment` is the new item, or for a
     poster the video or link card it belongs to.
   - Limits: a call refused as busy counts nothing, and so does a call over the budget (a create needs one per item,
     all at once); REST says 429 with `Retry-After: 3600` (the window). A hosted `POST /api/asks` with `attachments`
