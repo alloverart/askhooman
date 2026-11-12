@@ -26,6 +26,12 @@ Tasks (long-running work an agent does itself; the human only reads them):
 Waking up (the hosted bridge, ASKS_URL=https://askhooman.com with an agent key): wait for the user's answers and
 replies and run a command per event, with ASKHOOMAN_EVENT and ASKHOOMAN_ASK_ID / ASKHOOMAN_TASK_ID set:
   asks.py listen --exec 'claude -p "check asks_mine and tasks_mine"'
+
+Pictures and video (the hosted bridge; PNG, JPEG, WebP up to 5 MB and 4096 px, MP4 up to 20 MB, 6 per ask):
+  asks.py attach 12 cat.png --caption "Option 1"      upload a file (the server numbers it 1, 2, 3...)
+  asks.py attach 12 --url https://example.com/a.png    the bridge fetches it
+  asks.py attach 12 --url https://drive.google.com/file/d/x/view --link --title "Mockup"   a link card
+  asks.py detach 12 2
 """
 
 from __future__ import annotations  # keeps it runnable on macOS /usr/bin/python3 (3.9)
@@ -58,9 +64,10 @@ CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 class CliError(Exception):
     """Printed as `error: ...` with exit code 1. `status`: the HTTP status, if the server answered."""
 
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None, code: int = 1):
         super().__init__(message)
         self.status = status
+        self.code = code  # the process exit code
 
 
 def scrub(value):
@@ -544,6 +551,107 @@ def cmd_reopen(client, args):
     show_result(client.request("POST", f"/api/asks/{args.id}/reopen", body={}), args)
 
 
+# ---------- attachments ----------
+
+NOT_MEDIA = "convert to PNG, JPEG or WebP; send motion as MP4"
+
+
+def sniff_mime(head: bytes) -> str | None:
+    """The type from a file's first bytes: PNG, JPEG, WebP, or MP4 (an ISO BMFF `ftyp` box). The server checks the
+    rest (brand, sizes); this only picks the type to announce."""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[4:8] == b"ftyp":
+        return "video/mp4"
+    return None
+
+
+def describe_attachment(item: dict) -> str:
+    if item.get("kind") == "link":
+        return f"link {item.get('provider', 'web')}: {item.get('title', '')} <{item.get('url', '')}>"
+    size = f"{item['width']}x{item['height']}, " if item.get("width") else ""
+    return f"{item.get('kind')} {item.get('mime')} ({size}{item.get('bytes', 0):,} bytes)"
+
+
+def print_attachment(ask_id: int, item: dict, args) -> None:
+    if args.raw:
+        print_json(item)
+        return
+    caption = f"  \"{item['caption']}\"" if item.get("caption") else ""
+    print(f"attached #{item.get('id')} to ask #{ask_id}: {describe_attachment(item)}{caption}")
+
+
+def put_file(client, upload: dict, f, size: int) -> dict:
+    """PUT the open file to the one-time upload URL with the returned headers, streamed (no second read into
+    memory), with an explicit Content-Length: the server answers 411 without one."""
+    headers = {**upload["headers"], "Content-Length": str(size), "Accept": "application/json",
+               "User-Agent": "asks-cli/0.1"}
+    req = urllib.request.Request(upload["url"], data=f, headers=headers, method=upload.get("method", "PUT"))
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise CliError(f"HTTP {exc.code}: {error_detail(exc)}", status=exc.code)
+    except urllib.error.URLError as exc:
+        raise CliError(f"cannot reach {upload['url']}: {exc.reason}")
+    except (TimeoutError, socket.timeout):
+        raise CliError("the upload did not finish in time")
+    except OSError as exc:
+        raise CliError(f"upload failed: {exc}")
+    except http.client.HTTPException as exc:
+        raise CliError(f"upload failed: {type(exc).__name__}")
+    try:
+        return scrub(json.loads(raw))
+    except ValueError:
+        raise CliError(f"server returned non-JSON for the upload: {raw[:200]!r}")
+
+
+def cmd_attach(client, args):
+    if (args.file is None) == (args.media_url is None):
+        raise CliError("give a FILE or --url URL (not both)", code=2)
+    if args.media_url is not None:
+        if args.title is not None and not args.link:
+            raise CliError("--title goes with --link", code=2)
+        body = {"url": args.media_url, "link": True if args.link else None, "title": args.title,
+                "caption": args.caption, "source_url": args.source}
+        ask = client.request("POST", f"/api/asks/{args.id}/attachments",
+                             body={k: v for k, v in body.items() if v is not None}, timeout=60)
+        items = ask.get("attachments") or []
+        if not items:
+            raise CliError("the server returned no attachments")
+        print_attachment(args.id, max(items, key=lambda i: i.get("id", 0)), args)
+        return
+    if args.link or args.title is not None:
+        raise CliError("--link and --title go with --url", code=2)
+    try:
+        f = open(args.file, "rb")
+    except OSError as exc:
+        raise CliError(f"cannot read {args.file}: {exc.strerror}")
+    with f:
+        mime = sniff_mime(f.read(16))
+        if mime is None:
+            raise CliError(f"{args.file}: not a PNG, JPEG, WebP or MP4 file: {NOT_MEDIA}", code=2)
+        size = os.fstat(f.fileno()).st_size
+        body = {"mime": mime, "bytes": size, "caption": args.caption, "source_url": args.source}
+        issued = client.request("POST", f"/api/asks/{args.id}/uploads",
+                                body={k: v for k, v in body.items() if v is not None})
+        f.seek(0)
+        result = put_file(client, issued["upload"], f, size)
+    print_attachment(args.id, result["attachment"], args)
+
+
+def cmd_detach(client, args):
+    ask = client.request("DELETE", f"/api/asks/{args.id}/attachments/{args.n}")
+    if args.raw:
+        print_json(ask)
+    else:
+        print(f"detached #{args.n} from ask #{args.id}")
+
+
 # ---------- task commands ----------
 
 def cmd_tasks(client, args):
@@ -724,6 +832,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id", type=int)
     p.set_defaults(func=cmd_reopen)
 
+    p = sub.add_parser("attach", parents=[raw], help="attach a picture or video to my open ask (hosted bridge)")
+    p.add_argument("id", type=int)
+    p.add_argument("file", nargs="?", help="PNG, JPEG, WebP (up to 5 MB, 4096 px) or MP4 (up to 20 MB) to upload")
+    p.add_argument("--url", dest="media_url", help="https URL the bridge fetches (or, with --link, shows as a link card)")
+    p.add_argument("--link", action="store_true", help="with --url: a link card, nothing fetched")
+    p.add_argument("--title", help="link card title (with --link)")
+    p.add_argument("--caption", help="caption, up to 300 characters")
+    p.add_argument("--source", help="where the original lives (https URL)")
+    p.set_defaults(func=cmd_attach)
+
+    p = sub.add_parser("detach", parents=[raw], help="remove attachment N from my open ask")
+    p.add_argument("id", type=int)
+    p.add_argument("n", type=int, help="the attachment number")
+    p.set_defaults(func=cmd_detach)
+
     # ---------- tasks ----------
 
     p = sub.add_parser("tasks", parents=[raw], help="list tasks (default: open = active + waiting)")
@@ -798,7 +921,7 @@ def main(argv=None) -> int:
         args.func(client, args)
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return exc.code
     except KeyboardInterrupt:
         return 130
     return 0
