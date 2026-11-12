@@ -307,11 +307,12 @@ def clean_link_url(url: str, what: str) -> str:
 
 
 def provider_of(url: str) -> str:
-    """Which service a link card points to, by its host (and for docs.google.com its first path segment)."""
+    """Which service a link card points to, by its host as browsers resolve it (ascii_host: a trailing dot, capitals
+    or the dots 。．｡ still name Drive) and, for docs.google.com, its first path segment."""
     try:
         parts = urlsplit(url)
-        host = parts.hostname or ""
-    except ValueError:
+        host = ascii_host(parts.hostname or "")
+    except (ValueError, UnicodeError):
         return "web"
     if host == "drive.google.com":
         return "drive"

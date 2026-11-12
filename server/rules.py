@@ -208,10 +208,7 @@ def new_record(who: Identity, ask_id: int, fields: dict, now: str) -> dict:
 def plan_update(who: Identity, data: dict, load: Loader, now: str) -> tuple[dict, Change | None]:
     fields = clean_fields(data, partial=True)
     ask = load()
-    if who.is_denis or ask["agent"] != who.agent:
-        raise Forbidden(f"only the agent who created ask #{ask['id']} ({ask['agent']}) can edit it")
-    if ask["status"] != "open":
-        raise Conflict(f"ask #{ask['id']} is {ask['status']}; only open asks can be edited")
+    check_owner_open(who, ask)
     changes = {f: {"from": ask[f], "to": v} for f, v in fields.items() if ask[f] != v}
     if not changes:
         return ask, None
@@ -259,6 +256,14 @@ def plan_reopen(who: Identity, load: Loader, now: str) -> tuple[dict, Change]:
 def check_owner_or_denis(who: Identity, ask: dict, action: str) -> None:
     if not who.is_denis and ask["agent"] != who.agent:
         raise Forbidden(f"only the human or the agent who created ask #{ask['id']} ({ask['agent']}) can {action} it")
+
+
+def check_owner_open(who: Identity, ask: dict) -> None:
+    """An edit (fields, attachments): the owner agent only, and only while the ask is open."""
+    if who.is_denis or ask["agent"] != who.agent:
+        raise Forbidden(f"only the agent who created ask #{ask['id']} ({ask['agent']}) can edit it")
+    if ask["status"] != "open":
+        raise Conflict(f"ask #{ask['id']} is {ask['status']}; only open asks can be edited")
 
 
 # ---------- listing (stores without SQL; must match core.AskService.list) ----------

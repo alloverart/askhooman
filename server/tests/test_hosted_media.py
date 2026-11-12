@@ -261,7 +261,11 @@ def test_providers():
                           ("https://figma.com/file/x", "figma"), ("https://www.figma.com/design/x", "figma"),
                           ("https://DRIVE.Google.com/file/d/x", "drive"), ("https://example.com/", "web"),
                           ("https://drive.google.com.evil.com/", "web"), ("https://notyoutube.com/", "web"),
-                          ("https://www.docs.google.com/spreadsheets/d/x", "web")):
+                          ("https://www.docs.google.com/spreadsheets/d/x", "web"),
+                          # the host as a browser resolves it: a trailing dot, the dots 。．｡, full-width letters
+                          ("https://drive.google.com./file/d/x", "drive"), ("https://drive。google．com｡/file", "drive"),
+                          ("https://ｄｏｃｓ.google.com/spreadsheets/d/x", "sheets"), ("https://youtu.be./x", "youtube"),
+                          ("https://a..example/", "web")):
         assert provider_of(url) == provider, url
 
 

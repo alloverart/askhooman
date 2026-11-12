@@ -70,11 +70,14 @@ def get(client, ask_id) -> dict:
 
 
 def assert_mirrored(client, fake, ask_id, rev=None) -> dict:
-    """The file holds exactly what REST returns (ask + events), written by the bridge."""
+    """The file holds exactly what REST returns (ask + events), written by the bridge. `attachments` is the one
+    REST field the single-tenant mirror doesn't write: always [] here (SPEC v5 step 4, hosted only), the apps read a
+    missing one as [], and a file that has one keeps it like any field the bridge doesn't know."""
     ask = get(client, ask_id)
+    assert ask.pop("attachments") == []
     file = fake.file(f"ask-{ask_id}.json")
     doc = json.loads(file["content"])
-    assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "writer")} == ask
+    assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "writer", "attachments")} == ask
     assert (doc["schema"], doc["writer"]) == (1, "bridge")
     assert file["appProperties"] == {"ask_id": str(ask_id), "status": ask["status"], "agent": ask["agent"],
                                      "rev": str(doc["rev"])}

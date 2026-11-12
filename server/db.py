@@ -89,6 +89,7 @@ def ask_from_row(row: sqlite3.Row) -> dict:
     ask = {field: row[field] for field in ASK_FIELDS}
     ask["options"] = json.loads(ask["options"] or "[]")
     ask["links"] = json.loads(ask["links"] or "[]")
+    ask["attachments"] = []  # pictures and video live on the hosted bridge only (SPEC v5 step 4); never null
     return ask
 
 

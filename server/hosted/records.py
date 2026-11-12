@@ -15,9 +15,14 @@ Users can put anything into their own appDataFolder, so reads are bounded: listi
 files over MAX_FILE_BYTES (by their `size`, and while reading) are skipped as unreadable, downloads are never
 decompressed, a list downloads only the files its `limit` can need (chosen from appProperties first), and the
 per-instance cache holds validated records only, within a byte budget.
+
+Hosted asks carry one more field than single-tenant ones, `attachments` (SPEC v5 step 4; hosted/attachments.py
+writes the media files): HOSTED_ASK is the ask Kind with that field, read as a list of objects and `[]` on older
+files. A create may write media files first (`media`) and undo them if the ask file write fails (`rollback`).
 """
 
 import copy
+import dataclasses
 import json
 import logging
 import threading
@@ -77,6 +82,14 @@ DOWNLOAD_THREADS = 8
 LOCK_STRIPES = 64
 ASK_STATUSES = ("open", "answered", "closed")
 TASK_STATUSES = OPEN + FINISHED
+ATTACHMENTS = "attachments"
+HOSTED_ASK = dataclasses.replace(ASK, fields=(*ASK.fields, ATTACHMENTS))  # the ask object of the hosted bridge
+
+
+def new_hosted_record(who: Identity, ask_id: int, fields: dict, now: str) -> dict:
+    """A fresh open ask as the hosted REST returns it: rules.new_record plus `attachments` (empty until the media
+    service adds the files)."""
+    return {**new_record(who, ask_id, fields, now), ATTACHMENTS: []}
 
 
 class _Changed(Exception):
@@ -276,6 +289,8 @@ class DriveCollection:
         for field in self.list_fields:
             if not isinstance(record[field], list):
                 record[field] = []
+        if ATTACHMENTS in record:  # each attachment is an object (a user may put anything into their own folder)
+            record[ATTACHMENTS] = [item for item in record[ATTACHMENTS] if isinstance(item, dict)]
         return record
 
     def _missing(self, item_id) -> NotFound:
@@ -371,32 +386,52 @@ class DriveCollection:
 
     # writes
 
-    def create(self, who: Identity, fields: dict, make_record) -> dict:
+    def create(self, who: Identity, fields: dict, make_record, media: "Callable[[int], list[dict]] | None" = None,
+               rollback: "Callable[[list[dict]], None] | None" = None) -> dict:  # quoted: `list` is a method here
+        """A new file with its `created` event. `media(item_id)` (asks with attachments) writes the media files
+        first and returns the attachment objects: they go into the record, each with an `attached` event after
+        `created`. If the file write then fails, `rollback(items)` deletes those files and the error goes on."""
         item_id = self.records.allocate(self.kind)
         now = utc_now()
         record = make_record(who, item_id, fields, now)
-        event = {"id": 1, self.kind.key: item_id, "at": now, "actor": who.actor, "kind": "created", "payload": fields}
-        doc = build_doc({**record, "events": [event]}, 1, None, self.kind)
-        self.records.call(self.records.drive.create, self.kind.file(item_id), doc, app_properties(record, 1, self.kind))
+        events = [{"id": 1, self.kind.key: item_id, "at": now, "actor": who.actor, "kind": "created",
+                   "payload": fields}]
+        items = media(item_id) if media is not None else []
+        try:
+            for item in items:
+                events.append({"id": len(events) + 1, self.kind.key: item_id, "at": now, "actor": who.actor,
+                               "kind": "attached", "payload": {"attachment": item}})
+            if items:
+                record = {**record, ATTACHMENTS: [*record.get(ATTACHMENTS, []), *items]}
+            doc = build_doc({**record, "events": events}, 1, None, self.kind)
+            self.records.call(self.records.drive.create, self.kind.file(item_id), doc,
+                              app_properties(record, 1, self.kind))
+        except BaseException:
+            if rollback is not None and items:
+                rollback(items)
+            raise
         log.info("hosted: created %s for agent %s", self.kind.file(item_id), who.agent)
-        return self.decorate(record, [event])
+        return self.decorate(record, events)
 
-    def mutate(self, who: Identity, item_id, plan) -> dict:
+    def mutate(self, who: Identity, item_id, plan, with_events: bool = False) -> dict:
         """Read-modify-write of one file. plan(load) -> (current record, Change | None), from the shared rules;
-        `load` downloads the file only when the rules get to it (input errors come first, as with SQLite)."""
+        `load` downloads the file only when the rules get to it (input errors come first, as with SQLite). With
+        `with_events` the loaded record carries the file's `events` too (attachment ids are never reused, so
+        their rules read the history)."""
         with self.records.pool.stripe((self.records.sub, self.kind.name, item_id)):
             for _ in range(WRITE_ATTEMPTS):
                 loaded: dict = {}
 
                 def load(loaded=loaded):
                     loaded["meta"], loaded["doc"] = self._load(item_id)
-                    return self._record(loaded["doc"], item_id)
+                    return (self._entry_of if with_events else self._record)(loaded["doc"], item_id)
 
                 current, change = plan(load)
                 if change is None:
                     # Nothing to write; the task still comes back with its derived fields (only a plan that
                     # loaded the file can return no change, so the events are at hand).
                     events = (loaded.get("doc") or {}).get("events")
+                    current = {k: v for k, v in current.items() if k != "events"}
                     return self.decorate(current, events if isinstance(events, list) else [])
                 try:
                     return self._write(who, item_id, loaded["meta"], loaded["doc"], change)
@@ -437,8 +472,8 @@ class HostedAsks:
     """AskService's interface over one user's Drive."""
 
     def __init__(self, records: UserRecords):
-        self.items = DriveCollection(records, ASK, STATUS_FILTERS, ASK_STATUSES, ask_order, ("options", "links"),
-                                     {"open": 0, "answered": 1, "closed": 2})
+        self.items = DriveCollection(records, HOSTED_ASK, STATUS_FILTERS, ASK_STATUSES, ask_order,
+                                     ("options", "links", ATTACHMENTS), {"open": 0, "answered": 1, "closed": 2})
 
     def get(self, ask_id: int, with_events: bool = True) -> dict:
         return self.items.get(ask_id, with_events)
@@ -447,7 +482,8 @@ class HostedAsks:
         return self.items.list(status, agent, limit)
 
     def create(self, who: Identity, data: dict) -> dict:
-        return self.items.create(who, plan_create(who, data), new_record)
+        """An ask without attachments; with them, attachments.AskMedia.create writes the files first."""
+        return self.items.create(who, plan_create(who, data), new_hosted_record)
 
     def update(self, who: Identity, ask_id: int, data: dict) -> dict:
         return self.items.mutate(who, ask_id, lambda load: plan_update(who, data, load, utc_now()))
