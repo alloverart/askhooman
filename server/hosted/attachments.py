@@ -54,7 +54,7 @@ from .media import (
     ext_of,
     provider_of,
 )
-from .media_fetch import CREATE_FETCH_DEADLINE, fetch_media
+from .media_fetch import CREATE_FETCH_DEADLINE, NoRoom, fetch_media
 from .records import ATTACHMENTS, HostedAsks, UserRecords, new_hosted_record
 
 log = logging.getLogger("asks.hosted.media")
@@ -89,11 +89,12 @@ def _string(item: dict, key: str) -> str | None:
     return value.strip() or None
 
 
-def prepare(item, http: httpx.Client | None, until: float) -> Item:
-    """One item of ask_create's `attachments`, or ask_attach's arguments as one object: `{url, link?, title?,
-    caption?, source_url?}` or `{data, caption?, source_url?}`, exactly one of url and data. The texts are cleaned
-    like every field and the URLs checked before the bytes are fetched (`http`: the public-only client, `until`:
-    when the caller's time for fetching ends) or decoded, then checked like any attachment. Invalid otherwise."""
+def prepare(item, http: httpx.Client | None, until: float, max_bytes: int | None = None) -> Item:
+    """One item of ask_create's `attachments`, or ask_attach's arguments as one object: `{url, link: true, title?,
+    caption?}`, `{url, caption?, source_url?}` or `{data, caption?, source_url?}`, exactly one of url and data. The
+    texts are cleaned like every field and the URLs checked before the bytes are fetched (`http`: the public-only
+    client, `until`: when the caller's time for fetching ends, `max_bytes`: the most the fetch may read, NoRoom
+    beyond) or decoded, then checked like any attachment. Invalid otherwise."""
     if hasattr(item, "model_dump"):
         item = item.model_dump()
     if not isinstance(item, dict):
@@ -118,9 +119,12 @@ def prepare(item, http: httpx.Client | None, until: float) -> Item:
     if title is not None and not link:
         raise Invalid("title is for link cards (link=true); a picture or a video has a caption")
     if link:
+        if source_url is not None:  # the card would drop it: _stored keeps no source_url on a link
+            raise Invalid("source_url is for pictures and videos; a link card's url is the original")
         url = clean_link_url(url, "url")
-        return Item("link", None, url, title or urlsplit(url).hostname or url, caption, source_url)
-    checked = decode_data(data) if data is not None else fetch_media(http, url, until=until)
+        title = (title or urlsplit(url).hostname or url)[:LINK_TITLE_MAX]  # a host may have 253 chars
+        return Item("link", None, url, title, caption, source_url)
+    checked = decode_data(data) if data is not None else fetch_media(http, url, until=until, max_bytes=max_bytes)
     return Item("video" if checked.mime == VIDEO_TYPE else "image", checked, None, None, caption, source_url)
 
 
@@ -139,14 +143,19 @@ def attachment_list(items) -> list:
 def prepare_all(items, http: httpx.Client | None, until: float | None = None) -> list[Item]:
     """The `attachments` of one ask_create: at most ATTACH_MAX items, prepared in order with one fetch budget
     (CREATE_FETCH_DEADLINE from now, or `until`). A bad item fails the call as `attachments[i]: …` before anything
-    is written; the bytes are added up as they come, and the items after the ASK_MEDIA_MAX cap are not fetched."""
+    is written. The bytes are added up as they come and each fetch may read only what ASK_MEDIA_MAX leaves, so a
+    create holds at most 40 MB of bodies (what its CREATE_SLOTS allow for), and the items after the cap are not
+    fetched."""
     items = attachment_list(items)
     until = time.monotonic() + CREATE_FETCH_DEADLINE if until is None else until
     prepared: list[Item] = []
     total = 0
     for i, item in enumerate(items):
         try:
-            prepared.append(prepare(item, http, until))
+            try:
+                prepared.append(prepare(item, http, until, max_bytes=ASK_MEDIA_MAX - total))
+            except NoRoom as exc:
+                raise _too_much(total + exc.size, exact=exc.exact) from None
             total += prepared[-1].checked.bytes if prepared[-1].checked else 0
             if total > ASK_MEDIA_MAX:
                 raise _too_much(total)
@@ -199,9 +208,11 @@ def _poster(checked: Checked, file_id: str | None) -> dict:
             "bytes": checked.bytes}
 
 
-def _too_much(total: int) -> Invalid:
-    return Invalid(f"the attachments would take {total} bytes; at most {ASK_MEDIA_MAX // _MB} MB are stored per ask, "
-                   "posters included: attach a bigger video as a Drive link with a poster")
+def _too_much(total: int, exact: bool = True) -> Invalid:
+    """Over ASK_MEDIA_MAX; `exact` False: `total` is a lower bound (a fetch stopped where the room ran out)."""
+    return Invalid(f"the attachments would take {'' if exact else 'at least '}{total} bytes; at most "
+                   f"{ASK_MEDIA_MAX // _MB} MB are stored per ask, posters included: attach a bigger video as a Drive "
+                   "link with a poster")
 
 
 # ---------- the rules (pure; the ask files are the user's, so every value is checked) ----------

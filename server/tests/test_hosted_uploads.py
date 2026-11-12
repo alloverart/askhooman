@@ -14,8 +14,12 @@ import pytest
 
 from server.app import MAX_BODY
 from server.hosted import media_api
+from server.hosted.accounts import HostedIdentity
+from server.hosted.crypto import digest
 from server.hosted.media_api import Slots
 from server.hosted.ratelimit import LIMITS, RateLimiter
+from server.hosted.store import MemoryStore
+from server.hosted.uploads import UPLOADS, UploadGrants
 
 from .conftest import ALLEN as ALLEN_TOKEN
 from .conftest import auth
@@ -209,6 +213,17 @@ def test_token_single_use(hosted, google):
     assert put(hosted, issued, raw).status_code == 401
     assert media_files(drive) == ["media-1-1.png"]
     assert [a["id"] for a in hosted.get("/api/asks/1", headers=bearer(token)).json()["attachments"]] == [1]
+
+
+def test_claim_takes_the_whole_token_only():
+    """The format check covers the whole string: `$` alone also matches before a trailing newline."""
+    store = MemoryStore()
+    grants = UploadGrants(store, clock=lambda: 0.0)
+    token, _ = grants.issue(HostedIdentity("agent", "allen", user="u1", agent_id="a1"), 1, "image/png", 10, None,
+                            None, 0)
+    store.put(UPLOADS, digest(token + "\n"), store.get(UPLOADS, digest(token)))
+    assert grants.claim(token + "\n") is None and store.get(UPLOADS, digest(token + "\n")) is not None  # not looked up
+    assert grants.claim(token).ask_id == 1
 
 
 def test_token_bound_to_its_ask(hosted, google):
@@ -679,7 +694,7 @@ def test_slots_and_counting_many():
 
 # ---------- the single-tenant bridge ----------
 
-@pytest.mark.parametrize("value", [[{"url": PIC}], "x", {"url": PIC}, [1]])
+@pytest.mark.parametrize("value", [[{"url": PIC}], "x", {"url": PIC}, [1], False, {}, "", 0])
 def test_single_tenant_refuses_any_attachments(client, value):
     refused = client.post("/api/asks", json={"title": "Pic?", "attachments": value}, headers=auth(ALLEN_TOKEN))
     assert refused.status_code == 422 and refused.json()["detail"] == "attachments need the hosted AskHooman"

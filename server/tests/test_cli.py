@@ -232,6 +232,9 @@ def test_cli_attach_url_link(live_hosted, capsys, monkeypatch):
     assert out.startswith(f"attached #1 to ask #{ask_id}: link drive: Mockup <https://drive.google.com/file/d/abc/view>")
     code, _, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id), "--url", "http://x.example/a.png")
     assert code == 1 and "HTTP 422" in err
+    code, _, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id), "--url", "https://x.example/a",
+                       "--link", "--source", "https://example.com/orig")
+    assert code == 1 and "HTTP 422: source_url is for pictures and videos; a link card's url is the original" in err
     code, _, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id))
     assert code == 2 and "FILE or --url" in err
 

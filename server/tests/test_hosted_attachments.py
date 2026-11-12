@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+import tracemalloc
 
 import httpx
 import pytest
@@ -41,6 +42,7 @@ PIC = "https://pics.example/cat.png"
 CLIP = "https://pics.example/clip.mp4"
 DRIVE_LINK = "https://drive.google.com/file/d/abc/view"
 MEDIA_PROPS = {"ask_id": "1", "kind": "media", "attachment": "1"}
+MB = 1024 * 1024
 
 
 def soon() -> float:
@@ -501,6 +503,10 @@ def test_prepare_items(google):
                    soon())
     assert card == Item("link", None, "https://docs.google.com/spreadsheets/d/x/edit", "Costs", None, None)
     assert prepare({"url": "https://Example.com/a?b=c", "link": True}, None, soon()).title == "example.com"
+    long_host = ".".join(["a" * 60] * 4) + ".example"  # 251 chars, a valid DNS name
+    assert prepare({"url": f"https://{long_host}/x", "link": True}, None, soon()).title == long_host[:200]
+    assert "source_url is for pictures and videos; a link card's url is the original" in invalid(
+        prepare, {"url": "https://x.example/a", "link": True, "source_url": "https://example.com/orig"}, None, soon())
 
     assert "exactly one of url and data" in invalid(prepare, {"caption": "x"}, None, soon())
     assert "exactly one of url and data" in invalid(prepare, {"url": PIC, "data": "data:x"}, None, soon())
@@ -535,6 +541,50 @@ def test_prepare_all_names_the_bad_item(google):
     google.publish(CLIP, big, headers={"Content-Type": "video/mp4"})
     message = invalid(prepare_all, [{"url": CLIP}, {"url": CLIP}, {"url": CLIP}], http)
     assert message.startswith("attachments[2]: ") and "40 MB" in message  # over the cap: the 3rd is not fetched
+
+
+def test_prepare_all_reads_no_more_than_the_ask_has_room_for():
+    """A create holds at most its 40 MB (the budget of its 2 slots): after a 20 MB and a 15 MB video the third fetch
+    may take the 5 MB left, so its body is cut there (or refused by its Content-Length), never read whole first."""
+    big, mid = with_free(mp4(640, 360, 3.0), VIDEO_MAX_BYTES), with_free(mp4(640, 360, 3.0), 15 * MB)
+    bodies = {"/1.mp4": big, "/2.mp4": mid, "/3.mp4": big}
+    served: dict[str, int] = {}
+    declared: set[str] = set()  # paths that send their Content-Length
+
+    class Body(httpx.SyncByteStream):  # counts what the server got to send, 1 MB at a time
+        def __init__(self, path: str):
+            self.path = path
+
+        def __iter__(self):
+            view = memoryview(bodies[self.path])
+            for i in range(0, len(view), MB):
+                served[self.path] = served.get(self.path, 0) + MB
+                yield bytes(view[i:i + MB])
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        length = {"Content-Length": str(len(bodies[path]))} if path in declared else {}
+        return httpx.Response(200, headers={"Content-Type": "video/mp4", **length}, stream=Body(path))
+
+    http = httpx.Client(transport=httpx.MockTransport(handle))
+    items = [{"url": f"https://clips.example/{n}.mp4"} for n in (1, 2, 3)]
+    room = ASK_MEDIA_MAX - VIDEO_MAX_BYTES - 15 * MB
+    tracemalloc.start()
+    try:
+        message = invalid(prepare_all, items, http)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert served == {"/1.mp4": VIDEO_MAX_BYTES, "/2.mp4": 15 * MB, "/3.mp4": room + MB}  # + the chunk that crossed
+    assert message.startswith(f"attachments[2]: the attachments would take at least {ASK_MEDIA_MAX + MB} bytes; "
+                              "at most 40 MB are stored per ask")
+    assert peak < ASK_MEDIA_MAX + 4 * MB  # the two bodies kept and ≤ 6 MB of the third (it was read whole: ~58 MB)
+    # a Content-Length over the room left: refused before one byte of it is read, with the exact total
+    served.clear()
+    declared.add("/3.mp4")
+    message = invalid(prepare_all, items, http)
+    assert "/3.mp4" not in served
+    assert message.startswith(f"attachments[2]: the attachments would take {2 * VIDEO_MAX_BYTES + 15 * MB} bytes; ")
 
 
 # ---------- the pure rules ----------

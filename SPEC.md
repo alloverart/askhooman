@@ -479,15 +479,18 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
     the user answered or closed while the file was being written is a 409, exactly as `ask_update` in that race,
     and the file just written is deleted; a second attach that took the id meanwhile is a 409 too ("try again"),
     never a renumbering. A create writes the files first and the ask file last; a failure anywhere deletes what it
-    wrote (best effort, logged).
+    wrote (best effort, logged). Each fetch of a create reads at most what the ask's 40 MB still leave (a larger
+    `Content-Length` is refused before reading), so a create never holds more than the 40 MB of its 2 slots.
   - The next `id` counts the current items and every `attached` and `detached` event. `added_at` is when the media
-    file was written (a link card: when it was prepared); the `attached` event's `at` is the ask write.
+    file was written (a link card: when it was prepared); the `attached` event's `at` is the ask write, except on a
+    create, where every `attached` event has the `created` event's time (taken before the media files are written).
   - A replaced poster and a detached item's files are deleted after the ask write, and only when Drive says they
     are this ask's media (appProperties `kind: "media"`, `ask_id`): an ask file names them, and its owner can edit
     it to name anything else, which then stays and is logged. A Drive failure in that cleanup is logged; the call
     has succeeded (the ask is written).
-  - `title` is refused on anything but a link card; `caption` and `source_url` are refused with `poster_for` (they
-    belong to the attachment the poster is for); `poster_for` naming an image → 422, an unknown id → 404.
+  - `title` is refused on anything but a link card, and `source_url` on a link card (its `url` is the original);
+    `caption` and `source_url` are refused with `poster_for` (they belong to the attachment the poster is for);
+    `poster_for` naming an image → 422, an unknown id → 404.
   - The single-tenant bridge writes no `attachments` field into its Drive files (its REST says `[]`); the apps read
     a missing field as `[]`, and a file that has one keeps it like any field the bridge doesn't know.
 - **Bridge notes (12.11.2026, uploads and REST: `server/hosted/uploads.py`, `media_api.py`).** Also resolved there:
@@ -527,8 +530,8 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
     video is downloaded whole (≤ 20 MB, with progress) and played from the local file or blob; if the player fails:
     "Can't play this video here" + Download.
   - Unknown kinds are skipped; nothing from an attachment is ever inserted as HTML. The web app's Content-Security-Policy
-    (`web/vite.config.ts`) needs `blob:` added to `img-src` and a `media-src blob:` (without one, `media-src` falls
-    back to `default-src 'self'`).
+    (`web/vite.config.ts` in the `askhooman-apps` repo) needs `blob:` added to `img-src` and a `media-src blob:`
+    (without one, `media-src` falls back to `default-src 'self'`).
 - **Tests.** Server (fake Drive, fake fetch): each image type by its bytes, a declared type that doesn't match the
   bytes, 5 MB + 1, 4097 px, truncated headers, SVG / GIF / HEIC refused; MP4 with `moov` first and last, 64-bit box
   sizes, no `moov`, 181 s, a `.mov` brand, box loops and absurd sizes; fetch refusals (private and mixed DNS answers,
