@@ -12,11 +12,14 @@ by the bridge with the SSRF-safe client of client metadata documents and set_my_
   chunks one that drips.
 - The Content-Type must be an allowed type, read before the body, and the type read from the bytes
   (media.check_media, which then apply every other check). Its kind sets the cap on what is read: 5 MB for an
-  image, 20 MB for a video; a larger Content-Length is refused before reading. The body lives in one buffer that
-  is handed over, not copied, so a fetch holds about its cap (4 slots × 20 MB), never twice it.
+  image, 20 MB for a video, or less when the caller says how much room is left (`max_bytes`: an ask_create's
+  fetches share its 40 MB, which is what its 2 slots allow for); a larger Content-Length is refused before reading.
+  The body lives in one buffer that is handed over, not copied, so a fetch holds about its cap (4 slots × 20 MB),
+  never twice it.
 - A host IDNA refuses (an empty label, one over 63 chars) is refused before connecting, as the resolver would.
 
-Every refusal is rules.Invalid.
+Every refusal is rules.Invalid; a body over `max_bytes` but within its kind's cap is NoRoom, so the caller can say
+how much its items would take.
 """
 
 import io
@@ -65,6 +68,16 @@ def _too_slow() -> Invalid:
                    f"{CREATE_FETCH_DEADLINE:g} s")
 
 
+class NoRoom(Invalid):
+    """The body is larger than the caller's `max_bytes`, not than its kind's cap. `size` is its Content-Length
+    (`exact`), or what had come when the read stopped (a lower bound)."""
+
+    def __init__(self, size: int, room: int, exact: bool):
+        super().__init__(f"the file at url has {'' if exact else 'at least '}{size} bytes; there is room for {room}")
+        self.size = size
+        self.exact = exact
+
+
 def _too_big(mime: str) -> Invalid:
     if mime == VIDEO_TYPE:
         return Invalid(f"the video at url is larger than {VIDEO_MAX_BYTES // _MB} MB: attach a bigger one as a "
@@ -72,26 +85,34 @@ def _too_big(mime: str) -> Invalid:
     return Invalid(f"the image at url is larger than {IMAGE_MAX_BYTES // _MB} MB")
 
 
-def _read(response: httpx.Response, mime: str, until: float, clock) -> bytes:
-    """The raw body, at most the cap of its kind, in one buffer: BytesIO.getvalue() hands that buffer over instead of
-    copying it, so a fetch never holds two copies of a 20 MB body."""
-    cap = VIDEO_MAX_BYTES if mime == VIDEO_TYPE else IMAGE_MAX_BYTES
+def _over(mime: str, size: int, kind_cap: int, room: int | None, exact: bool) -> Invalid:
+    """A body of (at least) `size` bytes is too big: over its kind's cap (that message wins), else over `room`."""
+    return _too_big(mime) if room is None or size > kind_cap else NoRoom(size, room, exact)
+
+
+def _read(response: httpx.Response, mime: str, until: float, clock, room: int | None) -> bytes:
+    """The raw body, at most the cap of its kind and at most `room` bytes, in one buffer: BytesIO.getvalue() hands
+    that buffer over instead of copying it, so a fetch never holds two copies of a 20 MB body."""
+    kind_cap = VIDEO_MAX_BYTES if mime == VIDEO_TYPE else IMAGE_MAX_BYTES
+    cap = kind_cap if room is None else min(kind_cap, room)
     length = response.headers.get("content-length", "").strip()
     if _LENGTH.fullmatch(length) and int(length) > cap:
-        raise _too_big(mime)
+        raise _over(mime, int(length), kind_cap, room, exact=True)
     body = io.BytesIO()
     for chunk in raw_chunks(response):
         if body.tell() + len(chunk) > cap:
-            raise _too_big(mime)
+            raise _over(mime, body.tell() + len(chunk), kind_cap, room, exact=False)
         body.write(chunk)
         if clock() >= until:
             raise _too_slow()
     return body.getvalue()
 
 
-def fetch_media(http: httpx.Client, url: str, *, until: float, clock=time.monotonic) -> Checked:
+def fetch_media(http: httpx.Client, url: str, *, until: float, max_bytes: int | None = None,
+                clock=time.monotonic) -> Checked:
     """The image or MP4 at `url`, fetched once and checked like any attachment; Invalid otherwise. `until` is when
-    the caller's time for fetching ends, on `clock`; one fetch also stops FETCH_DEADLINE after it starts."""
+    the caller's time for fetching ends, on `clock`; one fetch also stops FETCH_DEADLINE after it starts.
+    `max_bytes`: the most the caller has room for (None: the kind's cap alone); a body over it is NoRoom."""
     if not isinstance(url, str):
         raise Invalid("url must be a string")
     url = url.strip()
@@ -123,7 +144,7 @@ def fetch_media(http: httpx.Client, url: str, *, until: float, clock=time.monoto
                 refuse_encoded(response)
             except ValueError as exc:
                 raise Invalid(f"url: {exc}") from None
-            raw = _read(response, declared, until, clock)
+            raw = _read(response, declared, until, clock, max_bytes)
     except httpx.TimeoutException:
         raise _too_slow() from None
     except httpx.HTTPError:

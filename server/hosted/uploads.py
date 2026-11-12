@@ -23,7 +23,7 @@ from .store import DELETE, UNCHANGED, Store
 UPLOADS = "uploads"  # the store collection
 UPLOAD_PATH = "/api/uploads"
 UPLOAD_PREFIX = "qtu_"
-UPLOAD_FORMAT = re.compile(r"^qtu_[A-Za-z0-9_-]{43}$")  # new_secret(UPLOAD_PREFIX): 32 random bytes
+UPLOAD_FORMAT = re.compile(r"qtu_[A-Za-z0-9_-]{43}")  # new_secret(UPLOAD_PREFIX): 32 random bytes; fullmatch only
 UPLOAD_TTL = 15 * 60  # seconds
 
 
@@ -91,7 +91,7 @@ class UploadGrants:
     def claim(self, token: str) -> UploadGrant | None:
         """Take the token (once: it is deleted in the same transaction that reads it); None if it is malformed,
         unknown, already used or expired (an expired one is deleted all the same)."""
-        if not isinstance(token, str) or not UPLOAD_FORMAT.match(token):
+        if not isinstance(token, str) or not UPLOAD_FORMAT.fullmatch(token):  # `$` would let "…\n" through
             return None
 
         def take(doc):

@@ -241,6 +241,22 @@ def test_a_fetch_holds_one_copy_of_the_body():
     assert peak < VIDEO_MAX_BYTES * 1.5
 
 
+def test_max_bytes_caps_the_read_below_the_kind():
+    """max_bytes (what an ask_create still has room for) lowers the read cap: a Content-Length over it is refused
+    before reading, a body without one is cut where it crosses it; the kind's cap still says its own message."""
+    http, sent = streaming(lambda: iter([b"\x00"]), headers={"Content-Length": str(3 * MB)})
+    assert "room" in invalid(fetch_media, http, URL, until=soon(), max_bytes=2 * MB)
+    assert sent == []  # not one chunk read
+    http, sent = streaming(lambda: (b"\x00" * MB for _ in range(20)))
+    assert "room" in invalid(fetch_media, http, URL, until=soon(), max_bytes=2 * MB + 1)
+    assert sum(sent) == 3 * MB  # the room and the one chunk that crossed it, not the 20 MB
+    http, sent = streaming(lambda: iter([b"\x00"]), headers={"Content-Length": str(VIDEO_MAX_BYTES + 1)})
+    assert "larger than 20 MB" in invalid(fetch_media, http, URL, until=soon(), max_bytes=MB)
+    raw = mp4(64, 48, 1.0)
+    http, _ = streaming(lambda: iter([raw]), headers={"Content-Length": str(len(raw))})
+    assert fetch_media(http, URL, until=soon(), max_bytes=len(raw)).raw == raw  # exactly the room fits
+
+
 def test_slow_drip_past_deadline():
     clock = FakeClock()
 

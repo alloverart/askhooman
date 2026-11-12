@@ -76,9 +76,9 @@ SHOW = ("Show, don't describe: attach the picture or clip your user decides on. 
         "ask_create(attachments=…), so the question appears with its pictures.")
 CREATE_ATTACHMENTS = ("attachments: at most 6, each {url} (an https PNG, JPEG, WebP or MP4 the bridge fetches once), "
                       "{url, link: true, title?} (a card that opens the page, nothing fetched) or {data} (a small "
-                      "image inline), with an optional caption and source_url. A bad item fails the whole call "
-                      "(attachments[2]: …) and nothing is created. A file on your disk: create the ask, then "
-                      "ask_upload.")
+                      "image inline), with an optional caption (and source_url, except on a card). A bad item "
+                      "fails the whole call (attachments[2]: …) and nothing is created. A file on your disk: create "
+                      "the ask, then ask_upload.")
 DOC_LINE = "\n        "  # a new line in a tool docstring, as the description shows it
 
 
@@ -120,7 +120,7 @@ LinkCard = Annotated[bool, Field(description="true: a link card for url (e.g. a 
 CardTitle = Annotated[str, Field(description="A link card's title (≤200 chars; default: the host)")]
 Caption = Annotated[str, Field(description="Shown under it (≤300 chars)")]
 SourceUrl = Annotated[str, Field(description="https link to the original, e.g. its Google Drive link (the apps show "
-                                             "'Open original')")]
+                                             "'Open original'); not on a link card, whose url is the original")]
 PosterFor = Annotated[int, Field(description="0: a new attachment. The id of a video or link card in this ask: this "
                                              "still image becomes its poster (replacing an earlier one)")]
 
