@@ -6,8 +6,9 @@ Configuration: environment variables, see server/config.py.
 
 import logging
 import mimetypes
+from collections.abc import Callable
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Any, Literal
 
 import anyio.to_thread
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -54,7 +55,9 @@ class AskCreate(StrictBody):
     links: list[LinkIn] | None = None
     priority: Literal["normal", "urgent"] | None = None
     ref: str | None = None
-    attachments: list[dict] | None = None  # hosted only (SPEC v5 step 4); the single-tenant bridge refuses any item
+    # Hosted only (SPEC v5 step 4). Any: the single-tenant bridge refuses every non-empty value with one message,
+    # and the hosted one names the bad item (`attachments[2]: …`), so pydantic checks nothing here.
+    attachments: Any = None
 
 
 class AskPatch(StrictBody):
@@ -139,6 +142,10 @@ class RequestGuard:
     upload. Checks the bearer token on /api/* and caps every request body at MAX_BODY.
     (/mcp checks its token itself in MCPEndpoint, also before the body is read.)
 
+    An identity with its own `max_body` (the hosted bridge's upload grant on PUT /api/uploads) is capped at that
+    instead, and must send a Content-Length: its route reads the body itself once it holds a memory slot, so
+    nothing may be buffered here before that (no chunked bodies).
+
     authenticate(path, headers, client, method) -> identity (raising HTTPException) replaces the tokens-file check;
     the hosted bridge uses it (its lookups block on the metadata store, so they run in a worker thread); `client`
     is the ASGI (host, port) of the peer, `method` the HTTP method (DELETE /api/me is the app's, not an agent's)."""
@@ -159,22 +166,29 @@ class RequestGuard:
             await self.app(scope, receive, send)
             return
         headers = Headers(scope=scope)
+        identity = None
         if scope["path"].startswith("/api/"):
             try:
-                scope[IDENTITY_SCOPE_KEY] = await self._identify(scope["path"], headers, scope.get("client"),
-                                                                 scope["method"])
+                identity = await self._identify(scope["path"], headers, scope.get("client"), scope["method"])
             except HTTPException as exc:
                 await _error(exc.status_code, exc.detail, exc.headers)(scope, receive, send)
                 return
-        too_big = _error(413, f"request body too large (max {self.max_body} bytes)")
+            scope[IDENTITY_SCOPE_KEY] = identity
+        own_cap = getattr(identity, "max_body", None)
+        cap = self.max_body if own_cap is None else own_cap
+        too_big = _error(413, f"request body too large (max {cap} bytes)")
         length = headers.get("content-length")
         if length is not None:
             if not length.strip().isdigit():
                 await _error(400, "invalid Content-Length")(scope, receive, send)
                 return
-            if int(length) > self.max_body:
+            if int(length) > cap:
                 await too_big(scope, receive, send)
                 return
+        elif own_cap is not None:
+            await _error(411, "send the body with a Content-Length header (curl --data-binary @FILE does)")(
+                scope, receive, send)
+            return
         elif "chunked" in headers.get("transfer-encoding", "").lower():
             # No length up front: read up to the cap here, then hand the buffered body on.
             messages, size = [], 0
@@ -184,7 +198,7 @@ class RequestGuard:
                 if message["type"] != "http.request":
                     break
                 size += len(message.get("body", b""))
-                if size > self.max_body:
+                if size > cap:
                     await too_big(scope, receive, send)
                     return
                 if not message.get("more_body", False):
@@ -255,7 +269,8 @@ def setup_logging() -> None:
 def add_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AskError)
     async def ask_error_handler(request: Request, exc: AskError):
-        return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
+        # `headers`: an error that tells the client when to come back (the hosted media guard's Retry-After)
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status_code, headers=getattr(exc, "headers", None))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
@@ -267,9 +282,11 @@ def add_error_handlers(app: FastAPI) -> None:
         return JSONResponse({"detail": f"internal server error ({type(exc).__name__})"}, status_code=500)
 
 
-def add_api_routes(app: FastAPI, services) -> None:
+def add_api_routes(app: FastAPI, services, ask_create: Callable[[Identity, dict], dict] | None = None) -> None:
     """REST for asks and tasks (SPEC "REST", v3 "REST"). services(identity) -> (AskService, TaskService):
-    the same two for everyone on the single-tenant bridge, the caller's user's Drive on the hosted one."""
+    the same two for everyone on the single-tenant bridge, the caller's user's Drive on the hosted one.
+    ask_create(identity, data): POST /api/asks instead of the AskService's create (the hosted bridge: a create may
+    carry attachments, hosted/media_api.py)."""
 
     @app.get("/api/me")
     def me(who: Identity = Depends(current_identity)):
@@ -290,7 +307,8 @@ def add_api_routes(app: FastAPI, services) -> None:
 
     @app.post("/api/asks", status_code=201)
     def create_ask(body: AskCreate, who: Identity = Depends(current_identity)):
-        return services(who)[0].create(who, body.model_dump(exclude_unset=True))
+        data = body.model_dump(exclude_unset=True)
+        return ask_create(who, data) if ask_create is not None else services(who)[0].create(who, data)
 
     @app.patch("/api/asks/{ask_id}")
     def update_ask(ask_id: int, body: AskPatch, who: Identity = Depends(current_identity)):

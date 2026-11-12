@@ -124,16 +124,23 @@ def prepare(item, http: httpx.Client | None, until: float) -> Item:
     return Item("video" if checked.mime == VIDEO_TYPE else "image", checked, None, None, caption, source_url)
 
 
-def prepare_all(items, http: httpx.Client | None, until: float | None = None) -> list[Item]:
-    """The `attachments` of one ask_create: at most ATTACH_MAX items, prepared in order with one fetch budget
-    (CREATE_FETCH_DEADLINE from now, or `until`). A bad item fails the call as `attachments[i]: …` before anything
-    is written; the bytes are added up as they come, and the items after the ASK_MEDIA_MAX cap are not fetched."""
+def attachment_list(items) -> list:
+    """The `attachments` of one ask_create as a list of at most ATTACH_MAX items, before any item is looked at
+    (None: none); Invalid otherwise."""
     if items is None:
         return []
     if not isinstance(items, list):
         raise Invalid("attachments must be a list of objects")
     if len(items) > ATTACH_MAX:
         raise Invalid(f"attachments: at most {ATTACH_MAX} items, got {len(items)}")
+    return items
+
+
+def prepare_all(items, http: httpx.Client | None, until: float | None = None) -> list[Item]:
+    """The `attachments` of one ask_create: at most ATTACH_MAX items, prepared in order with one fetch budget
+    (CREATE_FETCH_DEADLINE from now, or `until`). A bad item fails the call as `attachments[i]: …` before anything
+    is written; the bytes are added up as they come, and the items after the ASK_MEDIA_MAX cap are not fetched."""
+    items = attachment_list(items)
     until = time.monotonic() + CREATE_FETCH_DEADLINE if until is None else until
     prepared: list[Item] = []
     total = 0

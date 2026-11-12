@@ -10,6 +10,7 @@ hosted bridge keeps outside the users' Drives goes through this interface (accou
   codes/{sha256(code)}      authorization codes, short-lived
   tokens/{sha256(token)}    access and refresh tokens (only hashes are stored)
   keys/{sha256(key)}        agent keys
+  uploads/{sha256(token)}   one-time upload tokens for pictures and video in asks (uploads.py), 15 minutes
 
 Documents are plain dicts of JSON-like values. `expires_at` (epoch seconds) is checked by the readers; Firestore
 can also delete such documents itself through a TTL policy on `expire_time` (see deploy/hosted/README.md).

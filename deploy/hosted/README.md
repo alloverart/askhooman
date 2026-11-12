@@ -40,7 +40,7 @@ gcloud services enable run.googleapis.com firestore.googleapis.com secretmanager
 
 # 2. Firestore in Native mode, and TTL for documents that expire (the server writes the expire_time field)
 gcloud firestore databases create --location=$REGION --type=firestore-native
-for c in requests codes tokens families clients; do
+for c in requests codes tokens families clients uploads; do
   gcloud firestore fields ttls update expire_time --collection-group=$c --enable-ttl --async
 done
 
