@@ -3,7 +3,10 @@ one user's Drive, ids that are never reused, the per-ask caps, posters, owner an
 after a failure half-way or an app write in flight. Direct AskMedia calls against FakeGoogle's Drive; the single-tenant
 bridge only answers `attachments: []`."""
 
+import hashlib
+import json
 import logging
+import re
 import time
 
 import httpx
@@ -28,7 +31,7 @@ from server.tokens import Identity
 from .conftest import ALLEN as ALLEN_TOKEN
 from .conftest import auth
 from .fake_drive import app_action
-from .hosted_support import DENIS_SUB, connect, mcp, register, tool_result
+from .hosted_support import DENIS_SUB, PUBLIC, connect, mcp, register, tool_error, tool_result
 from .media_samples import box, data_url, jpeg, mp4, png, png_of_size
 
 ALLEN = Identity("agent", "allen")
@@ -565,6 +568,265 @@ def test_plan_attach_and_detach_rules():
     assert detach == Change({"attachments": [], "updated_at": "later"}, "detached", {"attachment": picture}, "later")
     with pytest.raises(NotFound):
         plan_detach(ALLEN, 4, lambda: {**ask, "attachments": [picture]}, "later")
+
+
+# ---------- MCP: ask_create(attachments=…), ask_attach, ask_upload, ask_detach ----------
+
+SHOW = ("Show, don't describe: attach the picture or clip your user decides on. The apps number attachments 1, 2, 3 in "
+        "order, so options can say 'Take #2'. A file on Google Drive your user can open: link=true with a poster. A "
+        "file you can read and they can't: upload its bytes and set source_url to the original. Prefer "
+        "ask_create(attachments=…), so the question appears with its pictures.")
+IMAGE_KEYS = ["id", "kind", "mime", "width", "height", "bytes", "caption", "source_url", "file_id", "added_at"]
+VIDEO_KEYS = ["id", "kind", "mime", "width", "height", "duration_ms", "bytes", "caption", "source_url", "file_id",
+              "poster", "added_at"]
+LINK_KEYS = ["id", "kind", "url", "title", "provider", "caption", "poster", "added_at"]
+BUSY = "busy, try again in a few seconds"
+
+
+def failure(hosted, token: str, name: str, arguments: dict) -> str:
+    """A tool error's own text: the SDK puts "Error executing tool <name>: " in front of every one."""
+    error = tool_error(mcp(hosted, token, name, arguments))
+    prefix = f"Error executing tool {name}: "
+    assert error.startswith(prefix), error
+    return error.removeprefix(prefix)
+
+
+def tools_list(hosted, token: str) -> dict[str, dict]:
+    response = hosted.post("/mcp", headers={"Authorization": f"Bearer {token}", "MCP-Protocol-Version": "2025-06-18",
+                                            "Accept": "application/json, text/event-stream"},
+                           json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert response.status_code == 200, response.text
+    return {t["name"]: t for t in response.json()["result"]["tools"]}
+
+
+def metadata_only(asks: list[dict]) -> None:
+    """What the read tools show of attachments: the stored shapes, never the bytes or a link to them."""
+    keys = {"image": IMAGE_KEYS, "video": VIDEO_KEYS, "link": LINK_KEYS}
+    for ask in asks:
+        for item in ask["attachments"]:
+            assert list(item) == keys[item["kind"]], item
+    text = json.dumps(asks)
+    assert "data:" not in text and "base64" not in text and "alt=media" not in text and "googleapis" not in text
+
+
+def test_mcp_create_with_attachments(hosted, google):
+    _, token = service(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    raw = png(40, 30)
+    google.publish(PIC, raw, headers={"Content-Type": "image/png"})
+    ask = tool_result(mcp(hosted, token, "ask_create", {
+        "title": "Which one?", "options": ["Take #1", "Take #2"],
+        "attachments": [{"url": PIC, "caption": "The cat"}, {"url": DRIVE_LINK, "link": True, "title": "The deck"}]}))
+    file = drive.file("media-1-1.png")
+    assert file["content"] == raw and file["appProperties"] == MEDIA_PROPS
+    assert ask["attachments"] == [
+        {"id": 1, "kind": "image", "mime": "image/png", "width": 40, "height": 30, "bytes": len(raw),
+         "caption": "The cat", "source_url": None, "file_id": file["id"],
+         "added_at": ask["attachments"][0]["added_at"]},
+        {"id": 2, "kind": "link", "url": DRIVE_LINK, "title": "The deck", "provider": "drive", "caption": None,
+         "poster": None, "added_at": ask["attachments"][1]["added_at"]}]
+    assert [e["kind"] for e in drive.doc(1)["events"]] == ["created", "attached", "attached"]
+    # the read tools: metadata only
+    mine = tool_result(mcp(hosted, token, "asks_mine"))["asks"]
+    listed = tool_result(mcp(hosted, token, "asks_list"))["asks"]
+    got = tool_result(mcp(hosted, token, "ask_get", {"id": 1}))
+    assert mine[0]["attachments"] == listed[0]["attachments"] == got["attachments"] == ask["attachments"]
+    assert [e["payload"] for e in got["events"][1:]] == [{"attachment": a} for a in ask["attachments"]]
+    metadata_only(mine + listed + [got])
+    # without attachments, or with [], ask_create is the plain one
+    assert tool_result(mcp(hosted, token, "ask_create", {"title": "Plain?"}))["attachments"] == []
+    assert tool_result(mcp(hosted, token, "ask_create", {"title": "Empty?", "attachments": []}))["attachments"] == []
+    assert media_files(drive) == ["media-1-1.png"]
+
+
+def test_mcp_bad_item_creates_nothing(hosted, google):
+    _, token = service(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    picture = {"data": data_url("image/png", png(8, 8))}
+    google.publish(PIC, png(10, 10), headers={"Content-Type": "image/png"})
+    for items, words in (
+            ([{"url": PIC}, {"url": "http://pics.example/cat.png"}], "invalid: attachments[1]: url must use https"),
+            ([picture, picture, {"url": DRIVE_LINK}], "invalid: attachments[2]: AskHooman can't open files in Google "
+                                                       "Drive: download it and use ask_upload, or attach the link "
+                                                       "with link=true"),
+            ([picture, {"data": "data:image/gif;base64,R0lGODlh"}], "invalid: attachments[1]: data must be a "
+                                                                    "data:image/png"),
+            ([picture, {"url": PIC, "data": picture["data"]}], "invalid: attachments[1]: exactly one of url and data"),
+            ([picture, {"data": picture["data"], "title": "x"}], "invalid: attachments[1]: title is for link cards"),
+            ([picture] * 7, "invalid: attachments: at most 6 items, got 7")):
+        error = failure(hosted, token, "ask_create", {"title": "Which one?", "attachments": items})
+        assert error.startswith(words), error
+    # an item with a field the schema doesn't have is refused by the schema, naming it
+    assert "colour" in failure(hosted, token, "ask_create", {"title": "Which one?",
+                                                            "attachments": [{**picture, "colour": "red"}]})
+    # a field error comes first: nothing is fetched for a create that can't happen
+    assert failure(hosted, token, "ask_create", {"title": " ", "attachments": [{"url": CLIP}]}).startswith(
+        "invalid: title")
+    assert tool_result(mcp(hosted, token, "asks_mine", {"status": "all"}))["asks"] == []
+    assert [f["name"] for f in drive.files.values()] == []
+
+
+def test_mcp_upload_curl(hosted, google):
+    _, token = service(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Which one?"}))
+    raw = jpeg(64, 48)
+    issued = tool_result(mcp(hosted, token, "ask_upload", {"id": 1, "mime": "image/jpeg", "bytes": len(raw),
+                                                           "caption": "From my disk", "source_url": DRIVE_LINK}))
+    secret = issued["upload"]["headers"]["Authorization"].removeprefix("Bearer ")
+    assert re.fullmatch(r"qtu_[A-Za-z0-9_-]{43}", secret)
+    assert list(hosted.store.all("uploads")) == [hashlib.sha256(secret.encode()).hexdigest()]
+    assert issued == {"upload": {"url": f"{PUBLIC}/api/uploads", "method": "PUT",
+                                 "headers": {"Authorization": f"Bearer {secret}", "Content-Type": "image/jpeg"},
+                                 "expires_at": issued["upload"]["expires_at"]},
+                      "curl": f"curl -sS --fail-with-body -X PUT -H 'Authorization: Bearer {secret}' "
+                              f"-H 'Content-Type: image/jpeg' --data-binary @FILE {PUBLIC}/api/uploads"}
+    assert media_files(drive) == []
+    # what the curl line sends
+    sent = hosted.put("/api/uploads", content=raw, headers=issued["upload"]["headers"])
+    assert sent.status_code == 201, sent.text
+    attachment = tool_result(mcp(hosted, token, "asks_mine"))["asks"][0]["attachments"][0]
+    assert attachment == sent.json()["attachment"]
+    assert (attachment["caption"], attachment["source_url"], attachment["mime"]) == ("From my disk", DRIVE_LINK,
+                                                                                     "image/jpeg")
+    assert drive.file("media-1-1.jpg")["content"] == raw
+    # refusals come back as tool errors, before any token exists
+    for arguments, words in (({"mime": "image/gif", "bytes": 10}, "invalid: mime must be image/png, image/jpeg, "
+                                                                  "image/webp or video/mp4: convert to PNG, JPEG or "
+                                                                  "WebP; send motion as MP4"),
+                             ({"mime": "video/mp4", "bytes": VIDEO_MAX_BYTES + 1}, "invalid: a video may be at most"),
+                             ({"mime": "image/png", "bytes": 10, "poster_for": 1}, "invalid: attachment #1 is an "
+                                                                                   "image: a poster is a still"),
+                             ({"mime": "image/png", "bytes": 0}, "invalid: bytes must be the file's size")):
+        error = failure(hosted, token, "ask_upload", {"id": 1, **arguments})
+        assert error.startswith(words), error
+    assert failure(hosted, token, "ask_upload", {"id": 9, "mime": "image/png", "bytes": 10}).startswith("not found: ")
+    assert hosted.store.all("uploads") == {}
+
+
+def test_mcp_attach_and_detach(hosted, google):
+    _, token = service(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Which one?"}))
+    clip = mp4(320, 240, 3)
+    google.publish(CLIP, clip, headers={"Content-Type": "video/mp4"})
+    by_url = tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "url": CLIP, "caption": "The clip"}))
+    assert [(a["id"], a["kind"], a["caption"]) for a in by_url["attachments"]] == [(1, "video", "The clip")]
+    by_data = tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "data": data_url("image/png", png(8, 8))}))
+    assert [a["kind"] for a in by_data["attachments"]] == ["video", "image"]
+    card = tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "url": DRIVE_LINK, "link": True}))
+    assert (card["attachments"][2]["title"], card["attachments"][2]["provider"]) == ("drive.google.com", "drive")
+    still = png(16, 9)
+    poster = tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "data": data_url("image/png", still),
+                                                           "poster_for": 3}))
+    assert poster["attachments"][2]["poster"]["bytes"] == len(still) and len(poster["attachments"]) == 3
+    assert media_files(drive) == ["media-1-1.mp4", "media-1-2.png", "media-1-3-poster.png"]
+    metadata_only([tool_result(mcp(hosted, token, "ask_get", {"id": 1}))])
+    assert failure(hosted, token, "ask_attach", {"id": 1}) == "invalid: exactly one of url and data is needed"
+    assert failure(hosted, token, "ask_attach", {"id": 1, "data": data_url("image/png", still), "title": "x"}) \
+        .startswith("invalid: title is for link cards")
+
+    detached = tool_result(mcp(hosted, token, "ask_detach", {"id": 1, "attachment_id": 3}))
+    assert [a["id"] for a in detached["attachments"]] == [1, 2]
+    assert media_files(drive) == ["media-1-1.mp4", "media-1-2.png"]
+    assert failure(hosted, token, "ask_detach", {"id": 1, "attachment_id": 3}) == \
+        "not found: ask #1 has no attachment #3"
+    # ids are never reused
+    again = tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "url": DRIVE_LINK, "link": True}))
+    assert [a["id"] for a in again["attachments"]] == [1, 2, 4]
+
+    # the owner agent only, open asks only
+    feynman = connect(hosted, google, register(hosted)["client_id"], agent="Feynman")["access_token"]
+    calls = (("ask_attach", {"id": 1, "url": DRIVE_LINK, "link": True}),
+             ("ask_upload", {"id": 1, "mime": "image/png", "bytes": 10}),
+             ("ask_detach", {"id": 1, "attachment_id": 1}))
+    for name, arguments in calls:
+        assert failure(hosted, feynman, name, arguments) == \
+            "forbidden: only the agent who created ask #1 (allen) can edit it", name
+    app_action(drive, 1, "answered", answer="The clip")
+    for name, arguments in calls:
+        assert failure(hosted, token, name, arguments) == \
+            "conflict: ask #1 is answered; only open asks can be edited", name
+    assert media_files(drive) == ["media-1-1.mp4", "media-1-2.png"] and hosted.store.all("uploads") == {}
+
+
+def test_rate_limit(hosted, google):
+    """60 attachment calls an hour per agent (each item of a create, each attach, upload request and detach), one
+    budget with the REST routes: the 61st is a tool error."""
+    _, token = service(hosted, google)
+    picture = {"data": data_url("image/png", png(8, 8))}
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Which one?", "attachments": [picture, picture]}))  # 2
+    tool_result(mcp(hosted, token, "ask_attach", {"id": 1, **picture}))  # 3
+    tool_result(mcp(hosted, token, "ask_upload", {"id": 1, "mime": "image/png", "bytes": 10}))  # 4
+    assert hosted.post("/api/asks/1/attachments", json=picture,
+                       headers={"Authorization": f"Bearer {token}"}).status_code == 201  # 5: REST counts too
+    for _ in range(55):  # 6…60: a refused detach is still a call
+        assert failure(hosted, token, "ask_detach", {"id": 1, "attachment_id": 99}).startswith("not found: ")
+    for name, arguments in (("ask_attach", {"id": 1, **picture}),
+                            ("ask_upload", {"id": 1, "mime": "image/png", "bytes": 10}),
+                            ("ask_detach", {"id": 1, "attachment_id": 1}),
+                            ("ask_create", {"title": "More?", "attachments": [picture]})):
+        assert failure(hosted, token, name, arguments) == (
+            "rate limited: too many attachment calls: at most 60 an hour per agent (each attach, upload, detach and "
+            "each item of an ask_create counts)"), name
+    assert len(tool_result(mcp(hosted, token, "ask_get", {"id": 1}))["attachments"]) == 4
+    # a plain ask is not an attachment call
+    assert tool_result(mcp(hosted, token, "ask_create", {"title": "Plain?"}))["id"] == 2
+    assert hosted.app.state.media.guard.slots.in_use == 0
+
+
+def test_busy(hosted, google):
+    """At most 4 slots of media in flight per instance, shared with the REST routes: a call that would fetch gets
+    the busy text alone (no "unavailable: " in front); a call that holds no media goes through."""
+    _, token = service(hosted, google)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Which one?"}))
+    google.publish(PIC, png(10, 10), headers={"Content-Type": "image/png"})
+    slots = hosted.app.state.media.guard.slots
+    assert slots.take(4)
+    assert failure(hosted, token, "ask_attach", {"id": 1, "url": PIC}) == BUSY
+    assert failure(hosted, token, "ask_create", {"title": "Pics?", "attachments": [{"url": PIC}]}) == BUSY
+    assert tool_result(mcp(hosted, token, "asks_mine"))["counts"]["open"] == 1  # the busy create made nothing
+    assert tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "data": data_url("image/png", png(8, 8))}))
+    assert tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "url": DRIVE_LINK, "link": True}))
+    assert tool_result(mcp(hosted, token, "ask_upload", {"id": 1, "mime": "image/png", "bytes": 10}))
+    assert tool_result(mcp(hosted, token, "ask_detach", {"id": 1, "attachment_id": 1}))
+    slots.give(1)  # a create that fetches needs 2 slots, an attach by url 1
+    assert failure(hosted, token, "ask_create", {"title": "Pics?", "attachments": [{"url": PIC}]}) == BUSY
+    assert tool_result(mcp(hosted, token, "ask_attach", {"id": 1, "url": PIC}))
+    slots.give(1)
+    assert tool_result(mcp(hosted, token, "ask_create", {"title": "Pics?", "attachments": [{"url": PIC}]}))
+    slots.give(2)
+    assert slots.in_use == 0
+
+
+def test_docstring_sentence(hosted, google):
+    _, token = service(hosted, google)
+    tools = tools_list(hosted, token)
+    for name in ("ask_create", "ask_attach", "ask_upload"):
+        assert SHOW in tools[name]["description"], name
+    assert "attachments[2]: …" in tools["ask_create"]["description"]
+    assert "ask_update options" in tools["ask_detach"]["description"]
+    schema = tools["ask_create"]["inputSchema"]
+    attachments = schema["properties"]["attachments"]
+    assert attachments["type"] == "array" and attachments["default"] == []
+    item = schema["$defs"][attachments["items"]["$ref"].rsplit("/", 1)[1]]
+    assert set(item["properties"]) == {"url", "data", "link", "title", "caption", "source_url"}
+    assert item["additionalProperties"] is False and "required" not in item
+    assert set(tools["ask_attach"]["inputSchema"]["properties"]) == {
+        "id", "url", "data", "link", "title", "caption", "source_url", "poster_for"}
+    assert tools["ask_attach"]["inputSchema"]["required"] == ["id"]
+    assert set(tools["ask_upload"]["inputSchema"]["properties"]) == {
+        "id", "mime", "bytes", "caption", "source_url", "poster_for"}
+    assert tools["ask_upload"]["inputSchema"]["required"] == ["id", "mime", "bytes"]
+    assert tools["ask_detach"]["inputSchema"]["required"] == ["id", "attachment_id"]
+    for name in ("ask_attach", "ask_upload", "ask_detach"):
+        hints = tools[name]["annotations"]
+        assert tools[name]["title"] == hints["title"] and hints["readOnlyHint"] is False, name
+    # detach deletes the item's files from Drive: the one destructive tool
+    assert [name for name, t in tools.items() if t["annotations"]["destructiveHint"]] == ["ask_detach"]
+    # the house rules and /llms.txt say it too
+    assert "<b>Show, don't describe.</b>" in hosted.get("/agents").text
+    assert "ask_attach, ask_upload, ask_detach" in hosted.get("/llms.txt").text
 
 
 # ---------- the single-tenant bridge ----------

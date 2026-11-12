@@ -12,7 +12,7 @@ from typing import Annotated, Any, Awaitable, Callable, Literal
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, TypedDict
 
 from .core import AskError, AskService
@@ -69,6 +69,19 @@ WORDS = {
 }
 
 
+# Pictures and video in asks (hosted; SPEC v5 step 4, "MCP"): what ask_create, ask_attach and ask_upload teach.
+SHOW = ("Show, don't describe: attach the picture or clip your user decides on. The apps number attachments 1, 2, 3 in "
+        "order, so options can say 'Take #2'. A file on Google Drive your user can open: link=true with a poster. A "
+        "file you can read and they can't: upload its bytes and set source_url to the original. Prefer "
+        "ask_create(attachments=…), so the question appears with its pictures.")
+CREATE_ATTACHMENTS = ("attachments: at most 6, each {url} (an https PNG, JPEG, WebP or MP4 the bridge fetches once), "
+                      "{url, link: true, title?} (a card that opens the page, nothing fetched) or {data} (a small "
+                      "image inline), with an optional caption and source_url. A bad item fails the whole call "
+                      "(attachments[2]: …) and nothing is created. A file on your disk: create the ask, then "
+                      "ask_upload.")
+DOC_LINE = "\n        "  # a new line in a tool docstring, as the description shows it
+
+
 class Link(TypedDict):
     url: str
     title: NotRequired[str]
@@ -97,6 +110,38 @@ TaskStatusFilter = Annotated[str, Field(description="open (active + waiting), ac
 TaskResolution = Annotated[str, Field(description="One line: the result, or why it is no longer needed")]
 AnswerText = Annotated[str, Field(description="What you did about the reply, or why the task stays open; ≤2000 chars")]
 
+MediaUrl = Annotated[str, Field(description="https URL of a PNG, JPEG, WebP or MP4 the bridge fetches once (image "
+                                            "≤5 MB, video ≤20 MB and ≤3 min; not a Google Drive link: use link=true "
+                                            "or ask_upload); with link=true, the page the card opens (never fetched)")]
+MediaData = Annotated[str, Field(description="A small image inline: data:image/png|jpeg|webp;base64,… (≤180 KB "
+                                             "decoded); instead of url")]
+LinkCard = Annotated[bool, Field(description="true: a link card for url (e.g. a Google Drive file your user can "
+                                             "open); nothing is fetched")]
+CardTitle = Annotated[str, Field(description="A link card's title (≤200 chars; default: the host)")]
+Caption = Annotated[str, Field(description="Shown under it (≤300 chars)")]
+SourceUrl = Annotated[str, Field(description="https link to the original, e.g. its Google Drive link (the apps show "
+                                             "'Open original')")]
+PosterFor = Annotated[int, Field(description="0: a new attachment. The id of a video or link card in this ask: this "
+                                             "still image becomes its poster (replacing an earlier one)")]
+
+
+class AttachmentIn(BaseModel):
+    """One picture or clip (url or data), or a link card (url with link=true)."""
+    # The values are checked by hosted.attachments.prepare, which reads "" as absent.
+    model_config = ConfigDict(extra="forbid")
+
+    url: MediaUrl = ""
+    data: MediaData = ""
+    link: LinkCard = False
+    title: CardTitle = ""
+    caption: Caption = ""
+    source_url: SourceUrl = ""
+
+
+Attachments = Annotated[list[AttachmentIn], Field(
+    description="Up to 6 pictures, clips or link cards, numbered 1, 2, 3 in this order in your user's app")]
+
+
 def caller(ctx: Context) -> Identity:
     request = ctx.request_context.request
     identity = request.scope.get(IDENTITY_SCOPE_KEY) if request is not None else None
@@ -105,12 +150,18 @@ def caller(ctx: Context) -> Identity:
     return identity
 
 
+def tool_message(exc: AskError) -> str:
+    """"label: message"; an error without a label is its message alone (media_api.Busy: "busy, try again in a few
+    seconds")."""
+    return f"{exc.label}: {exc}" if exc.label else str(exc)
+
+
 def run(action, *args):
     """Turn domain errors into MCP tool errors (is_error results) with a readable message."""
     try:
         return action(*args)
     except AskError as exc:
-        raise ToolError(f"{exc.label}: {exc}") from None
+        raise ToolError(tool_message(exc)) from None
     except Exception as exc:
         # Otherwise the SDK reports only "Error executing tool ..." (e.g. for "database is locked").
         log.exception("tool %s failed", getattr(action, "__name__", action))
@@ -123,7 +174,7 @@ def run_hosted(action, *args):
     try:
         return action(*args)
     except AskError as exc:
-        raise ToolError(f"{exc.label}: {exc}") from None
+        raise ToolError(tool_message(exc)) from None
     except Exception as exc:
         log.exception("tool %s failed", getattr(action, "__name__", action))
         raise ToolError(f"server error ({type(exc).__name__}); try again later") from None
@@ -155,17 +206,33 @@ class WebhookTool:
     test: Callable[[Identity], dict]
 
 
+@dataclass(frozen=True)
+class MediaTool:
+    """Pictures and video in asks (hosted only: the files live in the user's Drive), each call inside the bridge's one
+    media guard, which the REST routes share (hosted.media_api.MediaService). create(identity, ask fields +
+    attachments) -> ask; attach(identity, ask_id, {url, data, link, title, caption, source_url}, poster_for) -> ask;
+    upload(identity, ask_id, mime, bytes, caption, source_url, poster_for) -> {upload, curl};
+    detach(identity, ask_id, attachment_id) -> ask."""
+    create: Callable[[Identity, dict], dict]
+    attach: Callable[[Identity, int, dict, int], dict]
+    upload: Callable[[Identity, int, str, int, str, str, int], dict]
+    detach: Callable[[Identity, int, int], dict]
+
+
 def build_mcp(service: AskService | None = None, tasks: TaskService | None = None, *,
               services: Services | None = None, hosted: bool = False, look: LookTool | None = None,
-              feed: FeedTool | None = None, webhook: WebhookTool | None = None) -> MCPServer:
+              feed: FeedTool | None = None, webhook: WebhookTool | None = None,
+              media: MediaTool | None = None) -> MCPServer:
     """The MCP server. Single-tenant: one AskService/TaskService for everyone. Hosted: `services(identity)`
     returns the services of the caller's user (their Drive), the wording speaks of "your user" instead of
     "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app).
-    `look`: adds set_my_look (hosted). `feed`: adds ask_wait, `webhook`: set_my_webhook and test_my_webhook (hosted)."""
+    `look`: adds set_my_look (hosted). `feed`: adds ask_wait, `webhook`: set_my_webhook and test_my_webhook (hosted).
+    `media`: ask_create takes `attachments`, and ask_attach, ask_upload and ask_detach are added (hosted)."""
     if services is None:
         def services(who: Identity):
             return service, tasks
-    words = WORDS[hosted]
+    words = {**WORDS[hosted], "show": SHOW,
+             "create_media": DOC_LINE + SHOW + DOC_LINE + CREATE_ATTACHMENTS if media is not None else ""}
     call = run_hosted if hosted else run
     # subscriptions=False: nothing is ever pushed (the tool list is fixed), so no `subscriptions/listen` —
     # the 2026-07-28 replacement for the GET stream both bridges answer 405. Served, it makes server/discover
@@ -176,16 +243,17 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     else:
         mcp = MCPServer("asks", version="0.1.0", instructions=INSTRUCTIONS, subscriptions=False)
 
-    def tool(title: str, *, read_only: bool = False):
-        """mcp.tool with the docstring's ${...} words filled in for this mode, a title and explicit hints: the
-        Connectors Directory wants both on every tool, and Claude reads them for auto-permissions (read-only tools
-        run without asking). No tool is destructive: nothing is ever deleted, every change stays in the record's
-        history, and a closed ask or a finished task comes back with reopen."""
-        annotations = ToolAnnotations(title=title, readOnlyHint=read_only, destructiveHint=False,
+    def tool(title: str, *, read_only: bool = False, destructive: bool = False, doc: str | None = None):
+        """mcp.tool with the docstring (or `doc`) and its ${...} words filled in for this mode, a title and explicit
+        hints: the Connectors Directory wants both on every tool, and Claude reads them for auto-permissions
+        (read-only tools run without asking). Only ask_detach is destructive (it deletes the attachment's files from
+        Drive); otherwise nothing is ever deleted, every change stays in the record's history, and a closed ask or a
+        finished task comes back with reopen."""
+        annotations = ToolAnnotations(title=title, readOnlyHint=read_only, destructiveHint=destructive,
                                       idempotentHint=read_only, openWorldHint=False)
 
         def register(fn):
-            fn.__doc__ = Template(fn.__doc__).substitute(words)
+            fn.__doc__ = Template(doc if doc is not None else fn.__doc__).substitute(words)
             return mcp.tool(title=title, annotations=annotations)(fn)
         return register
 
@@ -198,18 +266,8 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     Title = Annotated[str, Field(  # noqa: N806
         description=f"One decision, phrased as a question {words['human']} can answer in one tap (≤200 chars)")]
 
-    # The [] defaults are never mutated; they make the published schema say "default: []".
-    @tool("Ask a question")
-    def ask_create(
-        title: Title,
-        ctx: Context,
-        context: ContextText = "",
-        options: Options = [],
-        links: Links = [],
-        priority: Priority = "normal",
-        ref: Ref = "",
-    ) -> dict[str, Any]:
-        """Put a question on ${humans} decision list. Returns the created ask.
+    # One docstring for both forms of ask_create; ${create_media} teaches attachments where they exist.
+    ask_create_doc = """Put a question on ${humans} decision list. Returns the created ask.
 
         Write good asks:
         - One decision per ask. Two questions = two asks.
@@ -217,12 +275,42 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         - context: 2–5 short lines with what ${they_need} to decide, plus refs (${refs}).
         - options: the likely answers (${option_examples}); ${type_own}.
         - Before creating, check asks_mine: don't duplicate an existing open ask — ask_update it instead.
-        ${Humans} answer arrives in asks_mine${ping}; act on it, then ask_close.
+        ${Humans} answer arrives in asks_mine${ping}; act on it, then ask_close.${create_media}
         """
-        data = {"title": title, "context": context, "options": options, "links": links,
-                "priority": priority, "ref": ref}
-        who = caller(ctx)
-        return call(ask_service(who).create, who, data)
+
+    def ask_fields(title, context, options, links, priority, ref) -> dict:
+        return {"title": title, "context": context, "options": options, "links": links, "priority": priority,
+                "ref": ref}
+
+    # The [] defaults are never mutated; they make the published schema say "default: []".
+    if media is None:
+        @tool("Ask a question", doc=ask_create_doc)
+        def ask_create(
+            title: Title,
+            ctx: Context,
+            context: ContextText = "",
+            options: Options = [],
+            links: Links = [],
+            priority: Priority = "normal",
+            ref: Ref = "",
+        ) -> dict[str, Any]:
+            who = caller(ctx)
+            return call(ask_service(who).create, who, ask_fields(title, context, options, links, priority, ref))
+    else:
+        @tool("Ask a question", doc=ask_create_doc)
+        def ask_create(
+            title: Title,
+            ctx: Context,
+            context: ContextText = "",
+            options: Options = [],
+            links: Links = [],
+            priority: Priority = "normal",
+            ref: Ref = "",
+            attachments: Attachments = [],
+        ) -> dict[str, Any]:
+            who = caller(ctx)
+            data = ask_fields(title, context, options, links, priority, ref)
+            return call(media.create, who, {**data, "attachments": attachments})
 
     @tool("My questions and answers", read_only=True)
     def asks_mine(ctx: Context, status: Status = "active") -> dict[str, Any]:
@@ -385,6 +473,63 @@ ${mine_tasks_note}"""
         """Reopen your done or dropped task: back to active (the old resolution stays in its history)."""
         who = caller(ctx)
         return call(task_service(who).reopen, who, id)
+
+    # ---------- pictures and video in asks (hosted) ----------
+
+    if media is not None:
+        Mime = Annotated[str, Field(  # noqa: N806
+            description="The file's type: image/png, image/jpeg, image/webp or video/mp4")]
+        Size = Annotated[int, Field(  # noqa: N806
+            description="The file's exact size in bytes (wc -c < FILE): an image ≤5 MB, a poster ≤1 MB, "
+                        "a video ≤20 MB")]
+        AttachmentId = Annotated[int, Field(  # noqa: N806
+            description="The attachment's id in the ask (its `id`; ids are never reused)")]
+
+        @tool("Attach to my question")
+        def ask_attach(
+            id: int,
+            ctx: Context,
+            url: MediaUrl = "",
+            data: MediaData = "",
+            link: LinkCard = False,
+            title: CardTitle = "",
+            caption: Caption = "",
+            source_url: SourceUrl = "",
+            poster_for: PosterFor = 0,
+        ) -> dict[str, Any]:
+            """Add a picture, a clip or a link card to your own open ask. Returns the ask.
+            ${show}
+            Exactly one of url and data. url: fetched once by the bridge, or with link=true a card that opens the page
+            outside the app (nothing fetched). poster_for: the image becomes that video's or link card's poster."""
+            item = {"url": url, "data": data, "link": link, "title": title, "caption": caption,
+                    "source_url": source_url}
+            who = caller(ctx)
+            return call(media.attach, who, id, item, poster_for)
+
+        @tool("Upload a file to my question")
+        def ask_upload(
+            id: int,
+            mime: Mime,
+            bytes: Size,
+            ctx: Context,
+            caption: Caption = "",
+            source_url: SourceUrl = "",
+            poster_for: PosterFor = 0,
+        ) -> dict[str, Any]:
+            """For a file on your disk: a one-time upload to your own open ask. Returns {upload: {url, method: "PUT",
+            headers, expires_at}, curl}: run curl in your shell with @FILE replaced by the file's path. It works once,
+            for 15 minutes, for exactly `bytes` bytes of `mime`, and answers {ask_id, attachment}.
+            ${show}"""
+            who = caller(ctx)
+            return call(media.upload, who, id, mime, bytes, caption, source_url, poster_for)
+
+        @tool("Detach from my question", destructive=True)
+        def ask_detach(id: int, attachment_id: AttachmentId, ctx: Context) -> dict[str, Any]:
+            """Remove an attachment (with its poster) from your own open ask: its files are deleted from ${humans}
+            Drive. The apps number the rest 1, 2, 3 in order again, so ask_update options that name a number.
+            Returns the ask."""
+            who = caller(ctx)
+            return call(media.detach, who, id, attachment_id)
 
     # ---------- waiting for the user (hosted) ----------
 

@@ -27,7 +27,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from ..app import RequestGuard, add_api_routes, add_error_handlers, setup_logging
-from ..mcp_tools import IDENTITY_SCOPE_KEY, FeedTool, LookTool, WebhookTool, build_mcp
+from ..mcp_tools import IDENTITY_SCOPE_KEY, FeedTool, LookTool, MediaTool, WebhookTool, build_mcp
 from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
@@ -183,7 +183,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     own_webhook = WebhookTool(
         lambda who, url, rotate: set_own_webhook(accounts, limiter, who, url, rotate),
         lambda who: ping_own_webhook(accounts, webhooks, limiter, who))
-    mcp = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user), webhook=own_webhook)
+    mcp = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user), webhook=own_webhook,
+                    media=MediaTool(media.create, media.attach, media.upload, media.detach))
     mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,
