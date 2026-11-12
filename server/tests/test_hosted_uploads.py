@@ -9,9 +9,11 @@ import re
 import time
 from datetime import datetime, timezone
 
+import anyio
 import pytest
 
 from server.app import MAX_BODY
+from server.hosted import media_api
 from server.hosted.media_api import Slots
 from server.hosted.ratelimit import LIMITS, RateLimiter
 
@@ -87,18 +89,23 @@ def slots_in_use(hosted) -> int:
     return hosted.app.state.media.guard.slots.in_use
 
 
-def raw_put(hosted, headers: dict, chunks: list[bytes]) -> tuple[int, dict, int]:
-    """PUT /api/uploads straight into the ASGI app, as a client that may lie about its Content-Length: returns
-    (status, JSON body, how many body chunks the server took)."""
+def raw_put(hosted, headers: dict, chunks: list[bytes], pause: float = 0.0,
+            stall: bool = False) -> tuple[int, dict, int]:
+    """PUT /api/uploads straight into the ASGI app, as a client that may lie about its Content-Length, wait `pause`
+    seconds before each chunk, or (`stall`) send nothing more after its chunks: returns (status, JSON body, how many
+    body chunks the server took)."""
     chunks = list(chunks)
     taken = []
     sent: list[dict] = []
 
     async def receive():
         if chunks:
+            await anyio.sleep(pause)
             chunk = chunks.pop(0)
             taken.append(chunk)
-            return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+            return {"type": "http.request", "body": chunk, "more_body": bool(chunks) or stall}
+        if stall:
+            await anyio.sleep_forever()
         return {"type": "http.disconnect"}
 
     async def send(message):
@@ -273,6 +280,38 @@ def test_wrong_size(hosted, google):
 
     assert media_files(drive) == [] and hosted.get("/api/asks/1", headers=bearer(token)).json()["attachments"] == []
     assert put(hosted, upload(hosted, token, 1, raw), raw).status_code == 201  # the exact size works
+    assert slots_in_use(hosted) == 0
+
+
+def test_slow_upload_frees_its_slot(hosted, google, monkeypatch):
+    """A PUT holds a media slot while it reads: a client that stops sending, or trickles, gets a 408 and the slot
+    goes back (deadlines shortened here from 20 s per piece and 120 s for the whole body)."""
+    assert (media_api.UPLOAD_IDLE, media_api.UPLOAD_DEADLINE) == (20.0, 120.0)
+    monkeypatch.setattr(media_api, "UPLOAD_IDLE", 0.5)
+    token = allen(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    new_ask(hosted, token)
+    raw = png_of_size(1000)
+
+    def headers() -> dict:
+        return {**upload(hosted, token, 1, raw)["upload"]["headers"], "Content-Length": "1000"}
+
+    monkeypatch.setattr(media_api, "UPLOAD_DEADLINE", 5.0)
+    stall_headers, started = headers(), time.monotonic()
+    status, body, taken = raw_put(hosted, stall_headers, [raw[:100]], stall=True)  # sends a little, then nothing
+    assert (status, body["detail"], taken) == (408, "upload too slow: request a new upload", 1)
+    assert time.monotonic() - started < 3  # the idle deadline, well before the whole-body one
+    assert slots_in_use(hosted) == 0
+    monkeypatch.setattr(media_api, "UPLOAD_DEADLINE", 0.3)
+    stalled = headers()
+    status, body, taken = raw_put(hosted, stalled, [raw[i:i + 50] for i in range(0, 1000, 50)], pause=0.05)
+    assert (status, body["detail"]) == (408, "upload too slow: request a new upload") and taken < 20  # each piece in
+    assert slots_in_use(hosted) == 0                                                         # time, the whole not
+    assert media_files(drive) == [] and hosted.store.all("uploads") == {}
+    status, body, _ = raw_put(hosted, stalled, [raw])  # the token went with the slow PUT
+    assert status == 401
+    status, body, _ = raw_put(hosted, headers(), [raw[:500], raw[500:]])
+    assert status == 201 and body["attachment"]["bytes"] == 1000
     assert slots_in_use(hosted) == 0
 
 
@@ -560,12 +599,16 @@ def test_busy_slots(hosted, google):
     slots = hosted.app.state.media.guard.slots
     assert slots.take(4)
     for response in (hosted.post("/api/asks/1/attachments", json={"url": PIC}, headers=bearer(token)),
-                     put(hosted, issued, raw),
                      hosted.post("/api/asks", json={"title": "Pics?", "attachments": [{"url": PIC}]},
                                  headers=bearer(token))):
         assert response.status_code == 503, response.text
         assert response.headers["retry-after"] == "5" and response.json()["detail"] == \
             "busy, try again in a few seconds"
+    # a busy PUT has used its token up (claimed first, whatever the outcome), and says so
+    busy = put(hosted, issued, raw)
+    assert busy.status_code == 503 and busy.headers["retry-after"] == "5"
+    assert busy.json()["detail"] == "busy: request a new upload in a few seconds"
+    assert hosted.store.all("uploads") == {}
     assert media_files(drive) == [] and hosted.get("/api/asks", headers=bearer(token)).json()["counts"]["open"] == 1
     # nothing to fetch, nothing held: data, link cards, detach and upload requests go through
     assert hosted.post("/api/asks/1/attachments", json={"data": data_url("image/png", raw)},

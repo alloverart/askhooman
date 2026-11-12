@@ -18,7 +18,9 @@ An upload request checks everything it can before a token exists (owner, open as
 kind's cap, poster rules, the per-ask count and 40 MB), so an agent learns before it sends the bytes; the PUT then
 checks it all again against the bytes and the ask as it is by then (attachments.AskMedia.attach). The PUT reads
 exactly the declared size into one buffer once it holds its slot: a longer body is a 413 without reading on, a
-shorter one a 422.
+shorter one a 422. A client that sends nothing for UPLOAD_IDLE, or takes more than UPLOAD_DEADLINE for the whole
+body, gets a 408 and gives the slot back (uvicorn has no body timeout of its own). A PUT has used its token up
+whatever the outcome, so a busy or slow one says to request a new upload.
 """
 
 import io
@@ -28,6 +30,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
+import anyio
 import anyio.to_thread
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -66,7 +69,11 @@ from .uploads import UPLOAD_PATH, UploadGrant, UploadGrants
 MEDIA_SLOTS = 4  # per instance
 FETCH_SLOTS = 1  # a url fetch or an upload PUT: at most 20 MB
 CREATE_SLOTS = 2  # an ask_create with any fetched item: at most 40 MB
+UPLOAD_IDLE = 20.0  # seconds a PUT may wait for the next piece of its body
+UPLOAD_DEADLINE = 120.0  # seconds for the whole body of a PUT
 BUSY = "busy, try again in a few seconds"
+UPLOAD_BUSY = "busy: request a new upload in a few seconds"  # the PUT's token is used up already
+UPLOAD_SLOW = "upload too slow: request a new upload"
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}  # an upload request's reply carries a token
 _MB = 1024 * 1024
 
@@ -118,9 +125,9 @@ class MediaGuard:
         self.slots = slots
 
     @contextmanager
-    def hold(self, who: HostedIdentity | None, calls: int, slots: int = 0):
+    def hold(self, who: HostedIdentity | None, calls: int, slots: int = 0, busy: str = BUSY):
         if not self.slots.take(slots):
-            raise Busy(BUSY)
+            raise Busy(busy)
         try:
             if calls and not self.limiter.allow("media", who.agent_id, calls):
                 count = self.limiter.limits["media"][0]
@@ -280,19 +287,25 @@ def _exact_size(size: int, got: int) -> Invalid:
 
 async def _read_exactly(request: Request, size: int) -> bytes:
     """The body, at most `size` bytes, in one buffer (BytesIO.getvalue() hands it over without a copy): a byte more
-    is a 413 at once, without reading on; fewer (or the client gone) a 422."""
+    is a 413 at once, without reading on; fewer (or the client gone) a 422; nothing for UPLOAD_IDLE seconds, or
+    more than UPLOAD_DEADLINE for all of it, a 408 (the caller holds a media slot meanwhile)."""
     body = io.BytesIO()
-    while True:
-        message = await request.receive()
-        if message["type"] == "http.disconnect":
-            raise _exact_size(size, body.tell())
-        chunk = message.get("body", b"")
-        if body.tell() + len(chunk) > size:
-            raise HTTPException(413, f"request body too large: the body must be exactly {size} bytes, the size "
-                                     "given to ask_upload")
-        body.write(chunk)
-        if not message.get("more_body", False):
-            break
+    try:
+        with anyio.fail_after(UPLOAD_DEADLINE):
+            while True:
+                with anyio.fail_after(UPLOAD_IDLE):
+                    message = await request.receive()
+                if message["type"] == "http.disconnect":
+                    raise _exact_size(size, body.tell())
+                chunk = message.get("body", b"")
+                if body.tell() + len(chunk) > size:
+                    raise HTTPException(413, f"request body too large: the body must be exactly {size} bytes, the "
+                                             "size given to ask_upload")
+                body.write(chunk)
+                if not message.get("more_body", False):
+                    break
+    except TimeoutError:
+        raise HTTPException(408, UPLOAD_SLOW) from None
     if body.tell() != size:
         raise _exact_size(size, body.tell())
     return body.getvalue()
@@ -329,6 +342,6 @@ def add_media_routes(app: FastAPI, media: MediaService) -> None:
         length = int(request.headers["content-length"])  # RequestGuard: present, digits, at most grant.bytes
         if length != grant.bytes:
             raise _exact_size(grant.bytes, length)
-        with media.guard.hold(None, 0, FETCH_SLOTS):
+        with media.guard.hold(None, 0, FETCH_SLOTS, busy=UPLOAD_BUSY):
             raw = await _read_exactly(request, grant.bytes)
             return await anyio.to_thread.run_sync(media.receive, grant, raw)
