@@ -154,3 +154,108 @@ def test_listen_survives_a_cut_response(capsys, monkeypatch):
         code, out, err = run(capsys, monkeypatch, url, "qtk_key", "listen", "--once")
     assert code == 0 and "IncompleteRead" in err and slept == [5]
     assert [q.get("after") for q in queries] == [None, "4", "4"] and json.loads(out)["id"] == 5
+
+
+# ---------- attach / detach (hosted bridge, pictures and video) ----------
+
+import socket  # noqa: E402
+import time  # noqa: E402
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+import uvicorn  # noqa: E402
+
+from .hosted_support import DENIS_SUB, build, connect, register  # noqa: E402
+from .fake_google import FakeGoogle  # noqa: E402
+from .media_samples import mp4, png  # noqa: E402
+
+
+@pytest.fixture
+def live_hosted():
+    """The hosted bridge (fake Google, in-memory store) under uvicorn; yields (base URL, an agent's access token, the user's Drive)."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    google = FakeGoogle(f"{base}/oauth/google/callback")
+    app, _ = build(google, public=base)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="on"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    while not server.started:
+        if time.monotonic() > deadline or not thread.is_alive():
+            raise RuntimeError("uvicorn did not start")
+        time.sleep(0.05)
+    try:
+        with httpx.Client(base_url=base) as client:  # the user signs an agent in: that also gives the bridge the Drive
+            token = connect(client, google, register(client)["client_id"], agent="Allen", origin=base)["access_token"]
+        yield base, token, google.drive(DENIS_SUB)
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+def new_hosted_ask(base, key):
+    response = httpx.post(f"{base}/api/asks", json={"title": "Which one?"}, headers={"Authorization": f"Bearer {key}"})
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def test_cli_attach_file(live_hosted, tmp_path, capsys, monkeypatch):
+    base, key, drive = live_hosted
+    ask_id = new_hosted_ask(base, key)
+    picture = tmp_path / "cat.png"
+    picture.write_bytes(png(64, 48))
+    code, out, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id), str(picture), "--caption", "The cat")
+    assert code == 0, err
+    assert out.startswith(f"attached #1 to ask #{ask_id}: image image/png (64x48, ") and '"The cat"' in out
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(mp4(320, 240, 2.0))
+    code, out, err = run(capsys, monkeypatch, base, key, "--json", "attach", str(ask_id), str(clip))
+    assert code == 0, err
+    item = json.loads(out)
+    assert item["id"] == 2 and item["kind"] == "video" and item["mime"] == "video/mp4"
+    assert sorted(f["name"] for f in drive.files.values() if f["name"].startswith("media-")) == \
+        [f"media-{ask_id}-1.png", f"media-{ask_id}-2.mp4"]
+    code, out, _ = run(capsys, monkeypatch, base, key, "--json", "show", str(ask_id))
+    assert [a["id"] for a in json.loads(out)["attachments"]] == [1, 2]
+
+
+def test_cli_attach_url_link(live_hosted, capsys, monkeypatch):
+    base, key, _ = live_hosted
+    ask_id = new_hosted_ask(base, key)
+    code, out, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id), "--url",
+                         "https://drive.google.com/file/d/abc/view", "--link", "--title", "Mockup",
+                         "--caption", "v2")
+    assert code == 0, err
+    assert out.startswith(f"attached #1 to ask #{ask_id}: link drive: Mockup <https://drive.google.com/file/d/abc/view>")
+    code, _, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id), "--url", "http://x.example/a.png")
+    assert code == 1 and "HTTP 422" in err
+    code, _, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id))
+    assert code == 2 and "FILE or --url" in err
+
+
+def test_cli_detach(live_hosted, tmp_path, capsys, monkeypatch):
+    base, key, drive = live_hosted
+    ask_id = new_hosted_ask(base, key)
+    picture = tmp_path / "cat.png"
+    picture.write_bytes(png(8, 8))
+    assert run(capsys, monkeypatch, base, key, "attach", str(ask_id), str(picture))[0] == 0
+    code, out, err = run(capsys, monkeypatch, base, key, "detach", str(ask_id), "1")
+    assert code == 0, err
+    assert out == f"detached #1 from ask #{ask_id}\n"
+    assert not [f for f in drive.files.values() if f["name"].startswith("media-")]
+    code, _, err = run(capsys, monkeypatch, base, key, "detach", str(ask_id), "1")
+    assert code == 1 and "HTTP 404" in err
+
+
+def test_cli_attach_unknown_type(live_hosted, tmp_path, capsys, monkeypatch):
+    base, key, _ = live_hosted
+    ask_id = new_hosted_ask(base, key)
+    gif = tmp_path / "a.gif"
+    gif.write_bytes(b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff;")
+    code, out, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id), str(gif))
+    assert code == 2 and "convert to PNG, JPEG or WebP; send motion as MP4" in err and out == ""
+    code, _, err = run(capsys, monkeypatch, base, key, "attach", str(ask_id), str(tmp_path / "missing.png"))
+    assert code == 1 and "cannot read" in err
