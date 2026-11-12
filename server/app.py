@@ -54,6 +54,7 @@ class AskCreate(StrictBody):
     links: list[LinkIn] | None = None
     priority: Literal["normal", "urgent"] | None = None
     ref: str | None = None
+    attachments: list[dict] | None = None  # hosted only (SPEC v5 step 4); the single-tenant bridge refuses any item
 
 
 class AskPatch(StrictBody):

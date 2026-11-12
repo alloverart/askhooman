@@ -461,6 +461,23 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
   they don't know. The apps never write `attachments` and keep them on their own writes (unknown fields survive).
   Media files are deleted only by `ask_detach` and by Drive → Manage apps → Delete hidden app data; Delete Account
   leaves them, as it leaves the asks.
+- **Bridge notes (12.11.2026, `server/hosted/attachments.py`).** Resolved where the text above is silent:
+  - An attach checks the ask before writing anything (owner, open, count, size, the next id, the poster's target),
+    writes the media file, then the ask file; the ask write runs the same checks again on the fresh file. So an ask
+    the user answered or closed while the file was being written is a 409, exactly as `ask_update` in that race,
+    and the file just written is deleted; a second attach that took the id meanwhile is a 409 too ("try again"),
+    never a renumbering. A create writes the files first and the ask file last; a failure anywhere deletes what it
+    wrote (best effort, logged).
+  - The next `id` counts the current items and every `attached` and `detached` event. `added_at` is when the media
+    file was written (a link card: when it was prepared); the `attached` event's `at` is the ask write.
+  - A replaced poster and a detached item's files are deleted after the ask write, and only when Drive says they
+    are this ask's media (appProperties `kind: "media"`, `ask_id`): an ask file names them, and its owner can edit
+    it to name anything else, which then stays and is logged. A Drive failure in that cleanup is logged; the call
+    has succeeded (the ask is written).
+  - `title` is refused on anything but a link card; `caption` and `source_url` are refused with `poster_for` (they
+    belong to the attachment the poster is for); `poster_for` naming an image → 422, an unknown id → 404.
+  - The single-tenant bridge writes no `attachments` field into its Drive files (its REST says `[]`); the apps read
+    a missing field as `[]`, and a file that has one keeps it like any field the bridge doesn't know.
 - **Apps** (the web app, which is also the Android app; iOS; macOS):
   - List: a paperclip with the count on the row. The list downloads nothing.
   - Detail: under the context, a row of tiles in order, each numbered 1, 2, 3 in a corner. Image → its thumbnail;

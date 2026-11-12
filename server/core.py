@@ -101,6 +101,9 @@ class AskService:
     # writes
 
     def create(self, who: Identity, data: dict) -> dict:
+        data = dict(data)
+        if data.pop("attachments", None):  # SPEC v5 step 4: pictures and video are hosted-only; [] is fine
+            raise Invalid("attachments need the hosted AskHooman")
         fields = plan_create(who, data)
         now = utc_now()
         with self.db.transaction(write=True) as conn:

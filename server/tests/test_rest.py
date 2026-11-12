@@ -15,7 +15,7 @@ from .conftest import ALLEN, ASKS_DIR, DENIS, HAMILTON, auth
 
 ASK_KEYS = {
     "id", "agent", "title", "context", "options", "links", "priority", "ref", "status", "answer",
-    "answered_at", "resolution", "closed_by", "closed_at", "created_at", "updated_at",
+    "answered_at", "resolution", "closed_by", "closed_at", "created_at", "updated_at", "attachments",
 }
 
 
