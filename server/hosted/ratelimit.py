@@ -26,6 +26,7 @@ LIMITS = {
     "look_fetch": (10, 600.0),  # set_my_look image_url fetches of one agent (looks.own_look)
     "webhook_set": (10, 3600.0),  # set_my_webhook calls of one agent (self_webhook.py)
     "webhook_test": (10, 3600.0),  # test_my_webhook calls of one agent
+    "media": (60, 3600.0),  # attachment calls of one agent: attach, upload request, detach, each item of a create
 }
 MAX_KEYS = 20000
 
@@ -47,8 +48,9 @@ class RateLimiter:
                 hits.popleft()
         return hits
 
-    def allow(self, bucket: str, key: str) -> bool:
-        """Count one request; False if this key already used up the bucket's window."""
+    def allow(self, bucket: str, key: str, n: int = 1) -> bool:
+        """Count `n` requests (one by default; an ask_create counts each of its attachments); False, counting none,
+        if fewer than `n` are left in this key's window."""
         limit = self.limits.get(bucket)
         if limit is None:
             return True
@@ -61,9 +63,9 @@ class RateLimiter:
                     self._evict(now)
                 hits = self._hits[(bucket, key)] = deque()
             self._hits.move_to_end((bucket, key))
-            if len(hits) >= count:
+            if len(hits) + n > count:
                 return False
-            hits.append(now)
+            hits.extend([now] * n)
             return True
 
     def blocked(self, bucket: str, key: str) -> bool:

@@ -2,6 +2,9 @@
 
   /mcp                  MCP (streamable HTTP, stateless) for agents: OAuth access tokens or agent keys
   /api/asks, /api/tasks the same REST as the single-tenant bridge, for agents (same tokens as /mcp)
+  /api/asks/{id}/attachments, /api/asks/{id}/uploads, PUT /api/uploads
+                        pictures and video in asks (media_api.py); PUT /api/uploads takes upload tokens (qtu_…,
+                        uploads.py) and nothing else, and they work nowhere else
   /api/agents…, /api/connect-info, /api/events, /api/drive/token, DELETE /api/me
                         the App API (Google ID tokens), app_api.py; the only routes with CORS, and only for the
                         origins in ASKS_CORS_ORIGINS
@@ -29,12 +32,14 @@ from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
 from .app_api import AppCors, AppUser, add_app_api, is_account_deletion, is_app_path
+from .attachments import AskMedia
 from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
 from .feed import EventFeed, add_feed_route
 from .google import GoogleError, GoogleOAuth
 from .looks import AGENT_COLORS, own_look
+from .media_api import MEDIA_SLOTS, MediaGuard, MediaService, Slots, add_media_routes
 from .operator import OperatorPing, telegram_sender
 from .oauth import AuthServer
 from .ratelimit import RateLimiter, client_ip
@@ -43,6 +48,7 @@ from .safe_http import public_client
 from .self_webhook import ping_own_webhook, set_own_webhook
 from .stats import internal_check
 from .store import MemoryStore
+from .uploads import UPLOAD_PATH, UPLOAD_PREFIX, UploadGrant, UploadGrants
 from .webhooks import WebhookSender
 
 log = logging.getLogger("asks.hosted")
@@ -158,6 +164,12 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         records = pool.records(who.user)
         return HostedAsks(records), HostedTasks(records)
 
+    # Pictures and video in asks (SPEC v5 step 4): one service and one guard (the `media` bucket, the slots) for
+    # the REST routes and the MCP tools alike.
+    grants = UploadGrants(store)
+    media = MediaService(lambda who: AskMedia(pool.records(who.user)), public_http, grants,
+                         MediaGuard(limiter, Slots(MEDIA_SLOTS)), settings.public_url)
+
     look = LookTool(AGENT_COLORS, lambda who, changes: own_look(accounts, public_http, limiter, who, changes))
 
     async def wait_for_user(who: HostedIdentity, timeout: float) -> dict:
@@ -179,13 +191,41 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
-    def authenticate(path: str, headers, client=None, method: str = "GET") -> HostedIdentity | AppUser:
-        """RequestGuard's check for /api/*: Google ID tokens on the App API, agent bearer tokens elsewhere. The first
-        App API call of a Google account creates its user, except Delete Account (nothing to create it for)."""
-        if not is_app_path(path, method):
-            ip = client_ip(headers, (client or (None,))[0], settings.trust_forwarded)
-            return resource_auth.identify(headers.get("authorization"), ip, headers.get("host"))
+    def upload_grant(token: str | None, ip: str) -> UploadGrant:
+        """PUT /api/uploads: an upload token only, claimed here (used up, whatever the outcome of the PUT)."""
+        challenge = {"WWW-Authenticate": "Bearer"}
+        if token is None or not token.startswith(UPLOAD_PREFIX):
+            raise HTTPException(401, "PUT /api/uploads takes the upload token from ask_upload "
+                                     "(Authorization: Bearer qtu_…)", headers=challenge)
+        if limiter.blocked("bearer_fail", ip):
+            raise HTTPException(429, "too many invalid tokens from this address", headers={"Retry-After": "60"})
+        try:
+            grant = grants.claim(token)
+            agent = accounts.own_agent(grant.user, grant.agent_id) if grant is not None else None
+        except Exception as exc:  # the metadata store is down
+            log.exception("upload token check failed: %s", type(exc).__name__)
+            raise HTTPException(503, "temporarily unavailable, try again", headers={"Retry-After": "5"}) from None
+        if grant is None:
+            limiter.allow("bearer_fail", ip)
+            raise HTTPException(401, "the upload token is invalid, expired or already used: get a new one with "
+                                     "ask_upload", headers=challenge)
+        if agent is None:
+            raise HTTPException(401, "the agent this upload was for was disconnected", headers=challenge)
+        return grant
+
+    def authenticate(path: str, headers, client=None, method: str = "GET") -> HostedIdentity | AppUser | UploadGrant:
+        """RequestGuard's check for /api/*: Google ID tokens on the App API, upload tokens on PUT /api/uploads (and
+        nowhere else), agent bearer tokens elsewhere. The first App API call of a Google account creates its user,
+        except Delete Account (nothing to create it for)."""
         token = bearer_token(headers.get("authorization"))
+        ip = client_ip(headers, (client or (None,))[0], settings.trust_forwarded)
+        if path == UPLOAD_PATH and method == "PUT":
+            return upload_grant(token, ip)
+        if token is not None and token.startswith(UPLOAD_PREFIX):  # not looked up: it is never valid here
+            raise HTTPException(401, "an upload token works only for its own PUT /api/uploads",
+                                headers={"WWW-Authenticate": "Bearer"})
+        if not is_app_path(path, method):
+            return resource_auth.identify(headers.get("authorization"), ip, headers.get("host"))
         if token is None:
             raise HTTPException(401, "sign in with Google", headers={"WWW-Authenticate": "Bearer"})
         try:
@@ -219,6 +259,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.state.webhooks = webhooks
     app.state.feed = feed
     app.state.limiter = limiter
+    app.state.uploads = grants
+    app.state.media = media
     app.state.auth_server = auth_server
     app.state.mcp = mcp
     add_error_handlers(app)
@@ -227,7 +269,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     def healthz():
         return {"ok": True}
 
-    add_api_routes(app, services)
+    add_api_routes(app, services, ask_create=media.create)
+    add_media_routes(app, media)
     add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed)
     add_feed_route(app, feed, accounts)
     app.router.routes.extend(auth_server.routes())
