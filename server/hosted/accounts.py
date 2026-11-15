@@ -13,7 +13,8 @@ checked against the agent on every use).
 Agents: a name is turned into a slug that owns the asks. A client may connect as an existing agent only if it
 did so before, or if the user explicitly confirmed it on the consent page (NameTaken otherwise), so a new
 client can't take over an agent just by calling itself by the agent's name. Each agent keeps the list of
-clients that connected as it.
+clients that connected as it. A renamed agent keeps its slug, so a name means an agent by its slug or by the
+name it is shown under (Accounts.named): no two active agents of a user answer to one name.
 """
 
 import hashlib
@@ -263,25 +264,33 @@ class Accounts:
     def client_ids(self, agent: dict) -> set[str]:
         return {c.get("client_id") for c in self.client_list(agent) if c.get("client_id")}
 
+    @staticmethod
+    def named(agents: list[dict], name) -> dict | None:
+        """The agent among `agents` that a name means: the one whose slug the name makes, else the one shown under
+        that name. A renamed agent keeps its slug ("allen" shown as "Sonya Allen"), and the name the user reads in
+        the app must mean it too, not make a twin."""
+        slug = slugify(clean_agent_name(name))
+        return (next((a for a in agents if a["slug"] == slug), None)
+                or next((a for a in agents if slugify(a["name"]) == slug), None))
+
     def connect_agent(self, sub: str, name, client_id: str | None, client_name: str | None,
                       confirm: str | None = None, dry_run: bool = False, shared_client: bool = False) -> dict:
         """The agent a consent (client_id set) or a new key (client_id None) connects as.
 
-        A name whose slug belongs to one of the user's active agents connects as that agent only if this client
-        connected as it before, or `confirm` equals that slug (the user said "connect as the existing agent");
-        otherwise NameTaken. shared_client: a CIMD client_id is the same for every install of the app (every Claude
-        Code), so "connected before" proves nothing and only `confirm` counts. The agent's original
+        A name that means one of the user's active agents (named()) connects as that agent only if this client
+        connected as it before, or `confirm` equals that agent's slug (the user said "connect as the existing
+        agent"); otherwise NameTaken. shared_client: a CIMD client_id is the same for every install of the app
+        (every Claude Code), so "connected before" proves nothing and only `confirm` counts. The agent's original
         client_id/client_name never change; connecting clients are added to its `clients` list. dry_run: only check
         (returns the existing agent or {})."""
         name = clean_agent_name(name)
         slug = slugify(name)
         now = utc_now()
         active = self.agents(sub)
-        for agent in active:
-            if agent["slug"] != slug:
-                continue
+        agent = self.named(active, name)
+        if agent is not None:
             known = client_id is not None and client_id in self.client_ids(agent)
-            if not (known and not shared_client) and confirm != slug:
+            if not (known and not shared_client) and confirm != agent["slug"]:
                 raise NameTaken(agent)
             if dry_run:
                 return agent
@@ -306,8 +315,12 @@ class Accounts:
         return agent
 
     def rename_agent(self, agent: dict, name) -> dict:
-        """Only the display name changes: the slug stays, so the agent keeps owning its asks and tasks."""
+        """Only the display name changes: the slug stays, so the agent keeps owning its asks and tasks.
+        A name that means another active agent of the user is refused (NameTaken)."""
         name = clean_agent_name(name)
+        other = self.named([a for a in self.agents(agent["user"]) if a["id"] != agent["id"]], name)
+        if other is not None:
+            raise NameTaken(other)
         self.store.update("agents", agent["id"], {"name": name})
         return {**agent, "name": name}
 
@@ -548,10 +561,15 @@ class Accounts:
     # ---------- agent keys ----------
 
     def create_key(self, sub: str, name, existing: bool = False) -> tuple[dict, str]:
-        """A new agent key. A name of an existing agent adds the key to it only with existing=True (NameTaken)."""
-        agent = self.connect_agent(sub, name, None, None, confirm=slugify(clean_agent_name(name)) if existing else None)
+        """A key for an agent given by name: a new agent, or, with existing=True, the agent that name means
+        (NameTaken without it)."""
+        taken = self.named(self.agents(sub), name) if existing else None
+        return self.key_for(self.connect_agent(sub, name, None, None, confirm=taken["slug"] if taken else None))
+
+    def key_for(self, agent: dict) -> tuple[dict, str]:
+        """Another key for a connected agent: its sign-ins and earlier keys keep working."""
         key = new_secret(KEY_PREFIX, nbytes=30)
-        self.store.put("keys", digest(key), {"user": sub, "agent_id": agent["id"], "created_at": utc_now(),
+        self.store.put("keys", digest(key), {"user": agent["user"], "agent_id": agent["id"], "created_at": utc_now(),
                                               "revoked": False})
         prefix = key[:12]
         self.store.update("agents", agent["id"], {"key_prefix": prefix})

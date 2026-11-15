@@ -90,6 +90,70 @@ def test_agent_key(hosted, google):
     assert mcp(hosted, key, "asks_mine").status_code == 401
 
 
+def test_a_key_for_an_agent_that_is_already_connected(hosted, google):
+    """The app's "Create key" on an agent's row: the key goes to that agent by its id, whatever it was renamed to,
+    and no second agent appears (a key made by typing a name the server did not recognise once made one)."""
+    tokens = connect(hosted, google, register(hosted)["client_id"], agent="Sonya Hamilton")
+    agent_id = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["id"]
+    hosted.patch(f"/api/agents/{agent_id}", json={"name": "Hamilton"}, headers=id_token(google))
+    made = hosted.post(f"/api/agents/{agent_id}/keys", headers=id_token(google))
+    assert made.status_code == 201, made.text
+    body = made.json()
+    key = body["key"]
+    assert key.startswith("qtk_") and body["agent"]["id"] == agent_id and body["agent"]["has_key"]
+    assert (body["agent"]["name"], body["agent"]["slug"]) == ("Hamilton", "sonya-hamilton")
+    assert body["agent"]["key_prefix"] == key[:12] and body["link_url"].endswith("/oauth/link")
+    assert key not in json.dumps(hosted.store.all("keys")) + json.dumps(hosted.store.all("agents"))
+    me = hosted.get("/api/me", headers={"Authorization": f"Bearer {key}"})
+    assert me.json() == {"role": "agent", "agent": "sonya-hamilton"}
+    assert mcp(hosted, tokens["access_token"], "asks_mine").status_code == 200  # its sign-in keeps working
+    second = hosted.post(f"/api/agents/{agent_id}/keys", headers=id_token(google)).json()["key"]
+    assert second != key  # another key; the first one keeps working
+    assert hosted.get("/api/me", headers={"Authorization": f"Bearer {key}"}).status_code == 200
+    assert len(hosted.get("/api/agents", headers=id_token(google)).json()["agents"]) == 1
+    # someone else's, unknown, disconnected: no key
+    assert hosted.post(f"/api/agents/{agent_id}/keys", headers=id_token(google, sub=OLGA_SUB)).status_code == 404
+    assert hosted.post("/api/agents/ag_nope/keys", headers=id_token(google)).status_code == 404
+    hosted.delete(f"/api/agents/{agent_id}", headers=id_token(google))
+    assert hosted.post(f"/api/agents/{agent_id}/keys", headers=id_token(google)).status_code == 404
+    assert hosted.get("/api/me", headers={"Authorization": f"Bearer {key}"}).status_code == 401
+
+
+def test_the_name_shown_for_a_renamed_agent_means_that_agent(hosted, google):
+    """A renamed agent keeps its slug ("allen") under a new name ("Sonya Allen"). Typing the name the app shows
+    must offer that agent, not make a twin with the same name and another slug."""
+    connect(hosted, google, register(hosted)["client_id"], agent="Allen")
+    agent_id = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["id"]
+    hosted.patch(f"/api/agents/{agent_id}", json={"name": "Sonya Allen"}, headers=id_token(google))
+    taken = hosted.post("/api/agents/keys", json={"name": "Sonya Allen"}, headers=id_token(google))
+    assert taken.status_code == 409 and "Sonya Allen" in taken.json()["detail"]
+    made = hosted.post("/api/agents/keys", json={"name": "sonya allen", "existing": True}, headers=id_token(google))
+    assert made.status_code == 201 and made.json()["agent"]["id"] == agent_id
+    assert made.json()["agent"]["slug"] == "allen"
+    by_slug = hosted.post("/api/agents/keys", json={"name": "allen", "existing": True}, headers=id_token(google))
+    assert by_slug.status_code == 201 and by_slug.json()["agent"]["id"] == agent_id  # its first name still means it
+    agents = hosted.get("/api/agents", headers=id_token(google)).json()["agents"]
+    assert [(a["name"], a["slug"]) for a in agents] == [("Sonya Allen", "allen")]
+
+
+def test_an_agent_cannot_be_renamed_to_another_agents_name(hosted, google):
+    client = register(hosted)["client_id"]
+    connect(hosted, google, client, agent="Allen")
+    connect(hosted, google, register(hosted)["client_id"], agent="Ogilvy")
+    allen, ogilvy = hosted.get("/api/agents", headers=id_token(google)).json()["agents"]
+    hosted.patch(f"/api/agents/{allen['id']}", json={"name": "Sonya Allen"}, headers=id_token(google))
+    for name in ("Sonya Allen", "allen"):  # the name it shows and the slug it keeps
+        refused = hosted.patch(f"/api/agents/{ogilvy['id']}", json={"name": name}, headers=id_token(google))
+        assert refused.status_code == 409 and "Sonya Allen" in refused.json()["detail"], name
+    # its own names stay free for itself; a free name is fine
+    assert hosted.patch(f"/api/agents/{allen['id']}", json={"name": "Allen"},
+                        headers=id_token(google)).status_code == 200
+    assert hosted.patch(f"/api/agents/{ogilvy['id']}", json={"name": "Sonya Ogilvy"},
+                        headers=id_token(google)).status_code == 200
+    names = [a["name"] for a in hosted.get("/api/agents", headers=id_token(google)).json()["agents"]]
+    assert names == ["Allen", "Sonya Ogilvy"]
+
+
 def test_connect_info(hosted, google):
     info = hosted.get("/api/connect-info", headers=id_token(google)).json()
     assert info["server_url"] == RESOURCE
