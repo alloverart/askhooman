@@ -28,6 +28,7 @@ Tasks (long-running work an agent does itself; the human only reads them):
 Waking up (the hosted bridge, ASKS_URL=https://askhooman.com with an agent key): wait for the user's answers and
 replies and run a command per event, with ASKHOOMAN_EVENT and ASKHOOMAN_ASK_ID / ASKHOOMAN_TASK_ID set:
   asks.py listen --exec 'claude -p "check asks_mine and tasks_mine"'
+  asks.py listen --once --cursor-file ~/.config/asks/cursor    exit on the next events; the next run starts after them
 
 Pictures and video (the hosted bridge; PNG, JPEG, WebP up to 5 MB and 4096 px, MP4 up to 20 MB, 6 per ask):
   asks.py attach 12 cat.png --caption "Option 1"      upload a file (the server numbers it 1, 2, 3...)
@@ -757,9 +758,10 @@ def run_for_event(command: str, event: dict, timeout: float) -> None:
 
 def cmd_listen(client, args):
     """Long-poll the agent's event feed (GET /api/agent/events); per event print one JSON line and, with --exec,
-    run the command. Starts now (no replay); network errors, 429 and 5xx back off and retry from the same cursor;
+    run the command. Starts now (no replay), or with --cursor-file after the cursor stored there, so what the
+    user did between two runs is not lost; network errors, 429 and 5xx back off and retry from the same cursor;
     other HTTP errors (401: the key is wrong or revoked) stop with exit code 1."""
-    cursor = None
+    cursor = read_cursor(args.cursor_file)
     failures = 0
     while True:
         try:
@@ -783,8 +785,34 @@ def cmd_listen(client, args):
             if args.exec:
                 run_for_event(args.exec, event, args.timeout)
         cursor = str(page["cursor"]) if page.get("cursor") is not None else cursor
+        write_cursor(args.cursor_file, cursor)
         if args.once and events:
             return
+
+
+def read_cursor(path: str | None) -> str | None:
+    """The cursor a previous `listen --cursor-file` left; no file, an empty or an unreadable one = start now."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def write_cursor(path: str | None, cursor: str | None) -> None:
+    """Store the cursor after every page (atomically: a killed listener never leaves half a file)."""
+    if not path or cursor is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(cursor)
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"listen: could not store the cursor in {path}: {exc}", file=sys.stderr, flush=True)
 
 
 # ---------- parser ----------
@@ -941,6 +969,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=900.0, metavar="SECONDS",
                    help="stop a command that runs longer (default 900)")
     p.add_argument("--once", action="store_true", help="stop after the first events")
+    p.add_argument("--cursor-file", metavar="PATH", help="keep the feed cursor in this file and start after it, so "
+                                                         "events between two runs are not lost (use with --once)")
     p.set_defaults(func=cmd_listen)
 
     return parser
