@@ -139,6 +139,34 @@ def test_listen_runs_command_per_event(tmp_path, capsys, monkeypatch):
     assert [json.loads(line)["id"] for line in stdout.splitlines()] == [1, 2]
 
 
+def test_listen_resumes_from_a_cursor_file(tmp_path, capsys, monkeypatch):
+    """`--once` exits on the first events; what the user did before the next start must not be lost (15.11.2026: an
+    answer given 3 s before a restart was seen 18 minutes later). With --cursor-file the listener starts after the
+    cursor it stored and stores the new one after every page."""
+    cursor = tmp_path / "state" / "cursor"
+    with feed_stub([(200, {"events": [], "cursor": "5"}), (200, {"events": [event(6, ask_id=7)], "cursor": "6"})]) as (
+            url, queries):
+        code, stdout, _ = run(capsys, monkeypatch, url, "qtk_key", "listen", "--once", "--cursor-file", str(cursor))
+    assert code == 0 and [q.get("after") for q in queries] == [None, "5"]     # no file yet: starts now
+    assert cursor.read_text() == "6" and [json.loads(line)["id"] for line in stdout.splitlines()] == [6]
+    # the next start asks for what happened after the stored cursor and gets it at once
+    with feed_stub([(200, {"events": [event(7, ask_id=8), event(8, "task.replied", task_id=3)], "cursor": "8"})]) as (
+            url, queries):
+        code, stdout, _ = run(capsys, monkeypatch, url, "qtk_key", "listen", "--once", "--cursor-file", str(cursor))
+    assert code == 0 and [q.get("after") for q in queries] == ["6"]
+    assert cursor.read_text() == "8" and [json.loads(line)["id"] for line in stdout.splitlines()] == [7, 8]
+    # a cursor the bridge no longer keeps: one `missed` event, and the file moves on to the bridge's cursor
+    with feed_stub([(200, {"events": [], "cursor": "40", "missed": True})]) as (url, queries):
+        code, stdout, _ = run(capsys, monkeypatch, url, "qtk_key", "listen", "--once", "--cursor-file", str(cursor))
+    assert code == 0 and queries[0]["after"] == "8" and json.loads(stdout)["type"] == "missed"
+    assert cursor.read_text() == "40"
+    # an empty or unreadable file is "start now", not a crash
+    cursor.write_text("  \n")
+    with feed_stub([(200, {"events": [event(41, ask_id=1)], "cursor": "41"})]) as (url, queries):
+        code, _, _ = run(capsys, monkeypatch, url, "qtk_key", "listen", "--once", "--cursor-file", str(cursor))
+    assert code == 0 and queries[0].get("after") is None and cursor.read_text() == "41"
+
+
 def test_listen_survives_failing_command_and_network_error(tmp_path, capsys, monkeypatch):
     slept = []
     monkeypatch.setattr(cli, "SLEEP", slept.append)

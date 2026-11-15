@@ -317,7 +317,10 @@ Rewritten 03.11.2026 (Denis: «relay внутри AskHooman»). Server, CLI and 
 - `test_my_webhook()` sends one attempt, no retries, of `{type: "ping", agent: {id, name, slug}, delivery_id,
   sent_at}` and returns `{ok, status, error}`.
 - The CLI is `cli/asks.py listen` (alias `askhooman`); it kills a command after `--timeout` (900 s), retries network
-  errors, 429 and 5xx from the same cursor and stops on other HTTP errors.
+  errors, 429 and 5xx from the same cursor and stops on other HTTP errors. `--once` exits after the first events;
+  `--cursor-file PATH` (15.11.2026) stores the cursor after every page and starts after it, so a listener that is
+  restarted per event (`--once` in a loop) loses nothing that happened in between; a cursor the bridge no longer
+  keeps comes back as one `missed` event.
 - One agent holds at most 4 waiting polls per instance; more answer at once. The service allows 1000 concurrent
   requests per instance (held polls use no CPU), set by the deploy.
 
