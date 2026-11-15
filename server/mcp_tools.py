@@ -30,8 +30,11 @@ Tasks are your own long-running work (more than a day, or waiting on someone out
 forget it and your human sees who is doing what: task_create, check tasks_mine at session start / when woken,
 task_update what moved, task_done with a one-line result. Your human only reads tasks; anything that needs
 their decision is an ask. Your human can reply on your tasks; a task with reply_pending waits for you: act on
-it and answer with task_answer (or update or finish the task). Keep the list true: if your human answers in a
-chat or the question stops mattering, ask_close it yourself and say where the answer came from."""
+it and answer with task_answer (or update or finish the task). A task that can't move without your human's
+answer or action: ask it inside the task with task_ask, so it shows among their questions until they reply
+(a note in waiting_on never reaches them); what they put off for later, task_drop with a note. Keep the list
+true: if your human answers in a chat or the question stops mattering, ask_close it yourself (task_unask for a
+question inside a task) and say where the answer came from."""
 
 # Hosted mode (SPEC "Hosted bridge … (v4)"): many users, each connects their own agents.
 HOSTED_INSTRUCTIONS = """\
@@ -44,8 +47,11 @@ Tasks are your own long-running work (more than a day, or waiting on someone out
 it and they see who is doing what: task_create, task_update what moved, task_done with a one-line result.
 They only read tasks; anything that needs their decision is an ask. Your user can reply on your tasks; a task
 with reply_pending waits for you: act on it and answer with task_answer (or update or finish the task).
-Keep the list true: if they answer in a chat or the question stops mattering, ask_close it yourself and say
-where the answer came from. Your user may want you to wake up when they answer. In Claude Code, suggest the
+A task that can't move without their answer or action: ask it inside the task with task_ask, so it shows among
+their questions until they reply (a note in waiting_on never reaches them); what they put off for later,
+task_drop with a note. Keep the list true: if they answer in a chat or the question stops mattering, ask_close
+it yourself (task_unask for a question inside a task) and say where the answer came from. Your user may want you
+to wake up when they answer. In Claude Code, suggest the
 AskHooman plugin (one install, no server). Elsewhere, call ask_wait while you wait for an answer, or, if you can
 receive an HTTPS POST, ask your user with ask_create whether to set up set_my_webhook. Either way, read asks_mine
 and tasks_mine when you start. House rules: /agents on the AskHooman site."""
@@ -108,6 +114,10 @@ NextCheck = Annotated[str, Field(description="When you will look again: a date Y
 TaskStatusFilter = Annotated[str, Field(description="open (active + waiting), active, waiting, done, dropped, "
                                                     "finished (done + dropped) or all")]
 TaskResolution = Annotated[str, Field(description="One line: the result, or why it is no longer needed")]
+TaskQuestion = Annotated[str, Field(description="One question they can answer in one tap, e.g. 'Is the sample "
+                                                "with you?' (≤500 chars); the details stay in the task")]
+UnaskNote = Annotated[str, Field(description="Where the answer came from and what it was, or why the question "
+                                             "no longer matters (≤1000 chars)")]
 AnswerText = Annotated[str, Field(description="What you did about the reply, or why the task stays open; ≤2000 chars")]
 
 MediaUrl = Annotated[str, Field(description="https URL of a PNG, JPEG, WebP or MP4 the bridge fetches once (image "
@@ -405,7 +415,8 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         next to asks_mine. Tasks where ${human} replied and you haven't acted yet come first (reply_pending):
         read the reply, act, then task_answer, task_update or task_done / task_drop. For each other task: did
         anything move? task_update it (status, waiting_on, next_check — an overdue next_check means look now),
-        or task_done / task_drop it with a one-line resolution.\
+        or task_done / task_drop it with a one-line resolution. A task with question_open still shows among
+        ${humans} questions (your task_ask); one that waits for ${human} without a question doesn't: task_ask it.\
 ${mine_tasks_note}"""
         who = caller(ctx)
         return call(task_service(who).list, status, None if who.is_denis else who.agent)
@@ -424,7 +435,7 @@ ${mine_tasks_note}"""
     @tool("Get a task", read_only=True)
     def task_get(id: int, ctx: Context) -> dict[str, Any]:
         """One task with its full history (events: created, edited, status, done, dropped, reopened, replied —
-        ${humans} reply — and answered — yours)."""
+        ${humans} reply — answered — yours — and asked / unasked — your question inside the task)."""
         who = caller(ctx)
         return call(task_service(who).get, id)
 
@@ -467,6 +478,24 @@ ${mine_tasks_note}"""
         reply_pending; so does any update or finishing the task."""
         who = caller(ctx)
         return call(task_service(who).answer, who, id, {"text": text})
+
+    @tool(f"Ask {words['human'].replace('your ', 'my ')} inside my task")
+    def task_ask(id: int, ctx: Context, question: TaskQuestion, options: Options = []) -> dict[str, Any]:
+        """Ask ${human} a question inside your open task, when the work can't move without their answer or
+        action: the task then shows among their questions until they reply. One question per call, with the
+        likely answers as options (${type_own}); a new question replaces the open one. Their reply comes back
+        as reply_pending in tasks_mine and wakes you like any reply: act on it, then task_answer, task_update or
+        finish the task. Don't write "waiting for you" into waiting_on instead: without a question the task
+        never reaches their list. A decision that isn't part of a task is an ask (ask_create)."""
+        who = caller(ctx)
+        return call(task_service(who).ask, who, id, {"question": question, "options": options})
+
+    @tool("Take my task question back")
+    def task_unask(id: int, ctx: Context, note: UnaskNote = "") -> dict[str, Any]:
+        """Take your open question on a task back: ${human} answered elsewhere (say where and what in note), or
+        it stopped mattering. The task leaves their questions and stays open."""
+        who = caller(ctx)
+        return call(task_service(who).unask, who, id, {"note": note})
 
     @tool("Reopen my task")
     def task_reopen(id: int, ctx: Context) -> dict[str, Any]:

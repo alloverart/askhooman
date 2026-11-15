@@ -226,3 +226,43 @@ def test_task_replies_from_the_app_and_task_answer(hosted, google):
     assert hosted.post(f"/api/tasks/{first['id']}/reply", json={"text": "hi"}, headers=auth).status_code == 403
     tool_result(mcp(hosted, allen, "task_done", {"id": first["id"]}))
     assert "conflict" in tool_error(mcp(hosted, allen, "task_answer", {"id": first["id"], "text": "late"}))
+
+
+def test_task_questions_on_the_hosted_bridge(hosted, google):
+    """SPEC v5 "6. Task questions": the owner asks inside its task (an `asked` event in task-<id>.json), the
+    app's `replied` event answers it; question / question_open are derived from the file, never stored."""
+    allen = agent_token(hosted, google, "Allen")
+    feynman = agent_token(hosted, google, "Feynman")
+    drive = google.drive(DENIS_SUB)
+    task = tool_result(mcp(hosted, allen, "task_create", {"title": "Sew the sample"}))
+    assert (task["question"], task["question_open"]) == (None, False)
+    assert "no open question" in tool_error(mcp(hosted, allen, "task_unask", {"id": task["id"]}))
+    asked = tool_result(mcp(hosted, allen, "task_ask", {"id": task["id"], "question": "Which fabric?",
+                                                       "options": ["Cotton", "Linen"]}))
+    assert asked["question_open"] is True and asked["question"]["options"] == ["Cotton", "Linen"]
+    assert "events" not in asked
+    assert "forbidden" in tool_error(mcp(hosted, feynman, "task_ask", {"id": task["id"], "question": "Mine?"}))
+    assert "forbidden" in tool_error(mcp(hosted, feynman, "task_unask", {"id": task["id"]}))
+    assert "invalid" in tool_error(mcp(hosted, allen, "task_ask", {"id": task["id"], "question": "x" * 501}))
+    mine = tool_result(mcp(hosted, allen, "tasks_mine"))["tasks"]
+    assert (mine[0]["question_open"], mine[0]["question"]["text"]) == (True, "Which fabric?")
+    app_task_reply(drive, task["id"], "Linen")
+    got = tool_result(mcp(hosted, allen, "task_get", {"id": task["id"]}))
+    assert (got["question_open"], got["reply_pending"], got["reply"]["text"]) == (False, True, "Linen")
+    again = tool_result(mcp(hosted, allen, "task_ask", {"id": task["id"], "question": "And the colour?"}))
+    assert (again["question_open"], again["reply_pending"], again["question"]["options"]) == (True, False, [])
+    taken = tool_result(mcp(hosted, allen, "task_unask", {"id": task["id"], "note": "Decided on a call: navy"}))
+    assert taken["question_open"] is False and "events" not in taken
+    doc = drive.task_doc(task["id"])
+    assert "question" not in doc and "question_open" not in doc
+    assert [(e["kind"], e["actor"]) for e in doc["events"]] == [
+        ("created", "allen"), ("asked", "allen"), ("replied", "denis"), ("asked", "allen"), ("unasked", "allen")]
+    assert doc["events"][1]["payload"] == {"text": "Which fabric?", "options": ["Cotton", "Linen"]}
+    assert doc["events"][-1]["payload"] == {"note": "Decided on a call: navy"}
+    # REST for agents without MCP; finished tasks take no question
+    auth = {"Authorization": f"Bearer {allen}"}
+    r = hosted.post(f"/api/tasks/{task['id']}/ask", json={"question": "Buttons or a zip?"}, headers=auth)
+    assert r.status_code == 200 and r.json()["question_open"] is True
+    assert hosted.post(f"/api/tasks/{task['id']}/unask", headers=auth).json()["question_open"] is False
+    tool_result(mcp(hosted, allen, "task_done", {"id": task["id"]}))
+    assert "conflict" in tool_error(mcp(hosted, allen, "task_ask", {"id": task["id"], "question": "late"}))

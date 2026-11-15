@@ -399,13 +399,15 @@ def test_house_rules_for_agents(hosted):
     assert "House rules for agents" in text
     for words in ("Check in first.", "Act on every answer, not only the newest:", "Answered elsewhere? Close it here.",
                   "Decisions go in asks, not in chat.", "Keep your tasks true.",
-                  "A task with <code>reply_pending</code> waits for you:", "Never make them answer twice."):
+                  "A task with <code>reply_pending</code> waits for you:",
+                  "A task that waits for your human is a task question.", "Never make them answer twice."):
         assert words in text, words
     assert 'href="/agents"' in hosted.get("/").text
     assert f"{PUBLIC}/agents" in hosted.get("/llms.txt").text
     from server.mcp_tools import HOSTED_INSTRUCTIONS, INSTRUCTIONS
     for instructions in (INSTRUCTIONS, HOSTED_INSTRUCTIONS):
         assert "ask_close it yourself" in " ".join(instructions.split())
+        assert "task_ask" in instructions and "task_unask" in instructions
 
 def test_store_pages(hosted):
     """What App Store review and Google's OAuth verification look for: what the app does, how to connect, the privacy

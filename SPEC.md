@@ -159,7 +159,7 @@ Bridge details (implementation notes, 31.10):
 
 ## Tasks (v3)
 
-v3 adds **tasks**: long-running work an agent does itself (more than a day, or waiting on someone outside), so agents don't forget it and the human sees who is doing what. The human only **reads** tasks; they never wait for the human's decision (that is what asks are for).
+v3 adds **tasks**: long-running work an agent does itself (more than a day, or waiting on someone outside), so agents don't forget it and the human sees who is doing what. The human only **reads** tasks; they never wait for the human's decision (that is what asks are for; since v5 a task can carry one question to the human, see "6. Task questions").
 
 ### Data model
 
@@ -661,9 +661,47 @@ agent.
 - **Not in v5:** transcription on the server (the voice would go to our server or a third party: a privacy policy
   change and a cost), cloud recognizers, voice replies on tasks, attachments on tasks.
 
+### 6. Task questions
+
+Denis 15.11.2026: «Если задача ждёт ответа от меня, то это задача-вопрос: пусть показывается в списке вопросов; после
+ответа пропадает там и возвращается в задачи.» Before this, a task that waited for the user said so only in
+`waiting_on`, which the user never sees among their questions (measured that day: 43 open tasks, about 6 waiting for
+his own action). Server, MCP and CLI implemented 15.11.2026; the apps follow.
+
+- **Nothing new is stored.** A task question is two more kinds of `task_events`, written by the owner agent:
+  `asked` (payload `{text, options}`: `text` 1–500 chars, `options` ≤ 6 × ≤ 80 chars, cleaned like asks' options)
+  and `unasked` (payload `{note}`, ≤ 1000 chars or `null`). The status is not touched.
+- **Task object, two more derived fields** (computed from the events like `reply` / `reply_pending`, never stored,
+  never written to the Drive file): `question` = the latest `asked` event as `{id, at, text, options}` or `null`;
+  `question_open` = true while no `replied`, `unasked`, `done` or `dropped` event is newer than it. So the user's
+  reply answers the question, the owner can take it back, and finishing the task closes it (a reopened task has no
+  open question). A new `asked` replaces the open one. `asked` and `unasked` are the owner's events: they clear
+  `reply_pending` like `answered` does.
+- **The answer is the existing reply**: a `replied` event (`{text, preset: null}`; an option's text, with the user's
+  note on the next line as for asks), written by the app into the task file, followed by the same
+  `POST /api/events {task_id, kind: "replied"}`. The agent wakes on `task.replied` and finds the task first in
+  `tasks_mine` with `reply_pending`. No new event type, feed entry or webhook body.
+- **Rules:** only the owner asks and takes back (the user's token and other agents: 403); only on an open task
+  (finished: 409); `unask` without an open question: 409 `task #N has no open question`.
+- **REST:** `POST /api/tasks/{id}/ask {question, options?}` → task; `POST /api/tasks/{id}/unask {note?}` → task.
+  **MCP:** `task_ask(id, question, options=[])`, `task_unask(id, note="")`. **CLI:** `task ask ID --question Q
+  [--option O]...`, `task unask ID [--note N]`; `task show` prints the open question and the texts of `asked`,
+  `replied`, `answered` and `unasked` in the history.
+- **What agents are told** (server instructions, `tasks_mine`, `task_ask`, the /agents page): a task that can't move
+  without the user's answer or action gets a question with `task_ask`; a note in `waiting_on` never reaches the
+  user. Answered elsewhere: `task_unask` with a note saying where and what. What the user put off for later:
+  `task_drop` with a note (and `task_reopen` when they come back to it), not an open task.
+- **Apps:** a task with `question_open` is listed among the user's questions (Waiting) with a "Task" mark and the
+  task's title; opening it shows the question, its options as buttons and the reply box, then the task and its
+  history. The Waiting count and the badge count it as a question. After the reply it leaves Waiting and stays in
+  Tasks. Apps that don't know the new kinds show the task as before, with `asked` as a plain history line; a reply
+  from their task screen answers the question all the same.
+- **Not in this step:** attachments on a task question, a separate "reminder" kind for things the user does
+  without answering (they are a question like "Done?"), filtering `GET /api/tasks` by `question_open`.
+
 ### Order
 
-1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the agent's event feed + `ask_wait`, the Claude Code channel plugin, `askhooman listen`, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery` / `last_seen`, the Wake-up row in the apps. 3. `set_my_name`. 4. Pictures and video: the server (media files, `ask_attach` / `ask_upload` / `ask_detach`, `attachments` on create, REST, CLI, docstrings), then the web app (which is the Android app too), then iOS and macOS. 5. Voice answers, after pictures: the server (`answer_voice` rules, the media route, docstrings) and the privacy policy first, then the web app, then iOS and macOS, with the store privacy labels in the same release. Each step ships on its own; existing tools and file formats keep working throughout.
+1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the agent's event feed + `ask_wait`, the Claude Code channel plugin, `askhooman listen`, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery` / `last_seen`, the Wake-up row in the apps. 3. `set_my_name`. 4. Pictures and video: the server (media files, `ask_attach` / `ask_upload` / `ask_detach`, `attachments` on create, REST, CLI, docstrings), then the web app (which is the Android app too), then iOS and macOS. 5. Voice answers, after pictures: the server (`answer_voice` rules, the media route, docstrings) and the privacy policy first, then the web app, then iOS and macOS, with the store privacy labels in the same release. 6. Task questions: the server (rules, REST, MCP `task_ask` / `task_unask`, CLI, docstrings), then the web app, then iOS and macOS. Each step ships on its own; existing tools and file formats keep working throughout.
 
 ### Open questions (Denis)
 
