@@ -16,7 +16,7 @@ from .conftest import ALLEN, DENIS, HAMILTON, auth
 
 TASK_KEYS = {
     "id", "agent", "title", "context", "status", "waiting_on", "next_check", "links", "ref", "resolution",
-    "created_at", "updated_at", "finished_at", "reply", "reply_pending",
+    "created_at", "updated_at", "finished_at", "reply", "reply_pending", "question", "question_open",
 }
 
 
@@ -493,3 +493,105 @@ def test_rest_reply_permissions_and_validation(client):
     finish(client, task["id"])
     assert reply(client, task["id"], text="hi").status_code == 409
     assert answer(client, task["id"], text="hi").status_code == 409
+
+
+# ---------- task questions (SPEC v5 "6. Task questions") ----------
+
+def test_question_opens_and_the_users_reply_closes_it(tmp_dir):
+    tasks = _service(tmp_dir)
+    task_id = tasks.create(BOT, {"title": "Sew the sample"})["id"]
+    fresh = tasks.get(task_id)
+    assert (fresh["question"], fresh["question_open"]) == (None, False)
+    asked = tasks.ask(BOT, task_id, {"question": "Which fabric?", "options": ["Cotton", "Linen"]})
+    assert asked["question_open"] is True and "events" not in asked and asked["status"] == "active"
+    assert asked["question"] == {"id": asked["question"]["id"], "at": asked["question"]["at"],
+                                 "text": "Which fabric?", "options": ["Cotton", "Linen"]}
+    assert tasks.update(BOT, task_id, {"next_check": "2026-12-01"})["question_open"] is True
+    assert tasks.list("open")["tasks"][0]["question_open"] is True
+    replied = tasks.reply(DENIS_ID, task_id, {"text": "Cotton"})
+    assert (replied["question_open"], replied["reply_pending"], replied["question"]["text"]) == (
+        False, True, "Which fabric?")
+    again = tasks.ask(BOT, task_id, {"question": "And the colour?"})
+    assert (again["question_open"], again["reply_pending"], again["question"]["options"]) == (True, False, [])
+    full = tasks.get(task_id)
+    assert [(e["kind"], e["actor"]) for e in full["events"]] == [
+        ("created", "allen"), ("asked", "allen"), ("edited", "allen"), ("replied", "denis"), ("asked", "allen")]
+    assert full["events"][-1]["payload"] == {"text": "And the colour?", "options": []}
+
+
+def test_unask_and_finishing_close_the_question(tmp_dir):
+    from server.rules import Conflict, Forbidden, Invalid
+    tasks = _service(tmp_dir)
+    task_id = tasks.create(BOT, {"title": "Sew the sample"})["id"]
+    with pytest.raises(Conflict, match="no open question"):
+        tasks.unask(BOT, task_id, {})
+    tasks.ask(BOT, task_id, {"question": "Which fabric?"})
+    with pytest.raises(Forbidden):
+        tasks.unask(Identity("agent", "hamilton"), task_id, {})
+    with pytest.raises(Forbidden):
+        tasks.ask(DENIS_ID, task_id, {"question": "x"})
+    with pytest.raises(Invalid):
+        tasks.ask(BOT, task_id, {"question": ""})
+    taken_back = tasks.unask(BOT, task_id, {"note": "Answered in chat: cotton"})
+    assert taken_back["question_open"] is False and taken_back["question"]["text"] == "Which fabric?"
+    assert tasks.get(task_id)["events"][-1]["payload"] == {"note": "Answered in chat: cotton"}
+    with pytest.raises(Conflict, match="no open question"):
+        tasks.unask(BOT, task_id, {})
+    tasks.ask(BOT, task_id, {"question": "Linen then?"})
+    assert tasks.done(BOT, task_id)["question_open"] is False
+    with pytest.raises(Conflict):
+        tasks.ask(BOT, task_id, {"question": "x"})
+    with pytest.raises(Conflict):
+        tasks.unask(BOT, task_id, {})
+    assert tasks.reopen(BOT, task_id)["question_open"] is False   # a reopened task has no question
+    assert [e["kind"] for e in tasks.get(task_id)["events"]] == [
+        "created", "asked", "unasked", "asked", "done", "reopened"]
+
+
+def ask_question(client, task_id, token=ALLEN, **body):
+    return client.post(f"/api/tasks/{task_id}/ask", json=body, headers=auth(token))
+
+
+def unask(client, task_id, token=ALLEN, **body):
+    return client.post(f"/api/tasks/{task_id}/unask", json=body, headers=auth(token))
+
+
+def test_rest_ask_reply_and_unask(client):
+    task = create(client)
+    assert (task["question"], task["question_open"]) == (None, False)
+    r = ask_question(client, task["id"], question="Which fabric?", options=["Cotton", "Linen"])
+    assert r.status_code == 200, r.text
+    assert r.json()["question_open"] is True and r.json()["question"]["options"] == ["Cotton", "Linen"]
+    listed = client.get("/api/tasks", headers=auth(DENIS)).json()["tasks"]
+    assert [(t["id"], t["question_open"], t["question"]["text"]) for t in listed] == [
+        (task["id"], True, "Which fabric?")]
+    answered = reply(client, task["id"], text="Linen")
+    assert (answered.json()["question_open"], answered.json()["reply_pending"]) == (False, True)
+    assert unask(client, task["id"]).status_code == 409
+    assert ask_question(client, task["id"], question="And the colour?").status_code == 200
+    taken = unask(client, task["id"], note="Decided on a call: navy")
+    assert taken.status_code == 200 and taken.json()["question_open"] is False
+    events = get(client, task["id"])["events"]
+    assert [e["kind"] for e in events] == ["created", "asked", "replied", "asked", "unasked"]
+    assert events[-1]["payload"] == {"note": "Decided on a call: navy"}
+
+
+def test_rest_ask_permissions_and_validation(client):
+    task = create(client)
+    assert ask_question(client, task["id"], token=DENIS, question="x").status_code == 403     # the user doesn't ask
+    assert ask_question(client, task["id"], token=HAMILTON, question="x").status_code == 403  # not the owner
+    assert ask_question(client, task["id"]).status_code == 422
+    assert ask_question(client, task["id"], question="  ").status_code == 422
+    assert ask_question(client, task["id"], question="x" * 501).status_code == 422
+    assert ask_question(client, task["id"], question="x", options=["a"] * 7).status_code == 422
+    assert ask_question(client, task["id"], question="x", extra=1).status_code == 422
+    assert ask_question(client, 999, question="x").status_code == 404
+    assert unask(client, 999).status_code == 404
+    assert ask_question(client, task["id"], question="x").status_code == 200
+    assert unask(client, task["id"], token=HAMILTON).status_code == 403
+    assert unask(client, task["id"], token=DENIS).status_code == 403
+    assert unask(client, task["id"], note="x" * 1001).status_code == 422
+    assert unask(client, task["id"], text="x").status_code == 422
+    finish(client, task["id"])
+    assert ask_question(client, task["id"], question="x").status_code == 409
+    assert unask(client, task["id"]).status_code == 409

@@ -455,6 +455,10 @@ moves, <code>task_update</code> it (status, <code>waiting_on</code>, <code>next_
 result.</li>
 <li><b>A task with <code>reply_pending</code> waits for you:</b> act on your human's reply, then <code>task_answer</code>
 it (or update or finish the task).</li>
+<li><b>A task that waits for your human is a task question.</b> When the work can't move without their answer or
+action, <code>task_ask</code> it inside the task: it shows among their questions until they reply. A note in
+<code>waiting_on</code> never reaches them. Answered elsewhere? <code>task_unask</code> with a note. What they put off
+for later: <code>task_drop</code> with a note, and reopen it when they come back to it.</li>
 <li><b>Wake up when they answer.</b> In Claude Code, suggest the AskHooman plugin to your human (one install, no
 server: <code>/plugin marketplace add alloverart/askhooman</code>). Elsewhere, call <code>ask_wait</code> while you
 wait for an answer. If you can receive an HTTPS POST, ask your human (with <code>ask_create</code>) whether to set up

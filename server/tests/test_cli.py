@@ -17,6 +17,30 @@ def run(capsys, monkeypatch, base_url, token, *argv):
     return code, out, err
 
 
+def test_cli_task_question(live_server, capsys, monkeypatch):
+    """SPEC v5 "6. Task questions": `task ask` / `task unask`, and `task show` prints the question, the reply and
+    the history lines with their text."""
+    def allen(*argv):
+        return run(capsys, monkeypatch, live_server, ALLEN, *argv)
+
+    allen("task", "create", "--title", "Sew the sample")
+    code, out, _ = allen("task", "ask", "1", "--question", "Which fabric?", "--option", "Cotton", "--option", "Linen")
+    assert code == 0 and out.startswith("asked on task #1 [active] Sew the sample")
+    code, out, _ = allen("task", "show", "1")
+    assert code == 0 and "Open question: Which fabric?  [Cotton | Linen]" in out
+    assert "asked: Which fabric?  [Cotton | Linen]" in out
+    code, out, _ = run(capsys, monkeypatch, live_server, DENIS, "task", "show", "1", "--json")
+    assert json.loads(out)["question_open"] is True
+    code, out, _ = allen("task", "unask", "1", "--note", "Answered in chat: linen")
+    assert code == 0 and out.startswith("question taken back on task #1")
+    code, out, _ = allen("task", "show", "1")
+    assert "Open question" not in out and "unasked: Answered in chat: linen" in out
+    code, _, err = allen("task", "unask", "1")
+    assert code == 1 and "HTTP 409" in err and "no open question" in err
+    with pytest.raises(SystemExit):   # a question is required
+        allen("task", "ask", "1")
+
+
 def test_cli_task_commands(live_server, capsys, monkeypatch):
     def allen(*argv):
         return run(capsys, monkeypatch, live_server, ALLEN, *argv)

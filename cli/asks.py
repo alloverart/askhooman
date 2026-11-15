@@ -22,6 +22,8 @@ Tasks (long-running work an agent does itself; the human only reads them):
           --waiting-on "Supplier support reply" --next-check 2026-11-03 --ref "chat 5591"
   asks.py task update 3 --status active --next-check ""     ("" clears a field)
   asks.py task done 3 --resolution "Supplier confirmed"
+  asks.py task ask 3 --question "Is the sample with you?" --option "Yes" --option "Not yet"
+          the task shows among the human's questions until they reply; `task unask 3 --note "..."` takes it back
 
 Waking up (the hosted bridge, ASKS_URL=https://askhooman.com with an agent key): wait for the user's answers and
 replies and run a command per event, with ASKHOOMAN_EVENT and ASKHOOMAN_ASK_ID / ASKHOOMAN_TASK_ID set:
@@ -345,7 +347,18 @@ def task_event_summary(event: dict) -> str:
         return f"{kind}: {resolution}" if resolution else kind
     if kind == "reopened" and payload.get("previous_status"):
         return f"reopened (was {payload['previous_status']})"
+    if kind == "asked":
+        return f"asked: {question_line(payload)}"
+    if kind in ("replied", "answered", "unasked"):
+        text = first_line(payload.get("note" if kind == "unasked" else "text"))
+        return f"{kind}: {text}" if text else kind
     return kind
+
+
+def question_line(question: dict) -> str:
+    """A task question on one line: its text, then the options in brackets."""
+    options = [o for o in question.get("options") or [] if isinstance(o, str)]
+    return first_line(question.get("text")) + (f"  [{' | '.join(options)}]" if options else "")
 
 
 def print_task(t: dict) -> None:
@@ -360,6 +373,8 @@ def print_task(t: dict) -> None:
         print(f"Waiting on: {t['waiting_on']}")
     if t.get("next_check"):
         print(f"Next {check_note(t['next_check'])}")
+    if t.get("question_open") and isinstance(t.get("question"), dict):
+        print(f"Open question: {question_line(t['question'])}")
     if t.get("context"):
         print("\nContext:")
         print(indented(t["context"]))
@@ -705,6 +720,16 @@ def cmd_task_reopen(client, args):
     show_task(client.request("POST", f"/api/tasks/{args.id}/reopen", body={}), args, "reopened")
 
 
+def cmd_task_ask(client, args):
+    body = {"question": args.question, "options": args.option or []}
+    show_task(client.request("POST", f"/api/tasks/{args.id}/ask", body=body), args, "asked on")
+
+
+def cmd_task_unask(client, args):
+    body = {"note": args.note} if args.note is not None else {}
+    show_task(client.request("POST", f"/api/tasks/{args.id}/unask", body=body), args, "question taken back on")
+
+
 # ---------- listen: wake on the user's actions (hosted bridge, SPEC v5) ----------
 
 LISTEN_WAIT = 50  # seconds the bridge holds each long poll
@@ -857,7 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, help="max tasks (server default 200; 100 for done/dropped/finished)")
     p.set_defaults(func=cmd_tasks)
 
-    p = sub.add_parser("task", help="one task: show, create, update, done, drop, reopen")
+    p = sub.add_parser("task", help="one task: show, create, update, done, drop, reopen, ask, unask")
     tsub = p.add_subparsers(dest="task_command", metavar="ACTION", required=True)
 
     def task_flags(q, update: bool):
@@ -896,6 +921,18 @@ def build_parser() -> argparse.ArgumentParser:
     q = tsub.add_parser("reopen", parents=[raw], help="reopen my done or dropped task")
     q.add_argument("id", type=int)
     q.set_defaults(func=cmd_task_reopen)
+
+    q = tsub.add_parser("ask", parents=[raw], help="ask the human a question inside my task: it shows among "
+                                                   "their questions until they reply")
+    q.add_argument("id", type=int)
+    q.add_argument("--question", required=True, help="one question they can answer in one tap (up to 500 chars)")
+    q.add_argument("--option", action="append", help="a likely answer (repeat, up to 6)")
+    q.set_defaults(func=cmd_task_ask)
+
+    q = tsub.add_parser("unask", parents=[raw], help="take my open question on a task back")
+    q.add_argument("id", type=int)
+    q.add_argument("--note", help="where the answer came from, or why it no longer matters")
+    q.set_defaults(func=cmd_task_unask)
 
     p = sub.add_parser("listen", help="wait for the user's answers and replies (hosted bridge, agent key); "
                                       "one JSON line per event")

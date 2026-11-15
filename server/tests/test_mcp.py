@@ -15,7 +15,7 @@ from .conftest import ALLEN, CHAT, DENIS, HAMILTON, auth
 
 TOOLS = {"ask_create", "asks_mine", "asks_list", "ask_get", "ask_update", "ask_close", "ask_answer",
          "task_create", "tasks_mine", "tasks_list", "task_get", "task_update", "task_done", "task_drop", "task_reopen",
-         "task_answer"}
+         "task_answer", "task_ask", "task_unask"}
 
 
 @asynccontextmanager
@@ -123,7 +123,7 @@ def test_every_tool_has_a_title_and_explicit_hints(live_server):
             assert t.annotations.read_only_hint is not None and t.annotations.destructive_hint is False, t.name
         assert {t.name for t in tools if t.annotations.read_only_hint} == {
             "asks_mine", "asks_list", "ask_get", "tasks_mine", "tasks_list", "task_get"}
-        assert len(tools) == 16  # single-tenant: ask_answer too; v5: task_answer
+        assert len(tools) == 18  # single-tenant: ask_answer too; v5: task_answer, task_ask, task_unask
 
     asyncio.run(scenario())
 
@@ -328,6 +328,40 @@ def test_mcp_task_answer_and_reply_pending_docs(live_server):
             assert answered["reply_pending"] is False
             payload(await allen.call_tool("task_done", {"id": task["id"]}))
             assert "done" in error_text(await allen.call_tool("task_answer", {"id": task["id"], "text": "late"}))
+
+    asyncio.run(scenario())
+
+
+def test_mcp_task_ask_and_unask(live_server):
+    """SPEC v5 "6. Task questions": the owner asks its human inside a task; the reply closes the question."""
+    from server.mcp_tools import HOSTED_INSTRUCTIONS, INSTRUCTIONS
+    for text in (INSTRUCTIONS, HOSTED_INSTRUCTIONS):
+        assert "task_ask" in text and "drop" in text
+
+    async def scenario():
+        async with connect(live_server, ALLEN) as allen, connect(live_server, HAMILTON) as hamilton:
+            tools = {t.name: t for t in (await allen.list_tools()).tools}
+            assert tools["task_ask"].title == "Ask my human inside my task"
+            assert "waiting_on" in tools["task_ask"].description and "ask_create" in tools["task_ask"].description
+            assert tools["task_unask"].title == "Take my task question back"
+            assert "question_open" in tools["tasks_mine"].description
+            assert "asked" in tools["task_get"].description and "unasked" in tools["task_get"].description
+            assert set(tools["task_ask"].input_schema["required"]) == {"id", "question"}
+            task = payload(await allen.call_tool("task_create", {"title": "Sew the sample"}))
+            asked = payload(await allen.call_tool(
+                "task_ask", {"id": task["id"], "question": "Which fabric?", "options": ["Cotton", "Linen"]}))
+            assert asked["question_open"] is True and asked["question"]["options"] == ["Cotton", "Linen"]
+            assert "only the agent who owns" in error_text(
+                await hamilton.call_tool("task_ask", {"id": task["id"], "question": "Mine?"}))
+            async with httpx.AsyncClient(base_url=live_server) as http:
+                r = await http.post(f"/api/tasks/{task['id']}/reply", json={"text": "Linen"}, headers=auth(DENIS))
+                assert r.status_code == 200, r.text
+            mine = payload(await allen.call_tool("tasks_mine", {}))
+            assert (mine["tasks"][0]["question_open"], mine["tasks"][0]["reply_pending"]) == (False, True)
+            assert "no open question" in error_text(await allen.call_tool("task_unask", {"id": task["id"]}))
+            payload(await allen.call_tool("task_ask", {"id": task["id"], "question": "And the colour?"}))
+            taken = payload(await allen.call_tool("task_unask", {"id": task["id"], "note": "Decided on a call"}))
+            assert taken["question_open"] is False
 
     asyncio.run(scenario())
 

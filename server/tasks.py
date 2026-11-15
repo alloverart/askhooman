@@ -27,11 +27,13 @@ from .task_rules import (  # noqa: F401  (re-exported: older imports use server.
     default_limit,
     plan_finish,
     plan_task_answer,
+    plan_task_ask,
     plan_task_create,
     plan_task_reopen,
     plan_task_reply,
+    plan_task_unask,
     plan_task_update,
-    reply_state,
+    task_state,
 )
 from .tokens import Identity
 
@@ -134,6 +136,14 @@ class TaskService:
         """The owner answers the user's reply."""
         return self._event_only(plan_task_answer, who, task_id, data)
 
+    def ask(self, who: Identity, task_id: int, data: dict) -> dict:
+        """The owner asks the user a question inside its task (SPEC v5 "6. Task questions")."""
+        return self._event_only(plan_task_ask, who, task_id, data)
+
+    def unask(self, who: Identity, task_id: int, data: dict) -> dict:
+        """The owner takes its open question back."""
+        return self._event_only(plan_task_unask, who, task_id, data, with_events=True)
+
     def done(self, who: Identity, task_id: int, resolution=None) -> dict:
         return self._finish(who, task_id, "done", resolution)
 
@@ -158,20 +168,30 @@ class TaskService:
         self._changed(task_id)
         return self.get(task_id, with_events=False)
 
-    def _event_only(self, plan, who: Identity, task_id: int, data: dict) -> dict:
+    def _event_only(self, plan, who: Identity, task_id: int, data: dict, with_events: bool = False) -> dict:
+        """A transition that only writes an event. With `with_events` the rules get the task's history too."""
         now = utc_now()
+
+        def load(conn):
+            task = self._load(conn, task_id)
+            if with_events:
+                rows = conn.execute("SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,))
+                task["events"] = [event_from_row(r, "task_id") for r in rows]
+            return task
+
         with self.db.transaction(write=True) as conn:
-            _, change = plan(who, data, lambda: self._load(conn, task_id), now)
+            _, change = plan(who, data, lambda: load(conn), now)
             self._apply(conn, task_id, who, change)
         self._changed(task_id)
         return self.get(task_id, with_events=False)
 
     @staticmethod
     def _with_reply(conn, tasks: "list[dict]") -> None:  # quoted: `list` is the method above, in this class body
-        """Set the derived `reply` / `reply_pending` (task_rules.reply_state) on each task, in place."""
+        """Set the derived fields (task_rules.task_state: reply / reply_pending, question / question_open) on
+        each task, in place."""
         if not tasks:
             return
-        kinds = ("replied", *OWNER_KINDS)
+        kinds = ("replied", *OWNER_KINDS)  # every kind the derived fields read (the question's closers are in)
         ids = [t["id"] for t in tasks]
         rows = conn.execute(
             f"SELECT * FROM task_events WHERE task_id IN ({', '.join('?' * len(ids))}) "
@@ -183,7 +203,7 @@ class TaskService:
             event = event_from_row(row, "task_id")
             events.setdefault(event["task_id"], []).append(event)
         for task in tasks:
-            task.update(reply_state(events.get(task["id"], [])))
+            task.update(task_state(events.get(task["id"], [])))
 
     def _apply(self, conn, task_id: int, who: Identity, change: Change) -> None:
         """Write a transition's field updates and its event."""

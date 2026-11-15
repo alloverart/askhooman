@@ -20,6 +20,7 @@ from .rules import (
     Loader,
     _Desc,
     _links,
+    _options,
     _text,
 )
 from .tokens import Identity
@@ -48,8 +49,14 @@ PRESETS = {  # ids and texts are part of the contract: agents match them, the ap
     "not-needed": "Not needed, please drop it",
     "nudge": "Nudge them again",
 }
+# Task questions (SPEC v5 "6. Task questions"): the owner asks the user inside its task; the user's reply answers.
+QUESTION_MAX = 500
+UNASK_NOTE_MAX = 1000
 # The owner's own events: any of them after the user's reply means the agent has acted on it.
-OWNER_KINDS = ("answered", "edited", "status", "done", "dropped", "reopened")
+OWNER_KINDS = ("answered", "edited", "status", "done", "dropped", "reopened", "asked", "unasked")
+# What closes a question: the user's reply, the owner taking it back, and finishing the task (so a reopened
+# task starts without one).
+QUESTION_CLOSERS = ("replied", "unasked", "done", "dropped")
 DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
@@ -184,10 +191,40 @@ def plan_task_answer(who: Identity, data: dict, load: Loader, now: str) -> tuple
     return task, Change({"updated_at": now}, "answered", {"text": text}, now)
 
 
-def _reply_fields(data: dict, allowed: tuple[str, ...]) -> tuple[str, str | None]:
+def plan_task_ask(who: Identity, data: dict, load: Loader, now: str) -> tuple[dict, Change]:
+    """The owner asks the user a question inside its open task: the task then shows among the user's questions
+    until they reply. A new question replaces the open one. The status stays."""
+    _only_fields(data, ("question", "options"))
+    text = _text(data.get("question"), "question", QUESTION_MAX, required=True)
+    options = _options(data.get("options"))
+    task = load()
+    check_owner(who, task, "ask a question on")
+    _check_open(task, "questions go to open tasks")
+    return task, Change({"updated_at": now}, "asked", {"text": text, "options": options}, now)
+
+
+def plan_task_unask(who: Identity, data: dict, load: Loader, now: str) -> tuple[dict, Change]:
+    """The owner takes its open question back (answered elsewhere, or it stopped mattering). `load` returns the
+    task with its `events`: whether a question is open is read from the history."""
+    _only_fields(data, ("note",))
+    note = _text(data.get("note"), "note", UNASK_NOTE_MAX)
+    task = load()
+    check_owner(who, task, "take back a question on")
+    _check_open(task, "it has no open question")
+    events = task.get("events")
+    if not question_state(events if isinstance(events, list) else [])["question_open"]:
+        raise Conflict(f"task #{task['id']} has no open question")
+    return task, Change({"updated_at": now}, "unasked", {"note": note}, now)
+
+
+def _only_fields(data: dict, allowed: tuple[str, ...]) -> None:
     unknown = set(data) - set(allowed)
     if unknown:
         raise Invalid(f"unknown fields: {', '.join(sorted(unknown))}")
+
+
+def _reply_fields(data: dict, allowed: tuple[str, ...]) -> tuple[str, str | None]:
+    _only_fields(data, allowed)
     text = _text(data.get("text"), "text", REPLY_MAX, required=True)
     preset = data.get("preset")
     if preset is not None and not isinstance(preset, str):
@@ -219,6 +256,32 @@ def reply_state(events: list) -> dict:
     reply = {"id": last_reply["id"], "at": last_reply.get("at"), "text": payload.get("text"),
              "preset": payload.get("preset")}
     return {"reply": reply, "reply_pending": last_reply["id"] > last_owner}
+
+
+def question_state(events: list) -> dict:
+    """`question` = the owner's latest question {id, at, text, options} or None; `question_open` while nothing
+    has closed it since (QUESTION_CLOSERS). Derived from the events, never stored; junk in a file is skipped."""
+    last_asked, last_closer = None, 0
+    for event in events:
+        if not isinstance(event, dict) or not isinstance(event.get("id"), int) or isinstance(event.get("id"), bool):
+            continue
+        if event.get("kind") == "asked":
+            if last_asked is None or event["id"] > last_asked["id"]:
+                last_asked = event
+        elif event.get("kind") in QUESTION_CLOSERS:
+            last_closer = max(last_closer, event["id"])
+    if last_asked is None:
+        return {"question": None, "question_open": False}
+    payload = last_asked.get("payload") if isinstance(last_asked.get("payload"), dict) else {}
+    options = payload.get("options") if isinstance(payload.get("options"), list) else []
+    question = {"id": last_asked["id"], "at": last_asked.get("at"), "text": payload.get("text"),
+                "options": [o for o in options if isinstance(o, str)]}
+    return {"question": question, "question_open": last_asked["id"] > last_closer}
+
+
+def task_state(events: list) -> dict:
+    """Every derived field of a task: reply / reply_pending and question / question_open."""
+    return {**reply_state(events), **question_state(events)}
 
 
 def check_owner(who: Identity, task: dict, action: str) -> None:

@@ -96,6 +96,15 @@ class TaskAnswerIn(StrictBody):  # POST /api/tasks/{id}/answer (the owner agent;
     text: str
 
 
+class TaskAskIn(StrictBody):  # POST /api/tasks/{id}/ask (the owner agent; SPEC v5 "6. Task questions")
+    question: str
+    options: list[str] | None = None
+
+
+class TaskUnaskIn(StrictBody):  # POST /api/tasks/{id}/unask (the owner agent)
+    note: str | None = None
+
+
 class TaskPatch(StrictBody):
     title: str | None = None
     context: str | None = None
@@ -374,6 +383,16 @@ def add_api_routes(app: FastAPI, services, ask_create: Callable[[Identity, dict]
     @app.post("/api/tasks/{task_id}/answer")
     def answer_task(task_id: int, body: TaskAnswerIn, who: Identity = Depends(current_identity)):
         return services(who)[1].answer(who, task_id, body.model_dump())
+
+    # task questions (v5): the owner agent asks the user inside its task; the user's reply answers it
+
+    @app.post("/api/tasks/{task_id}/ask")
+    def ask_on_task(task_id: int, body: TaskAskIn, who: Identity = Depends(current_identity)):
+        return services(who)[1].ask(who, task_id, body.model_dump(exclude_unset=True))
+
+    @app.post("/api/tasks/{task_id}/unask")
+    def unask_on_task(task_id: int, body: TaskUnaskIn | None = None, who: Identity = Depends(current_identity)):
+        return services(who)[1].unask(who, task_id, body.model_dump(exclude_unset=True) if body else {})
 
 
 def create_app(settings: Settings | None = None, notifier: Notifier | None = None,
