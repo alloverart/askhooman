@@ -5,7 +5,11 @@
   PATCH  /api/agents/{id}        {name?, webhook_url?, rotate_webhook_secret?, wake?, color?, avatar?}
                                  -> agent (+ webhook_secret, once)
   DELETE /api/agents/{id}        revoke: every token and key of the agent stops working at once
-  POST   /api/agents/keys        {name} -> 201 {agent, key}: an agent key (qtk_…), shown only in this response
+  POST   /api/agents/keys        {name, existing?} -> 201 {agent, key}: an agent key (qtk_…), shown only in this
+                                 response, for a new agent of that name; a name that means a connected agent is
+                                 409, or, with existing: true, the key goes to that agent
+  POST   /api/agents/{id}/keys   -> 201 {agent, key}: another key for that connected agent (the app's "Create
+                                 key" on its row); its sign-ins and earlier keys keep working
   GET    /api/connect-info       the MCP URL and per-client setup snippets
   POST   /api/events             {ask_id, kind: answered|closed|reopened} or {task_id, kind: replied} after the user
                                  acted in the app -> an event in the owner agent's feed (feed.py) and a call to its
@@ -345,7 +349,11 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
         if "avatar" in given:
             look["avatar"] = clean_avatar(given["avatar"])
         if body.name is not None:
-            agent = accounts.rename_agent(agent, body.name)
+            try:
+                agent = accounts.rename_agent(agent, body.name)
+            except NameTaken as taken:
+                raise Conflict(f"an agent named {taken.agent['name']} is already connected; choose another "
+                               "name") from None
         secret = None
         if "webhook_url" in given or body.rotate_webhook_secret:
             url = given.get("webhook_url", agent.get("webhook_url"))
@@ -378,6 +386,13 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
         except NameTaken as taken:
             raise Conflict(f"an agent named {taken.agent['name']} is already connected; send existing: true to "
                            "give it a key, or choose another name") from None
+        return key_reply(user, agent, key)
+
+    @app.post("/api/agents/{agent_id}/keys", status_code=201)
+    def create_key_for(agent_id: str, user: AppUser = Depends(app_user)):
+        return key_reply(user, *accounts.key_for(own(user, agent_id)))
+
+    def key_reply(user: AppUser, agent: dict, key: str) -> dict:
         return {"agent": agent_json(agent), "key": key, "drive_linked": accounts.drive_linked(user.sub),
                 "link_url": f"{settings.public_url}/oauth/link"}
 

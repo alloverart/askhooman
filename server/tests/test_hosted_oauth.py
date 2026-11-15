@@ -19,6 +19,7 @@ from .hosted_support import (
     connect,
     consent,
     csrf_of,
+    id_token,
     mcp,
     pkce,
     query,
@@ -182,6 +183,27 @@ def test_a_shared_cimd_client_never_prefills_or_takes_over_an_agent(hosted, goog
     ogilvy = connect(hosted, google, CIMD_URL, CIMD_REDIRECT, agent="Ogilvy")
     ask = tool_result(mcp(hosted, ogilvy["access_token"], "ask_create", {"title": "Thanksgiving prints?"}))
     assert ask["agent"] == "ogilvy"
+
+
+def test_connecting_as_a_renamed_agent_is_that_agent(hosted, google):
+    """A renamed agent ("Allen" -> "Sonya Allen", slug allen): its shown name and its first name both offer
+    "Connect as existing agent", and confirming connects as it (the confirm form posts the shown name, which once
+    made a second agent sonya-allen)."""
+    google.publish(CIMD_URL, cimd_document(), headers={"Cache-Control": "max-age=600"})
+    connect(hosted, google, CIMD_URL, CIMD_REDIRECT, agent="Allen")
+    agent_id = hosted.get("/api/agents", headers=id_token(google)).json()["agents"][0]["id"]
+    hosted.patch(f"/api/agents/{agent_id}", json={"name": "Sonya Allen"}, headers=id_token(google))
+    for typed_name in ("Sonya Allen", "allen"):
+        consent_url = to_consent(hosted, google, authorize(hosted, CIMD_URL, pkce()[1], CIMD_REDIRECT))
+        page = hosted.get(consent_url).text
+        typed = hosted.post(consent_url, data={"csrf": csrf_of(page), "agent_name": typed_name, "action": "allow"},
+                            follow_redirects=False)
+        assert typed.status_code == 200 and "Connect as existing agent Sonya Allen" in typed.text, typed_name
+        confirmed = hosted.post(consent_url, data={"csrf": csrf_of(typed.text), "agent_name": "Sonya Allen",
+                                                   "confirm": "allen", "action": "allow"}, follow_redirects=False)
+        assert confirmed.status_code == 303, confirmed.text
+    active = [a for a in hosted.store.all("agents").values() if not a["revoked_at"]]
+    assert [(a["name"], a["slug"]) for a in active] == [("Sonya Allen", "allen")]
 
 
 def test_reconnecting_with_the_same_name_is_the_same_agent(hosted, google):

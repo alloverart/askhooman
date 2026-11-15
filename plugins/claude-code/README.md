@@ -11,8 +11,9 @@ your text. No server or public URL is needed: the plugin keeps one long poll ope
 
 ## Install
 
-1. In the AskHooman app (Settings on iPhone and Mac, Agents on the web): Create agent key, with the name of the agent that already asks you
-   (then "Use the existing agent"). Save the key:
+1. In the AskHooman app (Settings on iPhone and Mac, Agents on the web): open the … menu of the agent that already asks you and choose
+   Create key. (An app version without that item: Create agent key, type that agent's name exactly as the list shows it, then "Use the
+   existing agent".) Save the key:
 
        mkdir -p ~/.config/askhooman && pbpaste > ~/.config/askhooman/key && chmod 600 ~/.config/askhooman/key
 
