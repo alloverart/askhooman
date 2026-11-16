@@ -422,11 +422,15 @@ def test_store_pages(hosted):
     landing, privacy, support = (" ".join(pages[p].text.split()) for p in ("/", "/privacy", "/support"))  # as rendered
     assert f"<code class=\"url\">{RESOURCE}</code>" in landing
     assert "Add custom connector" in landing and f"claude mcp add --scope user --transport http askhooman {RESOURCE}" in landing
-    for words in ("In review at the App Store", "In review at Google Play", "Open the web app",
+    for words in ("In review at Google Play", "Open the web app",
                   '<a href="https://app.askhooman.com">app.askhooman.com</a>',
+                  # the iPhone/iPad and Mac apps are on sale (one App Store record for both): each card links to it
+                  '<a href="https://apps.apple.com/app/id6829153687">Download on the App Store</a>',
+                  '<a href="https://apps.apple.com/app/id6829153687">Download on the Mac App Store</a>',
                   "Apache-2.0", "drive.appdata",
                   "We keep only your account email, an encrypted Google token and your agents' names and keys"):
         assert words in landing, words
+    assert "In review at the App Store" not in landing and landing.count("Available now") == 4
     for words in ("Effective 1 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
                   "will adhere to the <a href=\"https://developers.google.com/terms/api-services-user-data-policy\">"
                   "Google API Services User Data Policy</a>, including the Limited Use requirements",
