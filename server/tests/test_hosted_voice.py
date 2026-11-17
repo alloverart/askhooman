@@ -757,8 +757,8 @@ def test_media_route_content_type_from_allowlist(hosted, google):
 
 
 def test_media_route_rate_limit(hosted, google):
-    """60 requests a minute per user, all their agents' links together: the 61st is 429 with Retry-After. Another
-    user's links go on."""
+    """60 requests a minute for each agent of a user, counted once the token opens: the 61st is 429 with Retry-After.
+    The user's other agents and other users go on, so one leaked or revoked link can't block them."""
     allen = agent(hosted, google)
     feynman = agent(hosted, google, "Feynman")
     drive = google.drive(DENIS_SUB)
@@ -766,17 +766,78 @@ def test_media_route_rate_limit(hosted, google):
     tool_result(mcp(hosted, feynman, "ask_create", {"title": "Paint?"}))
     answered_by_voice(drive, 1)
     answered_by_voice(drive, 2)
-    paths = (link(hosted, allen, 1), link(hosted, feynman, 2))
+    allen_path, feynman_path = link(hosted, allen, 1), link(hosted, feynman, 2)
     for n in range(60):
-        assert hosted.get(paths[n % 2]).status_code == 200, n
-    for path in paths:
+        assert hosted.get(allen_path).status_code == 200, n
+    for n in range(60):
+        assert hosted.get(feynman_path).status_code == 200, n
+    for path in (allen_path, feynman_path):
         response = hosted.get(path)
         assert response.status_code == 429 and response.headers["retry-after"] == "60"
-        assert response.json() == {"detail": "too many requests for recordings: at most 60 a minute"}
+        assert response.json() == {"detail": "too many requests for recordings: at most 60 a minute per agent"}
+    assert hosted.get("/media/v1/v1.k1.garbage").status_code == 404  # a token that doesn't open counts for nobody
     olga = agent(hosted, google, "Olga's bot", sub=OLGA_SUB, email=OLGA_EMAIL)
     tool_result(mcp(hosted, olga, "ask_create", {"title": "Hers?"}))
     answered_by_voice(google.drive(OLGA_SUB), 1)
     assert hosted.get(link(hosted, olga)).status_code == 200
+
+
+def test_media_route_oversized_file_without_size_404(hosted, google):
+    """A file over 5 MB for which Drive reports no size: the download stops at the cap and the answer is the one 404
+    (not a 503 that would tell the agent to try again)."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    answered_by_voice(drive, 1, raw=bytes(5 * MB + 1), bytes=1000)
+    path = link(hosted, token)
+    real = drive._fields
+
+    def no_size(file, fields):
+        found = real(file, fields)
+        found.pop("size", None)
+        return found
+
+    drive._fields = no_size
+    response = hosted.get(path)
+    drive._fields = real
+    assert (response.status_code, response.json()) == (404, NOT_FOUND)
+    assert hosted.app.state.media.guard.slots.in_use == 0
+
+
+class Watch:
+    """The app, noting the media slots in use whenever a recording's body goes out."""
+
+    def __init__(self, app):
+        self.app = app
+        self.seen: list[int] = []
+
+    async def __call__(self, scope, receive, send):
+        async def watched(message):
+            if message["type"] == "http.response.body" and scope["path"].startswith("/media/v1/"):
+                self.seen.append(self.app.state.media.guard.slots.in_use)
+            await send(message)
+
+        await self.app(scope, receive, watched)
+
+
+def test_media_slot_held_until_the_response_is_sent(google):
+    """The recording's bytes keep their media slot until they have been sent, so the bound on media in flight
+    (deploy/hosted/README.md) holds for voice too; the slot comes back after, whatever the outcome."""
+    app, _ = build(google)
+    watch = Watch(app)
+    with TestClient(watch, base_url=PUBLIC) as hosted:
+        token = agent(hosted, google)
+        drive = google.drive(DENIS_SUB)
+        tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+        voice = answered_by_voice(drive, 1)
+        path = link(hosted, token)
+        slots = app.state.media.guard.slots
+        assert hosted.get(path).content == AUDIO
+        assert watch.seen == [1] and slots.in_use == 0
+        drive.fail_next("GET", f"/drive/v3/files/{voice['file_id']}", 500, after=1)
+        assert hosted.get(path).status_code == 503 and slots.in_use == 0
+        drive.files[voice["file_id"]]["content"] = bytes(5 * MB + 1)
+        assert hosted.get(path).status_code == 404 and slots.in_use == 0
 
 
 def test_media_route_drive_unavailable_503(hosted, google):
