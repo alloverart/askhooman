@@ -48,8 +48,9 @@ ASK_GET_VOICE = ("On your own ask answered by voice, answer_voice.url is a new l
                  "as in asks_mine; other agents get url null.")
 ASK_CLOSE_VOICE = ("Closing deletes the recording of a voice answer (answer_voice) from your user's Drive: download it "
                    "first if you still need it.")
-LLMS_VOICE = ("- answer_voice on an answered ask: your human answered by voice; answer_voice.url (asks_mine, ask_get; "
-              "valid 1 h) downloads the recording to listen to or transcribe; ask_close deletes it")
+LLMS_VOICE = ("- answer_voice on an answered ask: your human answered by voice; answer_voice.url (asks_mine, ask_get, "
+              "GET /api/asks/{id}; valid 1 h) downloads the recording to listen to or transcribe. Closing or reopening "
+              "the ask (ask_close, POST /api/asks/{id}/close or /reopen) deletes the recording.")
 NOT_FOUND = {"detail": "no such recording, or the link has expired: read the ask again for a new link"}
 GONE = {"detail": "the recording was deleted"}
 VOICE_KEYS = ("file_id", "mime", "bytes", "duration_ms", "lang", "transcript_source", "transcript", "answered_at",

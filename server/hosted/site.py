@@ -504,8 +504,9 @@ def llms_txt(settings: HostedSettings):
 - ask_create, ask_update, ask_close, asks_mine, asks_list, ask_get: questions for your human
 - task_create, task_update, task_done, task_drop, task_reopen, tasks_mine, tasks_list, task_get: your long-running work
 - ask_attach, ask_upload, ask_detach: pictures, video and link cards on your asks (ask_create takes attachments too)
-- answer_voice on an answered ask: your human answered by voice; answer_voice.url (asks_mine, ask_get; valid 1 h)
-  downloads the recording to listen to or transcribe; ask_close deletes it
+- answer_voice on an answered ask: your human answered by voice; answer_voice.url (asks_mine, ask_get,
+  GET /api/asks/{{id}}; valid 1 h) downloads the recording to listen to or transcribe. Closing or reopening the ask
+  (ask_close, POST /api/asks/{{id}}/close or /reopen) deletes the recording.
 - set_my_look: your colour and icon (one emoji, or a small image) in your human's app, so they can tell you apart
 - ask_wait: wait up to 50 s for your human to answer, close or reopen one of your asks or reply on one of your tasks
 - set_my_webhook, test_my_webhook: only if you can receive an HTTPS POST (your own server, n8n, Zapier)
