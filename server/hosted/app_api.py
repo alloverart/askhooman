@@ -13,7 +13,8 @@
   GET    /api/connect-info       the MCP URL and per-client setup snippets
   POST   /api/events             {ask_id, kind: answered|closed|reopened} or {task_id, kind: replied} after the user
                                  acted in the app -> an event in the owner agent's feed (feed.py) and a call to its
-                                 webhook (webhooks.py), unless its wake switch is off -> {queued, fed}
+                                 webhook (webhooks.py), unless its wake switch is off -> {queued, fed}; the webhook
+                                 body's ask is the owner's view (a voice answer with its link, voice.for_reader)
   POST   /api/drive/token        a Drive access token (drive.appdata) made with the Google grant the bridge holds for
                                  the user, so the web app keeps reading their Drive after its own token ran out
                                  (DriveTokens) -> {access_token, expires_in, scope}; 409 {detail, error} without a
@@ -46,7 +47,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from ..db import utc_now
 from ..mcp_tools import IDENTITY_SCOPE_KEY
 from ..rules import Conflict, Invalid, NotFound
-from .accounts import Accounts, NameTaken, agent_json
+from .accounts import Accounts, HostedIdentity, NameTaken, agent_json
 from .config import HostedSettings
 from .crypto import CryptoError
 from .feed import EventFeed
@@ -55,6 +56,7 @@ from .looks import clean_avatar, clean_color
 from .ratelimit import RateLimiter
 from .records import DrivePool, HostedAsks, HostedTasks
 from .stats import admin_stats, internal_check
+from .voice import VoiceLinks, for_reader
 from .webhooks import WebhookSender, check_webhook_url
 
 log = logging.getLogger("asks.hosted.app_api")
@@ -316,7 +318,7 @@ def connect_info(settings: HostedSettings, drive_linked: bool) -> dict:
 
 def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool: DrivePool,
                 webhooks: WebhookSender, limiter: RateLimiter, google: GoogleOAuth,
-                feed: EventFeed | None = None) -> None:
+                feed: EventFeed | None = None, voice_links: VoiceLinks | None = None) -> None:
     drive_tokens = DriveTokens(accounts, google, limiter, f"{settings.public_url}/oauth/link")
     app.state.drive_tokens = drive_tokens
 
@@ -458,8 +460,12 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             secret = accounts.webhook_secret(agent) if agent.get("webhook_url") else None
             if not secret:
                 continue
+            body = payload
+            if "ask" in payload and voice_links is not None:  # the owner's view: a voice answer carries its link
+                owner_view = HostedIdentity("agent", agent["slug"], user=user.sub, agent_id=agent["id"])
+                body = {**payload, "ask": for_reader(payload["ask"], voice_links, owner_view)}
             delivery = uuid.uuid4().hex
-            webhooks.send(agent["webhook_url"], secret, payload["type"], delivery, {**payload, "delivery_id": delivery},
+            webhooks.send(agent["webhook_url"], secret, payload["type"], delivery, {**body, "delivery_id": delivery},
                           agent_id=agent["id"])
             queued += 1
         return {"queued": queued, "fed": fed}

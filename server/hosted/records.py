@@ -76,7 +76,7 @@ from ..task_rules import (
 )
 from ..task_rules import STATUS_FILTERS as TASK_FILTERS
 from ..tokens import Identity
-from .voice import clean_voice
+from .voice import VoiceLinks, clean_voice, for_reader
 
 log = logging.getLogger("asks.hosted.records")
 
@@ -483,27 +483,35 @@ class DriveCollection:
 
 
 class HostedAsks:
-    """AskService's interface over one user's Drive."""
+    """AskService's interface over one user's Drive. With `links` (an agent's calls, `reader` = that agent), every
+    ask returned has its answer_voice as that agent gets it: with url and url_expires_at (voice.for_reader). Without
+    (the bridge's own reads), answer_voice is as checked."""
 
-    def __init__(self, records: UserRecords):
+    def __init__(self, records: UserRecords, links: VoiceLinks | None = None, reader: Identity | None = None):
         self.items = DriveCollection(records, HOSTED_ASK, STATUS_FILTERS, ASK_STATUSES, ask_order,
                                      ("options", "links", ATTACHMENTS), {"open": 0, "answered": 1, "closed": 2})
+        self.links = links
+        self.reader = reader
+
+    def _out(self, ask: dict) -> dict:
+        return for_reader(ask, self.links, self.reader) if self.links is not None else ask
 
     def get(self, ask_id: int, with_events: bool = True) -> dict:
-        return self.items.get(ask_id, with_events)
+        return self._out(self.items.get(ask_id, with_events))
 
     def list(self, status: str = "active", agent: str | None = None, limit: int = 200) -> dict:
-        return self.items.list(status, agent, limit)
+        found = self.items.list(status, agent, limit)
+        return {**found, "asks": [self._out(ask) for ask in found["asks"]]}
 
     def create(self, who: Identity, data: dict) -> dict:
         """An ask without attachments; with them, attachments.AskMedia.create writes the files first."""
-        return self.items.create(who, plan_create(who, data), new_hosted_record)
+        return self._out(self.items.create(who, plan_create(who, data), new_hosted_record))
 
     def update(self, who: Identity, ask_id: int, data: dict) -> dict:
-        return self.items.mutate(who, ask_id, lambda load: plan_update(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, ask_id, lambda load: plan_update(who, data, load, utc_now())))
 
     def answer(self, who: Identity, ask_id: int, answer) -> dict:
-        return self.items.mutate(who, ask_id, lambda load: plan_answer(who, answer, load, utc_now()))
+        return self._out(self.items.mutate(who, ask_id, lambda load: plan_answer(who, answer, load, utc_now())))
 
     def close(self, who: Identity, ask_id: int, resolution=None) -> dict:
         return self._ending(who, ask_id, lambda load: plan_close(who, resolution, load, utc_now()))
@@ -526,7 +534,7 @@ class HostedAsks:
         voice = ended.get("voice")
         if voice is not None and voice["file_id"] is not None:
             self._delete_recording(ask_id, voice["file_id"])
-        return ask
+        return self._out(ask)
 
     def _delete_recording(self, ask_id: int, file_id: str) -> None:
         """Best effort, the ask is written already: deleted only when Drive says the file is this ask's recording
