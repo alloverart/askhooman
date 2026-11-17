@@ -8,6 +8,8 @@
   /api/agents…, /api/connect-info, /api/events, /api/drive/token, DELETE /api/me
                         the App API (Google ID tokens), app_api.py; the only routes with CORS, and only for the
                         origins in ASKS_CORS_ORIGINS
+  /media/v1/<token>     a voice answer's recording for the agent that asked (voice_api.py): the token in the path is
+                        the credential, no Authorization
   /authorize, /token, /register, /revoke, /oauth/…, /.well-known/…   the authorization server, oauth.py
   /healthz
 
@@ -50,6 +52,7 @@ from .stats import internal_check
 from .store import MemoryStore
 from .uploads import UPLOAD_PATH, UPLOAD_PREFIX, UploadGrant, UploadGrants
 from .voice import VoiceLinks
+from .voice_api import add_voice_route
 from .webhooks import WebhookSender
 
 log = logging.getLogger("asks.hosted")
@@ -277,6 +280,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     add_api_routes(app, services, ask_create=media.create)
     add_media_routes(app, media)
+    add_voice_route(app, voice_links, accounts, pool, limiter, media.guard.slots)
     add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed, voice_links)
     add_feed_route(app, feed, accounts)
     app.router.routes.extend(auth_server.routes())

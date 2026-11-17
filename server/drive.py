@@ -1,7 +1,8 @@
 """Minimal Google Drive v3 REST client for the bridge's mirror in the appDataFolder (SPEC.md, "Drive storage").
 
 Only what the mirror needs: refresh the access token, list / read / create / update JSON files in
-appDataFolder, and for the hosted bridge write media files (pictures, video) there and delete files.
+appDataFolder, and for the hosted bridge write media files (pictures, video) there, read a voice recording's bytes
+and delete files.
 Credentials are read from their files at refresh time, so re-linking the account
 (writing a new refresh token file) needs no restart. No token or secret ever appears in an error message or log.
 """
@@ -280,9 +281,15 @@ class DriveClient:
             raise DriveBadFile(f"file {file_id} is not a JSON object")
         return doc
 
-    def _download_capped(self, file_id: str) -> bytes:
-        """The file's bytes, read raw (no decompression) and at most max_file_bytes; DriveBadFile if larger."""
-        limit = self.max_file_bytes
+    def download_bytes(self, file_id: str, max_bytes: int) -> bytes:
+        """A binary file's bytes (a voice recording), read raw (no decompression) and at most `max_bytes`;
+        DriveBadFile if larger, DriveNotFound if it is gone."""
+        return self._download_capped(file_id, max_bytes)
+
+    def _download_capped(self, file_id: str, limit: int | None = None) -> bytes:
+        """The file's bytes, read raw (no decompression) and at most `limit` (default max_file_bytes); DriveBadFile
+        if larger."""
+        limit = self.max_file_bytes if limit is None else limit
         for attempt in (1, 2):
             token = self._token()
             try:

@@ -3,12 +3,14 @@ the answer; the bridge checks it on every read, drops a bad or stale one on its 
 close, clears it on reopen and deletes the recording when an agent closes or reopens. FakeGoogle's Drive plays the
 user's Drive; `answered_by_voice` plays the apps' send (SPEC «Sending»)."""
 
+import base64
 import json
 import logging
 import time
 from datetime import datetime, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 from server.hosted.crypto import CryptoError, Keyring
 from server.hosted.records import HostedAsks
@@ -19,28 +21,54 @@ from .conftest import ALLEN as ALLEN_TOKEN
 from .conftest import DENIS as DENIS_TOKEN
 from .conftest import auth
 from .fake_drive import app_action, now_iso
-from .hosted_support import DENIS_SUB, KEY, PUBLIC, connect, id_token, mcp, register, tool_result
+from .hosted_support import (
+    DENIS_SUB,
+    KEY,
+    OLGA_EMAIL,
+    OLGA_SUB,
+    PUBLIC,
+    build,
+    connect,
+    id_token,
+    mcp,
+    register,
+    tool_result,
+)
 
 ALLEN = Identity("agent", "allen")
 DENIS = Identity("denis")
 MB = 1024 * 1024
 AUDIO = b"\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00M4A mp42isom" + bytes(range(256)) * 8  # the bytes are not looked at
+NOT_FOUND = {"detail": "no such recording, or the link has expired: read the ask again for a new link"}
+GONE = {"detail": "the recording was deleted"}
 VOICE_KEYS = ("file_id", "mime", "bytes", "duration_ms", "lang", "transcript_source", "transcript", "answered_at",
               "deleted_at")
 
 
-def agent(hosted, google, name: str = "Allen") -> str:
-    """An agent connected to Denis's account: its access token."""
-    return connect(hosted, google, register(hosted)["client_id"], agent=name)["access_token"]
+def agent(hosted, google, name: str = "Allen", sub: str = DENIS_SUB, email: str = "owner@example.com") -> str:
+    """An agent connected to Denis's account (or another user's): its access token."""
+    return connect(hosted, google, register(hosted)["client_id"], agent=name, sub=sub, email=email)["access_token"]
 
 
 def bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def agent_id(hosted, google, name: str = "Allen") -> str:
-    return next(a["id"] for a in hosted.get("/api/agents", headers=id_token(google)).json()["agents"]
-                if a["name"] == name)
+def agent_id(hosted, google, name: str = "Allen", sub: str = DENIS_SUB, email: str = "owner@example.com") -> str:
+    agents = hosted.get("/api/agents", headers=id_token(google, sub, email)).json()["agents"]
+    return next(a["id"] for a in agents if a["name"] == name)
+
+
+def link(hosted, token: str, ask_id: int = 1) -> str:
+    """The path of the owner's link to the ask's recording, as ask_get gives it."""
+    url = tool_result(mcp(hosted, token, "ask_get", {"id": ask_id}))["answer_voice"]["url"]
+    return url.removeprefix(PUBLIC)
+
+
+def sealed_path(path: str, keyring: Keyring | None = None, context: str = "media", drop: str = "", **changes) -> str:
+    """A token like the bridge's, sealed here with the claims of `path` changed."""
+    found = {k: v for k, v in {**claims(f"{PUBLIC}{path}"), **changes}.items() if k != drop}
+    return f"/media/v1/{(keyring or Keyring(KEY)).encrypt(json.dumps(found), context)}"
 
 
 def claims(url: str) -> dict:
@@ -460,6 +488,225 @@ def test_webhook_body_carries_voice_url(hosted, google):
     hosted.post("/api/events", json={"ask_id": 1, "kind": "reopened"}, headers=id_token(google)).raise_for_status()
     assert hosted.app.state.webhooks.flush(5)
     assert json.loads(google.webhook_calls[-1].content)["ask"]["answer_voice"] is None
+
+
+# ---------- GET /media/v1/<token> ----------
+
+def test_media_route_404s(hosted, google):
+    """A tampered, expired or foreign token, a file that is no longer the ask's recording, a revoked agent: 404 with one
+    message for all, whatever the reason."""
+    allen = agent(hosted, google)
+    feynman_id = (agent(hosted, google, "Feynman"), agent_id(hosted, google, "Feynman"))[1]
+    allen_id = agent_id(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    for title in ("Ship?", "Paint?"):
+        tool_result(mcp(hosted, allen, "ask_create", {"title": title}))
+    voice = answered_by_voice(drive, 1)
+    path = link(hosted, allen)
+    assert hosted.get(path).content == AUDIO
+    token = path.removeprefix("/media/v1/")
+    flipped = token[:-5] + ("A" if token[-5] != "A" else "B") + token[-4:]
+    refused = {
+        "tampered": f"/media/v1/{flipped}",
+        "cut short": path[:-12],
+        "garbage": "/media/v1/v1.k1.garbage",
+        "empty": "/media/v1/",
+        "a path below it": f"{path}/more",
+        "too long": f"{path}{'A' * 3000}",
+        "another context": sealed_path(path, context=f"webhook:{allen_id}"),
+        "another key": sealed_path(path, keyring=Keyring(base64.b64encode(b"z" * 32).decode())),
+        "expired": sealed_path(path, exp=int(time.time()) - 1),
+        "a claim missing": sealed_path(path, drop="agent"),
+        "a claim of the wrong type": sealed_path(path, ask_id="1"),
+        "another user": sealed_path(path, user=OLGA_SUB),
+        "an unknown agent": sealed_path(path, agent="ag_" + "x" * 16),
+        "another agent of the user": sealed_path(path, agent=feynman_id),
+        "another ask": sealed_path(path, ask_id=2),
+        "an ask that doesn't exist": sealed_path(path, ask_id=99),
+        "another file": sealed_path(path, file_id=drive.file("ask-2.json")["id"]),
+    }
+    for name, refused_path in refused.items():
+        response = hosted.get(refused_path)
+        assert (response.status_code, response.json()) == (404, NOT_FOUND), name
+        assert response.headers["cache-control"] == "no-store", name
+
+    # another user's agent with a link naming Denis's recording: her ask 1 has its own recording
+    olga = agent(hosted, google, "Olga's bot", sub=OLGA_SUB, email=OLGA_EMAIL)
+    tool_result(mcp(hosted, olga, "ask_create", {"title": "Hers?"}))
+    answered_by_voice(google.drive(OLGA_SUB), 1)
+    olga_path = link(hosted, olga)
+    assert hosted.get(olga_path).status_code == 200
+    stolen = sealed_path(olga_path, file_id=voice["file_id"])
+    assert (hosted.get(stolen).status_code, hosted.get(stolen).json()) == (404, NOT_FOUND)
+
+    # the ask file names a file that is not this ask's recording (another ask's, an ask file, one over 5 MB)
+    other = answered_by_voice(drive, 2)
+    rewrite(drive, 1, answer_voice={**voice, "file_id": other["file_id"]})
+    assert hosted.get(link(hosted, allen)).json() == NOT_FOUND
+    rewrite(drive, 1, answer_voice={**voice, "file_id": drive.file("ask-2.json")["id"]})
+    assert hosted.get(link(hosted, allen)).json() == NOT_FOUND
+    answered_by_voice(drive, 1, raw=bytes(5 * MB + 1), bytes=1000)
+    assert hosted.get(link(hosted, allen)).json() == NOT_FOUND
+
+    # not the current file: the user answered again with a new recording
+    answered_by_voice(drive, 1)
+    old = link(hosted, allen)
+    answered_by_voice(drive, 1, text="Yes, today")
+    current = link(hosted, allen)
+    assert hosted.get(old).json() == NOT_FOUND and hosted.get(current).status_code == 200
+    # a revoked agent's links die with it
+    hosted.delete(f"/api/agents/{allen_id}", headers=id_token(google)).raise_for_status()
+    assert (hosted.get(current).status_code, hosted.get(current).json()) == (404, NOT_FOUND)
+
+
+def test_media_route_deleted_410(hosted, google):
+    """Once the recording is deleted: 410. Closed (file_id null), or gone from Drive while the ask still names it (the
+    apps' sweep after 30 days, the user deleting the app's data)."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    for title in ("Ship?", "Paint?", "Print?"):
+        tool_result(mcp(hosted, token, "ask_create", {"title": title}))
+    answered_by_voice(drive, 1)
+    path = link(hosted, token)
+    assert hosted.get(path).status_code == 200
+    tool_result(mcp(hosted, token, "ask_close", {"id": 1, "resolution": "Shipped"}))
+    response = hosted.get(path)
+    assert (response.status_code, response.json()) == (410, GONE)
+    assert response.headers["cache-control"] == "no-store"
+
+    swept = answered_by_voice(drive, 2)
+    path = link(hosted, token, 2)
+    drive.files.pop(swept["file_id"])
+    assert (hosted.get(path).status_code, hosted.get(path).json()) == (410, GONE)
+
+    closed_in_app = answered_by_voice(drive, 3)
+    path = link(hosted, token, 3)
+    app_action(drive, 3, "closed", resolution="Done",
+               extra={"answer_voice": {**closed_in_app, "file_id": None, "deleted_at": now_iso()}})
+    drive.files.pop(closed_in_app["file_id"])
+    assert (hosted.get(path).status_code, hosted.get(path).json()) == (410, GONE)
+
+
+def test_media_route_headers(google):
+    """No Authorization and no CORS; the exact headers of SPEC "What the agent gets"."""
+    app, _ = build(google, cors_origins=("https://app.example",))
+    with TestClient(app, base_url=PUBLIC) as hosted:
+        token = agent(hosted, google)
+        drive = google.drive(DENIS_SUB)
+        for title in ("Ship?", "Paint?"):
+            tool_result(mcp(hosted, token, "ask_create", {"title": title}))
+        answered_by_voice(drive, 1)
+        answered_by_voice(drive, 2, raw=AUDIO[:1500], mime="audio/webm")
+        path = link(hosted, token)
+        response = hosted.get(path, headers={"Origin": "https://app.example"})
+        assert response.status_code == 200 and response.content == AUDIO
+        assert dict(response.headers) == {
+            "content-type": "audio/mp4",
+            "content-length": str(len(AUDIO)),
+            "content-disposition": 'attachment; filename="ask-1-voice.m4a"',
+            "cache-control": "private, no-store",
+            "x-content-type-options": "nosniff",
+            "content-security-policy": "sandbox",
+        }
+        webm = hosted.get(link(hosted, token, 2))
+        assert webm.content == AUDIO[:1500] and webm.headers["content-type"] == "audio/webm"
+        assert webm.headers["content-disposition"] == 'attachment; filename="ask-2-voice.webm"'
+        # no Authorization: one sent is not looked at
+        for headers in (bearer(token), {"Authorization": "Bearer junk"}):
+            assert hosted.get(path, headers=headers).content == AUDIO
+        # no CORS, for an answer, an error or a preflight
+        for response in (hosted.get("/media/v1/nope", headers={"Origin": "https://app.example"}),
+                         hosted.options(path, headers={"Origin": "https://app.example",
+                                                       "Access-Control-Request-Method": "GET"})):
+            assert not any(h.startswith("access-control-") for h in response.headers), dict(response.headers)
+
+
+def test_media_route_content_type_from_allowlist(hosted, google):
+    """The type is answer_voice's (audio/mp4 or audio/webm), never Drive's: a file Drive serves as text/html still goes
+    out as audio, as an attachment, sandboxed and not sniffed."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    page = b"<html><body><script>fetch('/api/agents')</script></body></html>" + bytes(1000)
+    answered_by_voice(drive, 1, raw=page, drive_mime="text/html")
+    path = link(hosted, token)
+    assert drive.files[claims(PUBLIC + path)["file_id"]]["mimeType"] == "text/html"  # what Drive will say
+    response = hosted.get(path)
+    assert response.status_code == 200 and response.content == page
+    assert response.headers["content-type"] == "audio/mp4"
+    assert response.headers["content-disposition"] == 'attachment; filename="ask-1-voice.m4a"'
+    assert response.headers["content-security-policy"] == "sandbox"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_media_route_rate_limit(hosted, google):
+    """60 requests a minute per user, all their agents' links together: the 61st is 429 with Retry-After. Another
+    user's links go on."""
+    allen = agent(hosted, google)
+    feynman = agent(hosted, google, "Feynman")
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, allen, "ask_create", {"title": "Ship?"}))
+    tool_result(mcp(hosted, feynman, "ask_create", {"title": "Paint?"}))
+    answered_by_voice(drive, 1)
+    answered_by_voice(drive, 2)
+    paths = (link(hosted, allen, 1), link(hosted, feynman, 2))
+    for n in range(60):
+        assert hosted.get(paths[n % 2]).status_code == 200, n
+    for path in paths:
+        response = hosted.get(path)
+        assert response.status_code == 429 and response.headers["retry-after"] == "60"
+        assert response.json() == {"detail": "too many requests for recordings: at most 60 a minute"}
+    olga = agent(hosted, google, "Olga's bot", sub=OLGA_SUB, email=OLGA_EMAIL)
+    tool_result(mcp(hosted, olga, "ask_create", {"title": "Hers?"}))
+    answered_by_voice(google.drive(OLGA_SUB), 1)
+    assert hosted.get(link(hosted, olga)).status_code == 200
+
+
+def test_media_route_drive_unavailable_503(hosted, google):
+    """Drive unreachable: 503 with Retry-After (the link stays good for its hour). So is an instance whose media slots
+    are all taken (the recording passes through memory, counted like pictures)."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    voice = answered_by_voice(drive, 1)
+    path = link(hosted, token)
+    unavailable = {"detail": "Google Drive is not available right now, try again"}
+    drive.down = True
+    response = hosted.get(path)
+    assert (response.status_code, response.json()) == (503, unavailable) and response.headers["retry-after"] == "30"
+    drive.down = False
+    drive.fail_next("GET", f"/drive/v3/files/{voice['file_id']}", 500, after=1)  # the metadata, then the bytes
+    response = hosted.get(path)
+    assert (response.status_code, response.json()) == (503, unavailable)
+    slots = hosted.app.state.media.guard.slots
+    assert slots.take(4)
+    response = hosted.get(path)
+    assert (response.status_code, response.headers["retry-after"]) == (503, "5")
+    slots.give(4)
+    assert hosted.get(path).content == AUDIO and slots.in_use == 0
+
+
+def test_media_route_logs_nothing_of_the_recording(hosted, google, caplog):
+    """Neither the recording, nor the transcript, nor the token reaches the server's log, whatever the outcome."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    raw = b"RAW-VOICE-BYTES-" + AUDIO
+    voice = answered_by_voice(drive, 1, raw=raw, transcript="our secret launch date is friday")
+    path = link(hosted, token)
+    secret_token = path.removeprefix("/media/v1/")
+    with caplog.at_level(logging.DEBUG):
+        assert hosted.get(path).content == raw
+        hosted.get(path[:-3])
+        drive.fail_next("GET", f"/drive/v3/files/{voice['file_id']}", 500, after=1)
+        hosted.get(path)
+        drive.down = True
+        hosted.get(path)
+        drive.down = False
+    logged = "\n".join(r.getMessage() for r in caplog.records if r.name.startswith("asks"))
+    assert "Drive call failed" in logged  # the failures are logged, without the rest
+    for secret in ("RAW-VOICE-BYTES", "secret launch", secret_token[-40:]):
+        assert secret not in logged, secret
 
 
 # ---------- the single-tenant bridge ----------
