@@ -303,6 +303,11 @@ class DriveCollection:
             record[ANSWER_VOICE] = clean_voice(record[ANSWER_VOICE], record.get("answered_at"), record.get("status"))
         return record
 
+    def _drop_bad_voice(self, doc: dict) -> None:
+        if ANSWER_VOICE in self.kind.fields and doc.get(ANSWER_VOICE) is not None \
+                and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at"), doc.get("status")) is None:
+            doc[ANSWER_VOICE] = None
+
     def _missing(self, item_id) -> NotFound:
         return NotFound(f"no {self.kind.name} #{item_id}")
 
@@ -450,10 +455,11 @@ class DriveCollection:
         raise Conflict(f"{self.kind.name} #{item_id} is being changed by someone else right now; try again")
 
     def _write(self, who: Identity, item_id: int, meta: dict, doc: dict, change: Change) -> dict:
+        # answer_voice that read as null (bad, another answer's, or on an open ask: an older app kept it) is dropped,
+        # checked on the file as read and again as written: a close must not make one left on an open ask valid again
+        self._drop_bad_voice(doc)
         doc.update(change.updates)
-        if ANSWER_VOICE in self.kind.fields and doc.get(ANSWER_VOICE) is not None \
-                and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at"), doc.get("status")) is None:
-            doc[ANSWER_VOICE] = None  # bad, another answer's or on an open ask (an older app kept it): now null too
+        self._drop_bad_voice(doc)
         events = doc.get("events") if isinstance(doc.get("events"), list) else []
         ids = [e["id"] for e in events if isinstance(e, dict) and isinstance(e.get("id"), int)]
         events.append({"id": max(ids, default=0) + 1, self.kind.key: item_id, "at": change.at, "actor": who.actor,
