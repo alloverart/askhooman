@@ -555,6 +555,8 @@ Added 11.11.2026 (Denis, TG 16914 and ask #1166: he answers agents by voice in T
 AskHooman; transcription is the connected agent's job for now, but do better where we can). The approach below (a mic
 button, recognition on the device, the recording sent along) is the one he approved. Hosted only. The server part is
 built (17.11.2026, the bullets marked «refined» say where the code made it exact); the apps are not yet.
+The web app ships voice behind a switch (off by default; a browser turns it on by opening the app once with
+`?voice=on`) until it has been checked with a real microphone and the privacy policy is published (refined 18.11.2026).
 
 The user records the answer in the app. Where the device can turn speech into text **on the device**, the text fills
 the answer box and the user checks it before sending. The recording goes with the answer, so the agent can listen
@@ -570,6 +572,23 @@ agent.
   the recording is deleted.
   - Recording stops by itself at 5:00 (a warning at 4:30), on an audio interruption (a call), and when the app goes
     to the background or the screen locks; what was recorded is kept. Under 1 s is discarded.
+  - The microphone is never on without its row and Stop on screen (refined 18.11.2026): the recording stops (what was
+    recorded is kept) when the ask stops being answerable (answered elsewhere, closed), on leaving the ask, and on a
+    hidden page. Finishing a recording waits a bounded time (4 s) for the recorder, then releases the microphone and
+    says so. An answer over 4000 characters is refused before the upload, with a line in the box (refined 18.11.2026).
+  - First tap on the mic (web, refined 18.11.2026): until then the answer box shows nothing of voice but the mic
+    button, and no speech API is called. The Download line and the first-use note appear after that tap; the note waits
+    for the capability answer, so it never says «can't» while the check runs.
+  - Re-answering («Change answer», refined 18.11.2026): the recording belongs to the answer until the user removes it.
+    The editor shows it as the chip (play from Drive, ×). Sent with the chip there and no new recording →
+    `answer_voice` is carried forward: the same file, the same fields, the NEW `answered_at`. × → `answer_voice` null and
+    the file deleted; this is a change even when the text is the same. A new recording replaces it (the old file is
+    deleted). A text-only send while a marker of an unresolved send exists (Sending, below) removes a marked recording
+    that landed.
+  - Transcript (refined 18.11.2026): `transcript_source: "on_device"` with the raw transcript only when the free-text
+    part of the answer is not empty at Send, whatever the user edited. An empty note (with or without an option
+    picked) → `none` and `null`: the user removed that text, so it does not travel. Heard words are kept in the box
+    when a recording is discarded for its size.
   - With no text at all (no recognizer, nothing typed, no option) the answer text is `Voice answer (0:42), not
     transcribed`, so an answer is never empty and old apps, webhooks and Telegram pings show something true.
   - First use, once per device: "Your agent gets the recording too, so it can listen again or transcribe it. Speech
@@ -581,14 +600,14 @@ agent.
     Android app needs no change: Chrome asks for app.askhooman.com. Refused → the mic button says where to allow it,
     and typing works as before.
 - **Speech to text, on the device only.** Never a cloud recognizer: Apple's server mode, Chrome's default Google
-  service and Safari's `webkitSpeechRecognition` all send the audio away.
+  service, Edge's default recognizer and Safari's `webkitSpeechRecognition` all send the audio away.
 
   | where | recognizer | Russian | otherwise |
   |---|---|---|---|
   | iOS 26+, macOS 26+ | `SpeechAnalyzer` + `SpeechTranscriber`; the model is installed once through `AssetInventory`, with progress | yes: `ru_RU` is one of its locales | record only |
   | iOS 17–18, macOS 14–15 | `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true`, only when `supportsOnDeviceRecognition` is true for the locale | as the OS reports | record only |
-  | web on Chrome or Edge 139+, desktop | Web Speech API with `processLocally = true`, fed the recorder's own mic track (`start(track)`); the language pack through `SpeechRecognition.install()` after the user taps Download | when `available()` says so for `ru-RU` | record only |
-  | Safari and Firefox on the web; the Android app (Chrome on Android has neither `processLocally` nor `start(track)`) | none | – | record only |
+  | web on Google Chrome 139+, desktop only (refined 18.11.2026) | Web Speech API with `processLocally = true`, fed the recorder's own mic track (`start(track)`); `available()` and `install()` both take `{langs, processLocally: true}`; the Download line and any speech API call appear only after the user's first tap on the mic, and the language pack is installed when the user taps Download | when `available()` says so for `ru-RU` | record only |
+  | Safari, Firefox and Edge on the web (refined 18.11.2026: Edge's default recognizer is a cloud service and its on-device mode is not proven, so it is record only until checked by hand with a network trace); the Android app (Chrome on Android has neither `processLocally` nor `start(track)`) | none | – | record only |
 
   Record only = the recording goes to the agent with whatever the user typed; the keyboard's own dictation (iOS,
   Gboard) still works in the box. Language: a recognizer takes one language per recording, so the chip cycles
@@ -603,7 +622,27 @@ agent.
   set both, `ask_id` as a string; without them the bridge neither sends nor deletes the file); 2) write the ask (answer,
   `answer_voice` and the `answered` event) in one PATCH, as now; 3) `POST /api/events {ask_id, kind: "answered"}`.
   If 2 fails (409, network), the app deletes the file it uploaded (best effort) and the draft (text and recording)
-  stays on screen to send again.
+  stays on screen to send again. Refined 18.11.2026: the delete follows only a definite refusal.
+  - Only a definite refusal (409, another 4xx that is not a rate limit, a refused token) proves the write did not
+    happen: the app deletes the upload and the draft stays. After any other failure (a timeout, a lost reply, a 5xx, a
+    429) the app deletes nothing (refined 18.11.2026): the ask's PATCH may have been saved by Drive, or may be saved late.
+  - It keeps a marker of the unresolved send: ask id, file id, the upload's time (`at`, never moved by a Retry).
+    Persisted on the device, ids only; written right after the upload and BEFORE the write; ended by a confirmed write
+    (after the event is posted), a definite refusal or a settle. A marked upload is never swept. A Retry reuses it only if
+    the file still exists (id and appProperties checked; gone → the marker is dropped and the recording is uploaded fresh
+    with a new marker). A later read of the ask settles it (refined 18.11.2026).
+  - Two meanings are kept apart (refined 18.11.2026). The answer landed: the ask is answered and its
+    `answer_voice.file_id` is the marker's file → `POST /api/events` exactly once for that marker, also when the text
+    differs from the draft, also after a new recording, also with other tabs open (the tab that takes the marker out of
+    the persisted list, re-read from storage first, posts). The user's send is done: the answer landed AND the ask's text
+    equals the text being sent or in the draft AND the draft's recording is the marker's → only then the draft, the error
+    and the editing state are cleared and the app says sent. Otherwise the draft stays as it is, and the next Send is an
+    ordinary Change answer that keeps the recording. A Retry that finds its own earlier send already in the ask posts
+    the event once.
+  - A marker ends without an event when a read shows the ask closed, gone, or answered with another file, or after 24
+    hours (by `at`); the sweep's orphan rule then takes the file. A text-only send while a marker exists is written as
+    «drop the voice», so a recording that did land is removed and its file deleted. The recording removed with × is
+    remembered by its file id, not a flag, and forgotten with the ask (refined 18.11.2026).
 - **Data model:** the ask gets `answer_voice`: `null` or
 
   | field | notes |
@@ -628,7 +667,9 @@ agent.
     like a stale one, and is dropped on the bridge's next write. Every write of the bridge checks the file as read,
     before its own change, and again after it (refined 18.11.2026), so closing such an open ask doesn't make the voice
     answer valid again: it is dropped, and its recording (no longer the ask's) is left to the sweep.
-  - Re-answering with the same text and no new recording stays a no-op; a new recording is a change. The `answered`
+  - Re-answering with the same text and no new recording stays a no-op; a new recording is a change. Refined 18.11.2026:
+    the same text AND the same recording state is a no-op; × on the kept recording is a change even with the same text
+    (`answer_voice` null, the file deleted, an `answered` event with `voice: null` and `previous_voice` set). The `answered`
     event payload adds `voice` and `previous_voice`; the `reopened` payload adds `answer_voice`.
   - Reopen (by anyone) clears it. Close (by anyone) keeps it with `file_id: null` and `deleted_at`, and deletes the
     recording. Whoever makes the transition deletes the file: the app for the user, the bridge for an agent's
@@ -639,6 +680,11 @@ agent.
     line with Google's error text (refined 18.11.2026), never with the recording or the transcript.
   - Sweep: at most once a day each app lists the `voice-` files and deletes those older than 30 days, those whose
     ask is closed and those their ask doesn't point to. So a recording lives until the ask is closed, 30 days at most.
+    Refined 18.11.2026: it never deletes the recording of an ask that is listed (readable or not) and answered with it;
+    a recording no ask points to is deleted only after 24 hours; for the recording an answered ask points to, the 30 days
+    count from the ask's `answered_at`, not from the upload; «now» is the `Date` header of the Drive listing when the page
+    can read it (the device clock otherwise); it touches only files whose appProperties say `kind: "voice"` with the ask
+    id of their name; and never a marked upload.
   - The single-tenant bridge: always `null`.
 - **What the agent gets.** For the **owner agent** only (`asks_mine`, `ask_get`, its REST, the `ask.answered` webhook
   body), `answer_voice` adds `url` and `url_expires_at`: `<ASKS_PUBLIC_URL>/media/v1/<token>`, where the token is
@@ -685,7 +731,11 @@ agent.
   the webhook body carries it (17.11.2026 also: the status decides, `transcript` owner-only, the slot held until the
   bytes are sent, the limit per agent, an oversized file without a size → 404). Apps: the recognizer choice per
   platform behind a fake (on device, record only), auto-stop at 5:00, an interruption keeps the recording, the
-  placeholder text, the send order and the rollback on 409, the sweep's three rules, the Info.plist keys and the
+  placeholder text, the send order and the rollback on 409, the sweep's rules (refined 18.11.2026: also the ones above),
+  the unresolved send and its settle (a lost reply, a late commit, a reload, two tabs, a 5xx and a 429 are not
+  refusals, a landed answer with another file), Change answer keeping the recording, × as a change, the transcript rule,
+  the microphone guards on the real screen (the row while a recorder is live, a hidden page, leaving the ask, an
+  unanswerable ask), the Info.plist keys and the
   entitlement present, `_headers` allows the microphone.
   Manual: an iPhone on iOS 26 in Russian and English, a Mac, Chrome on a desktop with the Russian pack, the Android
   app (record only), one 5-minute recording.
