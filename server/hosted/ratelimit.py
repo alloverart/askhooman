@@ -27,6 +27,7 @@ LIMITS = {
     "webhook_set": (10, 3600.0),  # set_my_webhook calls of one agent (self_webhook.py)
     "webhook_test": (10, 3600.0),  # test_my_webhook calls of one agent
     "media": (60, 3600.0),  # attachment calls of one agent: attach, upload request, detach, each item of a create
+    "voice": (60, 60.0),  # GET /media/v1/<token> of one user: their agents fetching voice answers (voice_api.py)
 }
 MAX_KEYS = 20000
 
