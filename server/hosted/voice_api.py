@@ -6,7 +6,8 @@ Checked in this order, every failure a 404 with one message: the token opens (se
 and has not expired; then the user's budget (60 a minute, "voice" in ratelimit.py: 429); the agent is still connected
 (not revoked) and the ask is its own; the ask's CURRENT answer_voice names that file; Drive says the file is this ask's
 recording (appProperties kind "voice" and ask_id, as the apps upload it) of at most 5 MB. A recording that was deleted
-(file_id null after a close, or gone from Drive) is 410; Drive unreachable is 503. Then the bytes are read from the
+(file_id null, a closed ask whatever an older app left in it, or gone from Drive) is 410; a reopened ask has no voice
+answer (404); Drive unreachable is 503. Then the bytes are read from the
 user's Drive with the user's grant and sent with
 
     Content-Type             answer_voice.mime (audio/mp4 or audio/webm: the allowlist), never Drive's
@@ -85,7 +86,7 @@ def add_voice_route(app: FastAPI, links: VoiceLinks, accounts: Accounts, pool: D
         voice = ask.get(ANSWER_VOICE)
         if ask["agent"] != agent["slug"] or voice is None:
             return _refuse(404, NO_SUCH)
-        if voice["file_id"] is None:
+        if voice["file_id"] is None or ask["status"] == "closed":  # closed: the recording went with the close
             return _refuse(410, DELETED)
         if voice["file_id"] != sealed["file_id"]:
             return _refuse(404, NO_SUCH)
