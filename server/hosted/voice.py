@@ -4,8 +4,10 @@ The user's apps record the answer, upload the recording to the user's Drive appD
 <m4a|webm>, appProperties ask_id and kind "voice") and write `answer_voice` with the answer, in the same write. No MCP
 tool or REST body sets it. The file is the user's, so the bridge never trusts it: clean_voice checks it on every read
 (the shape, each field's type and caps, the transcript cleaned like every text field) and ties it to the answer it
-belongs to (its answered_at must be the ask's). A bad or stale one reads as null, and the bridge's next write of the
-ask drops it (records.py).
+belongs to (its answered_at must be the ask's). The ask's status decides the rest, since an app that doesn't know
+voice yet keeps the field as an unknown one when it closes or reopens: on an `answered` ask it stands; on a `closed`
+one it is shown as stored but gives no link (the recording goes with the close); on an `open` one it counts as null.
+A bad, stale or open-ask one reads as null, and the bridge's next write of the ask drops it (records.py).
 
     file_id            the recording's Drive file id (letters, digits, - and _); null once it is deleted
     mime               audio/mp4 or audio/webm
@@ -17,11 +19,12 @@ ask drops it (records.py).
     answered_at        the ask's answered_at: the answer it belongs to
     deleted_at         null, or when the recording was deleted (exactly when file_id is null)
 
-What the agent gets (SPEC "What the agent gets"): for the agent that asked, and only while the recording exists,
-answer_voice adds `url` and `url_expires_at` (for_reader): <public URL>/media/v1/<token>, where the token is {user,
-agent, ask_id, file_id, exp} sealed with the bridge's key (VoiceLinks: Keyring, AES-GCM, context "media"), so it
-reveals nothing and can't be made or changed outside the bridge. It is valid for an hour and made anew on every read;
-GET /media/v1/<token> (voice_api.py) streams the recording from the user's Drive. Everyone else gets url null.
+What the agent gets (SPEC "What the agent gets"): for the agent that asked, and only while the ask is answered and
+the recording exists, answer_voice adds `url` and `url_expires_at` (for_reader): <public URL>/media/v1/<token>,
+where the token is {user, agent, ask_id, file_id, exp} sealed with the bridge's key (VoiceLinks: Keyring, AES-GCM,
+context "media"), so it reveals nothing and can't be made or changed outside the bridge. It is valid for an hour and
+made anew on every read; GET /media/v1/<token> (voice_api.py) sends the recording from the user's Drive. Everyone
+else gets url null.
 
 Nothing here touches Drive or logs anything of a voice answer.
 """
@@ -60,10 +63,13 @@ def _stamp(value) -> bool:
     return isinstance(value, str) and 0 < len(value) <= STAMP_MAX
 
 
-def clean_voice(value, answered_at) -> dict | None:
+def clean_voice(value, answered_at, status) -> dict | None:
     """The ask's answer_voice as the bridge reads it: the nine fields in their order, the transcript cleaned; None for
-    null, for anything that isn't a well-formed voice answer, and for one that belongs to another answer (its
-    answered_at is not the ask's `answered_at`). Keys beyond the nine are left out."""
+    null, for anything that isn't a well-formed voice answer, for one that belongs to another answer (its answered_at
+    is not the ask's `answered_at`), and on an ask whose `status` is not answered or closed (an older app reopened it
+    and kept the field). Keys beyond the nine are left out."""
+    if status not in ("answered", "closed"):
+        return None
     if not isinstance(value, dict) or any(key not in value for key in VOICE_KEYS):
         return None
     file_id, deleted_at = value["file_id"], value["deleted_at"]
@@ -135,13 +141,14 @@ class VoiceLinks:
 
 def for_reader(ask: dict, links: VoiceLinks, reader) -> dict:
     """The ask as `reader` gets it: answer_voice, when there is one, with url and url_expires_at, a link only for the
-    agent that asked (`reader` a HostedIdentity of that agent) while the recording exists, null otherwise."""
+    agent that asked (`reader` a HostedIdentity of that agent) while the ask is answered and the recording exists
+    (a closed ask's never has one, whatever an older app left in it), null otherwise."""
     voice = ask.get(ANSWER_VOICE)
     if not isinstance(voice, dict):
         return ask
     url = expires = None
     owner = (getattr(reader, "role", None) == "agent" and reader.agent == ask.get("agent")
              and getattr(reader, "user", "") and getattr(reader, "agent_id", ""))
-    if owner and voice["file_id"] is not None:
+    if owner and ask.get("status") == "answered" and voice["file_id"] is not None:
         url, expires = links.link(reader.user, reader.agent_id, ask["id"], voice["file_id"])
     return {**ask, ANSWER_VOICE: {**voice, "url": url, "url_expires_at": expires}}

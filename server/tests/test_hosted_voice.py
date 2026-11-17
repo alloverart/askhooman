@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from server.hosted.crypto import CryptoError, Keyring
 from server.hosted.records import HostedAsks
-from server.rules import Change, Invalid, plan_answer
+from server.rules import Change, Invalid, plan_answer, plan_reopen
 from server.tokens import Identity
 
 from .conftest import ALLEN as ALLEN_TOKEN
@@ -357,6 +357,71 @@ def test_answer_noop_rule_with_voice(hosted, google):
     assert drive.doc(1) == before and stored(again["answer_voice"]) == before["answer_voice"]
 
 
+def test_plan_reopen_clears_answer_voice():
+    """The rule itself: reopen sets answer_voice to null and carries it in the `reopened` payload (the bridge's write
+    would also drop a voice answer on an open ask, so this is checked where the rule is)."""
+    at = "2026-11-17T10:00:00.000Z"
+    voice = {"file_id": "rec1", "mime": "audio/mp4", "bytes": 1000, "duration_ms": 42000, "lang": "ru-RU",
+             "transcript_source": "on_device", "transcript": "да", "answered_at": at, "deleted_at": None}
+    ask = {"id": 1, "agent": "allen", "status": "answered", "answer": "Да", "answered_at": at, "resolution": None,
+           "closed_by": None, "closed_at": None, "answer_voice": voice}
+    now = "2026-11-17T11:00:00.000Z"
+    for status, recording in (("answered", voice), ("closed", {**voice, "file_id": None, "deleted_at": now})):
+        _, change = plan_reopen(ALLEN, lambda: {**ask, "status": status, "answer_voice": recording}, now)
+        assert change.updates["answer_voice"] is None, status
+        assert change.payload["answer_voice"] == recording, status
+    _, change = plan_reopen(ALLEN, lambda: {**ask, "answer_voice": None}, now)
+    assert "answer_voice" not in change.updates and change.payload["answer_voice"] is None
+
+
+def test_older_app_close_or_reopen_leaves_no_link(hosted, google):
+    """An app that doesn't know answer_voice keeps it as an unknown field when it closes or reopens: file_id set, and
+    answered_at unchanged by a close. The ask's status decides. Closed: answer_voice shows as stored, url is always
+    null (asks_mine, ask_get, REST, the webhook) and the old link is 410. Open (reopened keeping answered_at too): it
+    counts as null for every reader, the old link is 404, and the bridge's next write drops it."""
+    token = agent(hosted, google)
+    feynman = agent(hosted, google, "Feynman")
+    owner = agent_id(hosted, google)
+    hosted.patch(f"/api/agents/{owner}", json={"webhook_url": "https://hooks.example/voice"},
+                 headers=id_token(google)).raise_for_status()
+    drive = google.drive(DENIS_SUB)
+    for title in ("Ship?", "Paint?"):
+        tool_result(mcp(hosted, token, "ask_create", {"title": title}))
+
+    voice = answered_by_voice(drive, 1)
+    path = link(hosted, token)
+    assert hosted.get(path).status_code == 200
+    app_action(drive, 1, "closed", resolution="Done")  # an older app: answer_voice kept as it was, file_id and all
+    assert drive.doc(1)["answer_voice"] == voice and drive.doc(1)["status"] == "closed"
+    reads = (tool_result(mcp(hosted, token, "asks_mine", {"status": "closed"}))["asks"][0],
+             tool_result(mcp(hosted, token, "ask_get", {"id": 1})),
+             hosted.get("/api/asks/1", headers=bearer(token)).json())
+    for got in reads:
+        assert got["answer_voice"]["file_id"] == voice["file_id"]  # shown as stored
+        assert (got["answer_voice"]["url"], got["answer_voice"]["url_expires_at"]) == (None, None)
+    response = hosted.get(path)
+    assert (response.status_code, response.json()) == (410, GONE)
+    hosted.post("/api/events", json={"ask_id": 1, "kind": "closed"}, headers=id_token(google)).raise_for_status()
+    assert hosted.app.state.webhooks.flush(5)
+    body = json.loads(google.webhook_calls[-1].content)
+    assert body["type"] == "ask.closed" and body["ask"]["answer_voice"]["url"] is None
+
+    answered_by_voice(drive, 2)
+    path = link(hosted, token, 2)
+    assert hosted.get(path).status_code == 200
+    rewrite(drive, 2, status="open", answer=None)  # reopened by an older app that kept answered_at and answer_voice
+    for who in (token, feynman):
+        assert tool_result(mcp(hosted, who, "ask_get", {"id": 2}))["answer_voice"] is None
+        assert hosted.get("/api/asks/2", headers=bearer(who)).json()["answer_voice"] is None
+    assert tool_result(mcp(hosted, token, "asks_mine"))["asks"][0]["answer_voice"] is None
+    assert asks_of(hosted).get(2)["answer_voice"] is None
+    response = hosted.get(path)
+    assert (response.status_code, response.json()) == (404, NOT_FOUND)
+    assert drive.doc(2)["answer_voice"] is not None
+    tool_result(mcp(hosted, token, "ask_update", {"id": 2, "title": "Paint it red?"}))  # the bridge's next write
+    assert drive.doc(2)["answer_voice"] is None
+
+
 def test_bridge_deletes_recording_on_agent_close_and_reopen(hosted, google, caplog):
     """Whoever makes the transition deletes the file: the bridge for an agent's ask_close and reopen, after the ask is
     written, and only a file Drive says is this ask's recording (the user can name any file in their ask file)."""
@@ -568,6 +633,20 @@ def test_media_route_404s(hosted, google):
     # a revoked agent's links die with it
     hosted.delete(f"/api/agents/{allen_id}", headers=id_token(google)).raise_for_status()
     assert (hosted.get(current).status_code, hosted.get(current).json()) == (404, NOT_FOUND)
+
+
+def test_old_link_after_agent_reopen_404(hosted, google):
+    """The agent reopens its answered ask: answer_voice is cleared and the recording deleted, so the link it had is a
+    404, the one message."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    answered_by_voice(drive, 1)
+    path = link(hosted, token)
+    assert hosted.get(path).content == AUDIO
+    hosted.post("/api/asks/1/reopen", headers=bearer(token)).raise_for_status()
+    response = hosted.get(path)
+    assert (response.status_code, response.json()) == (404, NOT_FOUND)
 
 
 def test_media_route_deleted_410(hosted, google):

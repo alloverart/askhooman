@@ -19,9 +19,9 @@ per-instance cache holds validated records only, within a byte budget.
 Hosted asks carry two more fields than single-tenant ones. `attachments` (SPEC v5 step 4; hosted/attachments.py
 writes the media files): read as a list of objects and `[]` on older files. A create may write media files first
 (`media`) and undo them if the ask file write fails (`rollback`). `answer_voice` (SPEC v5 "5. Voice answers"): only the
-user's apps write it; every read checks it (voice.clean_voice: null when bad or another answer's), every write of the
-bridge drops a bad or stale one, and an agent's close or reopen deletes the recording after the ask is written
-(HostedAsks). HOSTED_ASK is the ask Kind with both fields.
+user's apps write it; every read checks it (voice.clean_voice: null when bad, another answer's or on an open ask),
+every write of the bridge drops such a one, and an agent's close or reopen deletes the recording after the ask is
+written (HostedAsks). HOSTED_ASK is the ask Kind with both fields.
 """
 
 import copy
@@ -300,8 +300,8 @@ class DriveCollection:
                 record[field] = []
         if ATTACHMENTS in record:  # each attachment is an object (a user may put anything into their own folder)
             record[ATTACHMENTS] = [item for item in record[ATTACHMENTS] if isinstance(item, dict)]
-        if ANSWER_VOICE in record:  # checked, and only for the answer it was made with
-            record[ANSWER_VOICE] = clean_voice(record[ANSWER_VOICE], record.get("answered_at"))
+        if ANSWER_VOICE in record:  # checked, only for the answer it was made with, null on an open ask
+            record[ANSWER_VOICE] = clean_voice(record[ANSWER_VOICE], record.get("answered_at"), record.get("status"))
         return record
 
     def _missing(self, item_id) -> NotFound:
@@ -453,8 +453,8 @@ class DriveCollection:
     def _write(self, who: Identity, item_id: int, meta: dict, doc: dict, change: Change) -> dict:
         doc.update(change.updates)
         if ANSWER_VOICE in self.kind.fields and doc.get(ANSWER_VOICE) is not None \
-                and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at")) is None:
-            doc[ANSWER_VOICE] = None  # bad, or another answer's (an older app kept it): it read as null, now it is
+                and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at"), doc.get("status")) is None:
+            doc[ANSWER_VOICE] = None  # bad, another answer's or on an open ask (an older app kept it): now null too
         events = doc.get("events") if isinstance(doc.get("events"), list) else []
         ids = [e["id"] for e in events if isinstance(e, dict) and isinstance(e.get("id"), int)]
         events.append({"id": max(ids, default=0) + 1, self.kind.key: item_id, "at": change.at, "actor": who.actor,
