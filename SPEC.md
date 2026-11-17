@@ -625,15 +625,18 @@ agent.
   - The ask's status decides the rest (refined 17.11.2026), since an older app keeps the field when it closes or
     reopens: on an `answered` ask it stands; on a `closed` one it is shown as stored but never carries a `url` and the
     route answers 410, so a close that kept `file_id` leaves no working link; on an `open` one it counts as `null`,
-    like a stale one, and is dropped on the bridge's next write.
+    like a stale one, and is dropped on the bridge's next write. Every write of the bridge checks the file as read,
+    before its own change, and again after it (refined 18.11.2026), so closing such an open ask doesn't make the voice
+    answer valid again: it is dropped, and its recording (no longer the ask's) is left to the sweep.
   - Re-answering with the same text and no new recording stays a no-op; a new recording is a change. The `answered`
     event payload adds `voice` and `previous_voice`; the `reopened` payload adds `answer_voice`.
   - Reopen (by anyone) clears it. Close (by anyone) keeps it with `file_id: null` and `deleted_at`, and deletes the
     recording. Whoever makes the transition deletes the file: the app for the user, the bridge for an agent's
     `ask_close` / `ask_reopen` (best effort; a failure is logged and left to the sweep). Refined 17.11.2026: the agent
     reopens over REST (there is no `ask_reopen` tool); the bridge deletes only a file whose appProperties say
-    `kind: "voice"` and this `ask_id`; a failure of any kind is logged with its type and the file id only, and the
-    close or reopen stands.
+    `kind: "voice"` and this `ask_id`; a failure of any kind is logged by the delete with its type and the file id only,
+    and the close or reopen stands. A failed Drive call is also logged by the bridge's general `Drive call failed: …`
+    line with Google's error text (refined 18.11.2026), never with the recording or the transcript.
   - Sweep: at most once a day each app lists the `voice-` files and deletes those older than 30 days, those whose
     ask is closed and those their ask doesn't point to. So a recording lives until the ask is closed, 30 days at most.
   - The single-tenant bridge: always `null`.
@@ -652,15 +655,16 @@ agent.
     with the user's grant: `Content-Type` from the allowlist (never Drive's), `Content-Length`,
     `Content-Disposition: attachment; filename="ask-<id>-voice.<ext>"`, `Cache-Control: private, no-store`,
     `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`. A bad, expired or foreign token → 404 (one
-    message for all); a deleted recording → 410; Drive unreachable → 503. 60 per minute per user. Cloud Run's request
-    log keeps the path; the token in it is dead within the hour.
-    Refined 17.11.2026: the 404 also covers an agent that doesn't own the ask and a file Drive doesn't confirm as
-    this ask's recording (appProperties above) or that is over 5 MB (by Drive's size, or while reading when Drive
-    gives none). The recording is read into memory in one piece (≤ 5 MB, not chunked) under one of the instance's
-    media slots, held until the response has been sent (all taken → 503 with `Retry-After: 5`; Drive unreachable →
-    503 with `Retry-After: 30`). The limit is 60 per minute per user and agent, counted once the token opens, so one
-    leaked or revoked link can't block the user's other agents (429 with `Retry-After: 60`). HEAD is 405 and `Range`
-    is ignored: always the whole body.
+    message for all); a deleted recording → 410; Drive unreachable → 503. 60 per minute per user and agent (refined
+    below). Cloud Run's request log keeps the path; the token in it is dead within the hour.
+    Refined 17.11.2026: the 404 also covers an agent that doesn't own the ask, an ask file the bridge can't read as an
+    ask (an unknown or missing `status`, not JSON; refined 18.11.2026: retrying a broken file doesn't help) and a file
+    Drive doesn't confirm as this ask's recording (appProperties above) or that is over 5 MB (by Drive's size, or
+    while reading when Drive gives none). The recording is read into memory in one piece (≤ 5 MB, not chunked) under
+    one of the instance's media slots, held until the response has been sent (all taken → 503 with
+    `Retry-After: 5`; Drive unreachable → 503 with `Retry-After: 30`). The limit is 60 per minute per user and agent,
+    counted once the token opens, so one leaked or revoked link can't block the user's other agents (429 with
+    `Retry-After: 60`). HEAD is 405 and `Range` is ignored: always the whole body.
   - `asks_mine` docstring: "answer_voice set: your user answered by voice. With transcript_source on_device, answer
     is their checked text. With none, answer is what they typed or the placeholder 'Voice answer (m:ss), not
     transcribed': download answer_voice.url (valid 1 h; read the ask again for a new one) and transcribe it, or ask
