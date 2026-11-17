@@ -39,6 +39,17 @@ ALLEN = Identity("agent", "allen")
 DENIS = Identity("denis")
 MB = 1024 * 1024
 AUDIO = b"\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00M4A mp42isom" + bytes(range(256)) * 8  # the bytes are not looked at
+# What the agents are told (SPEC "What the agent gets": the asks_mine sentence word for word).
+ASKS_MINE_VOICE = ("answer_voice set: your user answered by voice. With transcript_source on_device, answer is their "
+                   "checked text. With none, answer is what they typed or the placeholder 'Voice answer (m:ss), not "
+                   "transcribed': download answer_voice.url (valid 1 h; read the ask again for a new one) and "
+                   "transcribe it, or ask them. The recording is deleted when you close the ask.")
+ASK_GET_VOICE = ("On your own ask answered by voice, answer_voice.url is a new link to the recording (valid 1 h), "
+                 "as in asks_mine; other agents get url null.")
+ASK_CLOSE_VOICE = ("Closing deletes the recording of a voice answer (answer_voice) from your user's Drive: download it "
+                   "first if you still need it.")
+LLMS_VOICE = ("- answer_voice on an answered ask: your human answered by voice; answer_voice.url (asks_mine, ask_get; "
+              "valid 1 h) downloads the recording to listen to or transcribe; ask_close deletes it")
 NOT_FOUND = {"detail": "no such recording, or the link has expired: read the ask again for a new link"}
 GONE = {"detail": "the recording was deleted"}
 VOICE_KEYS = ("file_id", "mime", "bytes", "duration_ms", "lang", "transcript_source", "transcript", "answered_at",
@@ -707,6 +718,29 @@ def test_media_route_logs_nothing_of_the_recording(hosted, google, caplog):
     assert "Drive call failed" in logged  # the failures are logged, without the rest
     for secret in ("RAW-VOICE-BYTES", "secret launch", secret_token[-40:]):
         assert secret not in logged, secret
+
+
+# ---------- what the agents are told ----------
+
+def tools_list(client, token: str) -> dict[str, str]:
+    """Each tool's description as the calling model reads it (white space joined)."""
+    response = client.post("/mcp", headers={"Authorization": f"Bearer {token}", "MCP-Protocol-Version": "2025-06-18",
+                                            "Accept": "application/json, text/event-stream"},
+                           json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert response.status_code == 200, response.text
+    return {t["name"]: " ".join(t["description"].split()) for t in response.json()["result"]["tools"]}
+
+
+def test_voice_docstrings(hosted, google, client):
+    """asks_mine says what answer_voice means and what to do with it (the SPEC's sentence), ask_get and ask_close what
+    concerns them, and /llms.txt lists it with the tools. The single-tenant bridge has no voice answers: not a word."""
+    tools = tools_list(hosted, agent(hosted, google))
+    assert ASKS_MINE_VOICE in tools["asks_mine"]
+    assert ASK_GET_VOICE in tools["ask_get"]
+    assert ASK_CLOSE_VOICE in tools["ask_close"]
+    assert LLMS_VOICE in " ".join(hosted.get("/llms.txt").text.split())
+    single = tools_list(client, ALLEN_TOKEN)
+    assert not any("voice" in description for description in single.values())
 
 
 # ---------- the single-tenant bridge ----------

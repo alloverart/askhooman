@@ -87,6 +87,17 @@ CREATE_ATTACHMENTS = ("attachments: at most 6, each {url} (an https PNG, JPEG, W
                       "the ask, then ask_upload.")
 DOC_LINE = "\n        "  # a new line in a tool docstring, as the description shows it
 
+# Voice answers (hosted; SPEC v5 "5. Voice answers", "What the agent gets"): what asks_mine (the SPEC's sentence word
+# for word), ask_get and ask_close say about answer_voice.
+VOICE_MINE = ("answer_voice set: your user answered by voice. With transcript_source on_device, answer is their "
+              "checked text. With none, answer is what they typed or the placeholder 'Voice answer (m:ss), not "
+              "transcribed': download answer_voice.url (valid 1 h; read the ask again for a new one) and transcribe "
+              "it, or ask them. The recording is deleted when you close the ask.")
+VOICE_GET = ("On your own ask answered by voice, answer_voice.url is a new link to the recording (valid 1 h), as in "
+             "asks_mine; other agents get url null.")
+VOICE_CLOSE = ("Closing deletes the recording of a voice answer (answer_voice) from your user's Drive: download it "
+               "first if you still need it.")
+
 
 class Link(TypedDict):
     url: str
@@ -242,7 +253,11 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         def services(who: Identity):
             return service, tasks
     words = {**WORDS[hosted], "show": SHOW,
-             "create_media": DOC_LINE + SHOW + DOC_LINE + CREATE_ATTACHMENTS if media is not None else ""}
+             "create_media": DOC_LINE + SHOW + DOC_LINE + CREATE_ATTACHMENTS if media is not None else "",
+             # voice answers exist on the hosted bridge only (the single-tenant one always has answer_voice null)
+             "mine_voice": DOC_LINE + VOICE_MINE if hosted else "",
+             "get_voice": " " + VOICE_GET if hosted else "",
+             "close_voice": DOC_LINE + VOICE_CLOSE if hosted else ""}
     call = run_hosted if hosted else run
     # subscriptions=False: nothing is ever pushed (the tool list is fixed), so no `subscriptions/listen` —
     # the 2026-07-28 replacement for the GET stream both bridges answer 405. Served, it makes server/discover
@@ -257,8 +272,9 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         """mcp.tool with the docstring (or `doc`) and its ${...} words filled in for this mode, a title and explicit
         hints: the Connectors Directory wants both on every tool, and Claude reads them for auto-permissions
         (read-only tools run without asking). Only ask_detach is destructive (it deletes the attachment's files from
-        Drive); otherwise nothing is ever deleted, every change stays in the record's history, and a closed ask or a
-        finished task comes back with reopen."""
+        Drive); otherwise every change stays in the record's history, and a closed ask or a finished task comes back
+        with reopen. ask_close also deletes a voice answer's recording (hosted), the retention the user chose (SPEC v5
+        "5. Voice answers"): closing is how every ask ends, and its docstring says so, so it is not marked."""
         annotations = ToolAnnotations(title=title, readOnlyHint=read_only, destructiveHint=destructive,
                                       idempotentHint=read_only, openWorldHint=False)
 
@@ -325,7 +341,8 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     @tool("My questions and answers", read_only=True)
     def asks_mine(ctx: Context, status: Status = "active") -> dict[str, Any]:
         """Your own asks with ${humans} answers (active = open + answered). Call at session start or when woken.
-        For each answered ask: do what ${human} said, then ask_close(id, "what was done").${mine_asks_note}"""
+        For each answered ask: do what ${human} said, then ask_close(id, "what was done").${mine_voice}\
+${mine_asks_note}"""
         who = caller(ctx)
         return call(ask_service(who).list, status, None if who.is_denis else who.agent)
 
@@ -341,7 +358,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
 
     @tool("Get a question", read_only=True)
     def ask_get(id: int, ctx: Context) -> dict[str, Any]:
-        """One ask with its full history (events: created, edited, answered, closed, reopened)."""
+        """One ask with its full history (events: created, edited, answered, closed, reopened).${get_voice}"""
         who = caller(ctx)
         return call(ask_service(who).get, id)
 
@@ -367,7 +384,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     @tool("Close my question")
     def ask_close(id: int, ctx: Context, resolution: Resolution = "") -> dict[str, Any]:
         """Close your ask after acting on ${humans} answer, with a one-line resolution of what was done.
-        Also use it for an open ask that is no longer relevant."""
+        Also use it for an open ask that is no longer relevant.${close_voice}"""
         who = caller(ctx)
         return call(ask_service(who).close, who, id, resolution)
 
