@@ -45,6 +45,10 @@ STATUS_FILTERS = {
 # Written into ask files that the app writes too (SPEC "Drive storage"), so the text is part of the file format.
 DENIS_DISMISS_RESOLUTION = "Not relevant (Denis)"
 CLEARED_BY_REOPEN = ("answer", "answered_at", "resolution", "closed_by", "closed_at")
+# A voice answer (SPEC v5 "5. Voice answers"): only the user's apps write it, with the answer; the hosted bridge reads
+# it checked (hosted/voice.py), the single-tenant bridge always has null. The rules below keep it in step with the
+# answer: a new answer replaces it, close keeps it without the file, reopen clears it.
+ANSWER_VOICE = "answer_voice"
 
 
 class AskError(Exception):
@@ -217,20 +221,31 @@ def plan_update(who: Identity, data: dict, load: Loader, now: str) -> tuple[dict
     return ask, Change(updates, "edited", {"changes": changes}, now)
 
 
-def plan_answer(who: Identity, answer, load: Loader, now: str) -> tuple[dict, Change | None]:
+def plan_answer(who: Identity, answer, load: Loader, now: str, voice: dict | None = None) -> tuple[dict, Change | None]:
+    """The human's answer. `voice`: the recording that goes with it (the apps' answer_voice; no MCP tool or REST body
+    passes one), tied to this answer by its answered_at. The same text again without a new recording changes nothing;
+    a new recording is a change. Any new answer replaces the ask's answer_voice (null without a recording)."""
     if not who.is_denis:
         raise Forbidden("only the human can answer asks")
     answer = _text(answer, "answer", ANSWER_MAX, required=True)
     ask = load()
     if ask["status"] not in ("open", "answered"):
         raise Conflict(f"ask #{ask['id']} is closed; reopen it before answering")
-    if ask["status"] == "answered" and ask["answer"] == answer:
+    if ask["status"] == "answered" and ask["answer"] == answer and voice is None:
         return ask, None  # same answer again: nothing changes, no event, no second ping
+    previous_voice = ask.get(ANSWER_VOICE)
+    if voice is not None:
+        voice = {**voice, "answered_at": now}
     updates = {"status": "answered", "answer": answer, "answered_at": now, "updated_at": now}
-    return ask, Change(updates, "answered", {"answer": answer, "previous_answer": ask["answer"]}, now)
+    if voice is not None or previous_voice is not None:  # never set where there is none (no SQLite column for it)
+        updates[ANSWER_VOICE] = voice
+    payload = {"answer": answer, "previous_answer": ask["answer"], "voice": voice, "previous_voice": previous_voice}
+    return ask, Change(updates, "answered", payload, now)
 
 
 def plan_close(who: Identity, resolution, load: Loader, now: str) -> tuple[dict, Change]:
+    """Close by the owner agent or the human. A voice answer stays for the record without its recording (file_id
+    null, deleted_at the close): whoever closes deletes the file (the hosted bridge for an agent, records.py)."""
     resolution = _text(resolution, "resolution", RESOLUTION_MAX)
     ask = load()
     check_owner_or_denis(who, ask, "close")
@@ -240,17 +255,26 @@ def plan_close(who: Identity, resolution, load: Loader, now: str) -> tuple[dict,
         resolution = DENIS_DISMISS_RESOLUTION
     updates = {"status": "closed", "resolution": resolution, "closed_by": who.actor, "closed_at": now,
                "updated_at": now}
+    voice = ask.get(ANSWER_VOICE)
+    if voice is not None and voice.get("file_id") is not None:
+        updates[ANSWER_VOICE] = {**voice, "file_id": None, "deleted_at": now}
     return ask, Change(updates, "closed", {"resolution": resolution, "previous_status": ask["status"]}, now)
 
 
 def plan_reopen(who: Identity, load: Loader, now: str) -> tuple[dict, Change]:
+    """Reopen by the owner agent or the human: the answer, the close and a voice answer are cleared; the event
+    carries them (answer_voice too). Whoever reopens deletes the recording, as on close."""
     ask = load()
     check_owner_or_denis(who, ask, "reopen")
     if ask["status"] not in ("closed", "answered"):
         raise Conflict(f"ask #{ask['id']} is already open")
     cleared = {f: ask[f] for f in CLEARED_BY_REOPEN}
+    voice = ask.get(ANSWER_VOICE)
     updates = {"status": "open", **{f: None for f in CLEARED_BY_REOPEN}, "updated_at": now}
-    return ask, Change(updates, "reopened", {"previous_status": ask["status"], **cleared}, now)
+    if voice is not None:
+        updates[ANSWER_VOICE] = None
+    payload = {"previous_status": ask["status"], **cleared, ANSWER_VOICE: voice}
+    return ask, Change(updates, "reopened", payload, now)
 
 
 def check_owner_or_denis(who: Identity, ask: dict, action: str) -> None:

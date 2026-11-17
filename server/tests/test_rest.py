@@ -15,7 +15,7 @@ from .conftest import ALLEN, ASKS_DIR, DENIS, HAMILTON, auth
 
 ASK_KEYS = {
     "id", "agent", "title", "context", "options", "links", "priority", "ref", "status", "answer",
-    "answered_at", "resolution", "closed_by", "closed_at", "created_at", "updated_at", "attachments",
+    "answered_at", "resolution", "closed_by", "closed_at", "created_at", "updated_at", "attachments", "answer_voice",
 }
 
 
@@ -239,7 +239,8 @@ def test_answer_and_reanswer(client, sender, notifier):
     assert second["answered_at"] > first["answered_at"]
     events = client.get(f"/api/asks/{ask['id']}", headers=auth(ALLEN)).json()["events"]
     assert [e["kind"] for e in events] == ["created", "answered", "answered"]
-    assert events[2]["payload"] == {"answer": "Нет, подожди", "previous_answer": "Да"}
+    assert events[2]["payload"] == {"answer": "Нет, подожди", "previous_answer": "Да", "voice": None,
+                                    "previous_voice": None}
     assert events[2]["actor"] == "denis"
     assert notifier.flush()
     assert len(sender.sent) == 2
