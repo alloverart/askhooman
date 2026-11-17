@@ -445,6 +445,28 @@ def test_older_app_close_or_reopen_leaves_no_link(hosted, google):
     assert drive.doc(2)["answer_voice"] is None
 
 
+def test_agent_close_drops_voice_left_on_reopened_ask(hosted, google):
+    """An older app reopened the ask and kept answered_at and answer_voice: the open ask reads null, and the agent's
+    close (its next write) drops it from the file, although the closed status alone would make it look valid again.
+    It never came back to anyone, so nothing is deleted: the recording is the sweep's."""
+    token = agent(hosted, google)
+    feynman = agent(hosted, google, "Feynman")
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    voice = answered_by_voice(drive, 1, transcript="the old heard words")
+    path = link(hosted, token)
+    rewrite(drive, 1, status="open", answer=None)  # an older app's reopen that kept answered_at and answer_voice
+    assert tool_result(mcp(hosted, token, "ask_get", {"id": 1}))["answer_voice"] is None
+    closed = tool_result(mcp(hosted, token, "ask_close", {"id": 1, "resolution": "No longer relevant"}))
+    assert drive.doc(1)["answer_voice"] is None and drive.doc(1)["status"] == "closed"
+    assert closed["answer_voice"] is None
+    for who in (token, feynman):
+        assert tool_result(mcp(hosted, who, "ask_get", {"id": 1}))["answer_voice"] is None
+    assert "the old heard words" not in json.dumps(drive.doc(1)["answer_voice"])
+    assert voice["file_id"] in drive.files  # read as null, so not the bridge's to delete
+    assert (hosted.get(path).status_code, hosted.get(path).json()) == (404, NOT_FOUND)
+
+
 def test_bridge_deletes_recording_on_agent_close_and_reopen(hosted, google, caplog):
     """Whoever makes the transition deletes the file: the bridge for an agent's ask_close and reopen, after the ask is
     written, and only a file Drive says is this ask's recording (the user can name any file in their ask file)."""
