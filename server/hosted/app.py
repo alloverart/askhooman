@@ -49,6 +49,7 @@ from .self_webhook import ping_own_webhook, set_own_webhook
 from .stats import internal_check
 from .store import MemoryStore
 from .uploads import UPLOAD_PATH, UPLOAD_PREFIX, UploadGrant, UploadGrants
+from .voice import VoiceLinks
 from .webhooks import WebhookSender
 
 log = logging.getLogger("asks.hosted")
@@ -160,9 +161,12 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     auth_server = AuthServer(settings, accounts, google, CimdResolver(public_http), limiter)
     resource_auth = ResourceAuth(settings, accounts, limiter)
 
+    # Voice answers (SPEC v5 "5. Voice answers"): the agent that asked gets a link to the recording on each read.
+    voice_links = VoiceLinks(keyring, settings.public_url)
+
     def services(who: HostedIdentity):
         records = pool.records(who.user)
-        return HostedAsks(records), HostedTasks(records)
+        return HostedAsks(records, voice_links, who), HostedTasks(records)
 
     # Pictures and video in asks (SPEC v5 step 4): one service and one guard (the `media` bucket, the slots) for
     # the REST routes and the MCP tools alike.
@@ -262,6 +266,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.state.limiter = limiter
     app.state.uploads = grants
     app.state.media = media
+    app.state.voice_links = voice_links
     app.state.auth_server = auth_server
     app.state.mcp = mcp
     add_error_handlers(app)
@@ -272,7 +277,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     add_api_routes(app, services, ask_create=media.create)
     add_media_routes(app, media)
-    add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed)
+    add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed, voice_links)
     add_feed_route(app, feed, accounts)
     app.router.routes.extend(auth_server.routes())
     app.router.routes.extend(site.routes(settings))

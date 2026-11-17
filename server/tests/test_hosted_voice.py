@@ -5,9 +5,12 @@ user's Drive; `answered_by_voice` plays the apps' send (SPEC «Sending»)."""
 
 import json
 import logging
+import time
+from datetime import datetime, timezone
 
 import pytest
 
+from server.hosted.crypto import CryptoError, Keyring
 from server.hosted.records import HostedAsks
 from server.rules import Change, Invalid, plan_answer
 from server.tokens import Identity
@@ -16,7 +19,7 @@ from .conftest import ALLEN as ALLEN_TOKEN
 from .conftest import DENIS as DENIS_TOKEN
 from .conftest import auth
 from .fake_drive import app_action, now_iso
-from .hosted_support import DENIS_SUB, connect, mcp, register, tool_result
+from .hosted_support import DENIS_SUB, KEY, PUBLIC, connect, id_token, mcp, register, tool_result
 
 ALLEN = Identity("agent", "allen")
 DENIS = Identity("denis")
@@ -33,6 +36,22 @@ def agent(hosted, google, name: str = "Allen") -> str:
 
 def bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def agent_id(hosted, google, name: str = "Allen") -> str:
+    return next(a["id"] for a in hosted.get("/api/agents", headers=id_token(google)).json()["agents"]
+                if a["name"] == name)
+
+
+def claims(url: str) -> dict:
+    """What a link's token says, opened with the bridge's key (SPEC: {user, agent, ask_id, file_id, exp}, AES-GCM,
+    context "media")."""
+    assert url.startswith(f"{PUBLIC}/media/v1/"), url
+    return json.loads(Keyring(KEY).decrypt(url.removeprefix(f"{PUBLIC}/media/v1/"), "media"))
+
+
+def iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def asks_of(hosted) -> HostedAsks:
@@ -350,6 +369,97 @@ def test_failed_recording_delete_is_logged_without_content(hosted, google, caplo
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert "could not delete the voice recording" in logged and f"ask #1" in logged
     assert "secret plan" not in logged and "AUDIO-OF-THE-USER" not in logged and "ship on friday" not in logged
+
+
+# ---------- what the agent gets ----------
+
+def test_only_owner_gets_url(hosted, google):
+    """For the owner agent only (asks_mine, ask_get, its REST) answer_voice carries url and url_expires_at:
+    <public URL>/media/v1/<token>, the token sealed with the bridge's key (AES-GCM, context "media"), so it reveals
+    nothing; valid 1 h, a new one on every read. Other agents get url null, and so does everyone once the recording is
+    deleted. The link is never written to Drive."""
+    allen = agent(hosted, google)
+    feynman = agent(hosted, google, "Feynman")
+    allen_id = agent_id(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, allen, "ask_create", {"title": "Ship?"}))
+    voice = answered_by_voice(drive, 1)
+
+    reads = {"asks_mine": tool_result(mcp(hosted, allen, "asks_mine"))["asks"][0],
+             "ask_get": tool_result(mcp(hosted, allen, "ask_get", {"id": 1})),
+             "asks_list": tool_result(mcp(hosted, allen, "asks_list"))["asks"][0],
+             "GET /api/asks/1": hosted.get("/api/asks/1", headers=bearer(allen)).json(),
+             "GET /api/asks": hosted.get("/api/asks", params={"agent": "allen"},
+                                         headers=bearer(allen)).json()["asks"][0]}
+    urls = set()
+    for read, ask in reads.items():
+        got = ask["answer_voice"]
+        assert stored(got) == voice and list(got) == [*VOICE_KEYS, "url", "url_expires_at"], read
+        sealed = claims(got["url"])
+        assert sealed == {"user": DENIS_SUB, "agent": allen_id, "ask_id": 1, "file_id": voice["file_id"],
+                          "exp": sealed["exp"]}, read
+        assert isinstance(sealed["exp"], int) and abs(sealed["exp"] - (time.time() + 3600)) < 60, read
+        assert got["url_expires_at"] == iso(sealed["exp"]), read
+        token = got["url"].rsplit("/", 1)[1]
+        assert voice["file_id"] not in token and allen_id not in token and "ask_id" not in token, read  # sealed
+        with pytest.raises(CryptoError):
+            Keyring(KEY).decrypt(token, f"google-refresh:{DENIS_SUB}")  # bound to its own context
+        urls.add(got["url"])
+    assert len(urls) == len(reads)  # a new link on every read
+
+    others = (tool_result(mcp(hosted, feynman, "asks_list"))["asks"][0],
+              tool_result(mcp(hosted, feynman, "ask_get", {"id": 1})),
+              hosted.get("/api/asks/1", headers=bearer(feynman)).json(),
+              hosted.get("/api/asks", headers=bearer(feynman)).json()["asks"][0])
+    for ask in others:
+        assert stored(ask["answer_voice"]) == voice
+        assert (ask["answer_voice"]["url"], ask["answer_voice"]["url_expires_at"]) == (None, None)
+    events = tool_result(mcp(hosted, allen, "ask_get", {"id": 1}))["events"]
+    assert "/media/v1/" not in json.dumps(events)  # the history is the file's: no links in it
+    assert "/media/v1/" not in json.dumps(drive.doc(1))
+
+    closed = tool_result(mcp(hosted, allen, "ask_close", {"id": 1, "resolution": "Shipped"}))
+    for ask in (closed, tool_result(mcp(hosted, allen, "ask_get", {"id": 1})),
+                tool_result(mcp(hosted, allen, "asks_mine", {"status": "closed"}))["asks"][0]):
+        assert ask["answer_voice"]["file_id"] is None
+        assert (ask["answer_voice"]["url"], ask["answer_voice"]["url_expires_at"]) == (None, None)
+    assert "/media/v1/" not in json.dumps(drive.doc(1))
+    # an ask without a voice answer: null, as before
+    assert tool_result(mcp(hosted, allen, "ask_create", {"title": "Paint?"}))["answer_voice"] is None
+    assert tool_result(mcp(hosted, allen, "ask_get", {"id": 2}))["answer_voice"] is None
+
+
+def test_webhook_body_carries_voice_url(hosted, google):
+    """The ask.answered webhook goes to the owner agent: its ask's answer_voice carries the owner's url. The feed
+    event, ask_wait and POST /api/events' reply don't change."""
+    token = agent(hosted, google)
+    owner = agent_id(hosted, google)
+    hosted.patch(f"/api/agents/{owner}", json={"webhook_url": "https://hooks.example/voice"},
+                 headers=id_token(google)).raise_for_status()
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    voice = answered_by_voice(drive, 1)
+    sent = hosted.post("/api/events", json={"ask_id": 1, "kind": "answered"}, headers=id_token(google))
+    assert sent.status_code == 202 and sent.json() == {"queued": 1, "fed": 1}
+    assert hosted.app.state.webhooks.flush(5)
+    body = json.loads(google.webhook_calls[-1].content)
+    assert body["type"] == "ask.answered" and body["answer"] == "Yes, ship it"
+    got = body["ask"]["answer_voice"]
+    assert stored(got) == voice and got["url_expires_at"]
+    sealed = claims(got["url"])
+    assert (sealed["user"], sealed["agent"], sealed["ask_id"], sealed["file_id"]) == (DENIS_SUB, owner, 1,
+                                                                                       voice["file_id"])
+    assert got["url_expires_at"] == iso(sealed["exp"])
+    fed = hosted.app.state.feed.read(owner, "0")["events"]
+    assert len(fed) == 1 and "ask" not in fed[0] and "/media/v1/" not in json.dumps(fed)
+    waited = tool_result(mcp(hosted, token, "ask_wait", {"timeout": 0}))
+    assert "/media/v1/" not in json.dumps(waited) and "answer_voice" not in json.dumps(waited)
+    # once the agent closed it, the next webhook (the user reopens in the app) has no link
+    tool_result(mcp(hosted, token, "ask_close", {"id": 1, "resolution": "Shipped"}))
+    app_action(drive, 1, "reopened")
+    hosted.post("/api/events", json={"ask_id": 1, "kind": "reopened"}, headers=id_token(google)).raise_for_status()
+    assert hosted.app.state.webhooks.flush(5)
+    assert json.loads(google.webhook_calls[-1].content)["ask"]["answer_voice"] is None
 
 
 # ---------- the single-tenant bridge ----------

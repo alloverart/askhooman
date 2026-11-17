@@ -17,12 +17,22 @@ ask drops it (records.py).
     answered_at        the ask's answered_at: the answer it belongs to
     deleted_at         null, or when the recording was deleted (exactly when file_id is null)
 
-All pure; nothing here touches Drive or logs anything of a voice answer.
+What the agent gets (SPEC "What the agent gets"): for the agent that asked, and only while the recording exists,
+answer_voice adds `url` and `url_expires_at` (for_reader): <public URL>/media/v1/<token>, where the token is {user,
+agent, ask_id, file_id, exp} sealed with the bridge's key (VoiceLinks: Keyring, AES-GCM, context "media"), so it
+reveals nothing and can't be made or changed outside the bridge. It is valid for an hour and made anew on every read;
+GET /media/v1/<token> (voice_api.py) streams the recording from the user's Drive. Everyone else gets url null.
+
+Nothing here touches Drive or logs anything of a voice answer.
 """
 
+import json
 import re
+import time
+from datetime import datetime, timezone
 
-from ..rules import AskError, _text
+from ..rules import ANSWER_VOICE, AskError, _text
+from .crypto import CryptoError, Keyring
 
 VOICE_KEYS = ("file_id", "mime", "bytes", "duration_ms", "lang", "transcript_source", "transcript", "answered_at",
               "deleted_at")
@@ -35,6 +45,11 @@ TRANSCRIPT_SOURCES = ("on_device", "none")
 STAMP_MAX = 40  # an ISO-8601 timestamp is 24 chars
 FILE_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")  # it goes into a Drive URL path: nothing that could change the request
 LANG = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
+MEDIA_PATH = "/media/v1/"
+LINK_CONTEXT = "media"  # the AEAD context of a link's token: no other sealed value of the bridge opens as one
+LINK_TTL = 3600  # seconds
+TOKEN_MAX = 2048  # chars; a real token is about 250
+CLAIMS = {"user": str, "agent": str, "ask_id": int, "file_id": str, "exp": int}
 
 
 def _count(value, low: int, high: int) -> bool:
@@ -76,3 +91,57 @@ def clean_voice(value, answered_at) -> dict | None:
     if not _stamp(value["answered_at"]) or value["answered_at"] != answered_at:
         return None
     return {**{key: value[key] for key in VOICE_KEYS}, "transcript": transcript}
+
+
+# ---------- the owner agent's link ----------
+
+def _iso(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class VoiceLinks:
+    """Links to voice recordings for the agent that asked: made on each read, opened by GET /media/v1/<token>."""
+
+    def __init__(self, keyring: Keyring, public_url: str, clock=time.time):
+        self.keyring = keyring
+        self.public_url = public_url
+        self.clock = clock
+
+    def link(self, user: str, agent_id: str, ask_id: int, file_id: str) -> tuple[str, str]:
+        """(url, url_expires_at) of a new link, valid LINK_TTL from now."""
+        exp = int(self.clock()) + LINK_TTL
+        sealed = {"user": user, "agent": agent_id, "ask_id": ask_id, "file_id": file_id, "exp": exp}
+        token = self.keyring.encrypt(json.dumps(sealed, separators=(",", ":")), LINK_CONTEXT)
+        return f"{self.public_url}{MEDIA_PATH}{token}", _iso(exp)
+
+    def open(self, token) -> dict | None:
+        """{user, agent, ask_id, file_id, exp} of a token this bridge sealed and that has not expired; None for
+        anything else (not a token, tampered, sealed with a key no longer configured, expired)."""
+        if not isinstance(token, str) or len(token) > TOKEN_MAX:
+            return None
+        try:
+            sealed = json.loads(self.keyring.decrypt(token, LINK_CONTEXT))
+        except (CryptoError, ValueError):
+            return None
+        if not isinstance(sealed, dict) or set(sealed) != set(CLAIMS):
+            return None
+        for key, kind in CLAIMS.items():
+            if not isinstance(sealed[key], kind) or isinstance(sealed[key], bool) or sealed[key] in ("", 0):
+                return None
+        if sealed["exp"] <= self.clock():
+            return None
+        return sealed
+
+
+def for_reader(ask: dict, links: VoiceLinks, reader) -> dict:
+    """The ask as `reader` gets it: answer_voice, when there is one, with url and url_expires_at, a link only for the
+    agent that asked (`reader` a HostedIdentity of that agent) while the recording exists, null otherwise."""
+    voice = ask.get(ANSWER_VOICE)
+    if not isinstance(voice, dict):
+        return ask
+    url = expires = None
+    owner = (getattr(reader, "role", None) == "agent" and reader.agent == ask.get("agent")
+             and getattr(reader, "user", "") and getattr(reader, "agent_id", ""))
+    if owner and voice["file_id"] is not None:
+        url, expires = links.link(reader.user, reader.agent_id, ask["id"], voice["file_id"])
+    return {**ask, ANSWER_VOICE: {**voice, "url": url, "url_expires_at": expires}}
