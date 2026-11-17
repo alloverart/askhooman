@@ -34,6 +34,7 @@ from .hosted_support import (
     register,
     tool_result,
 )
+from .media_samples import data_url, png
 
 ALLEN = Identity("agent", "allen")
 DENIS = Identity("denis")
@@ -287,41 +288,62 @@ def test_close_keeps_answer_voice_without_file(hosted, google):
 
 def test_no_tool_or_rest_body_sets_answer_voice(hosted, google):
     """Only the user writes answer_voice, in the same write as the answer: no MCP tool, no REST body and no unknown
-    field passed through sets it. A new ask has it null."""
+    field passed through sets it. The forgery aims where it would count: answered asks, with each ask's own
+    answered_at, so a voice answer that got through would read as valid. A new ask has it null."""
     token = agent(hosted, google)
     drive = google.drive(DENIS_SUB)
-    forged = {"file_id": "forged1", "mime": "audio/mp4", "bytes": 10, "duration_ms": 2000, "lang": "en",
-              "transcript_source": "on_device", "transcript": "the user said yes", "answered_at": now_iso(),
-              "deleted_at": None}
     created = tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
     assert created["answer_voice"] is None and drive.doc(1)["answer_voice"] is None
-    # MCP: no tool has such a parameter, and an extra argument is dropped before the tool runs
-    for name, arguments in (("ask_create", {"title": "Forged?", "answer_voice": forged}),
-                            ("ask_update", {"id": 1, "title": "Ship today?", "answer_voice": forged}),
-                            ("ask_close", {"id": 1, "answer_voice": forged})):
-        assert tool_result(mcp(hosted, token, name, arguments))["answer_voice"] is None, name
-    # REST: every body with fields refuses it; reopen takes no body and ignores one
-    for method, path, body in (("POST", "/api/asks", {"title": "Forged?", "answer_voice": forged}),
-                               ("POST", "/api/asks", {"title": "Forged?", "attachments": [], "answer_voice": forged}),
-                               ("PATCH", "/api/asks/2", {"answer_voice": forged}),
-                               ("POST", "/api/asks/2/answer", {"answer": "Yes", "answer_voice": forged}),
-                               ("POST", "/api/asks/2/close", {"answer_voice": forged})):
+    for title in ("Paint?", "Print?", "Pack?"):
+        tool_result(mcp(hosted, token, "ask_create", {"title": title}))
+    for ask_id in (1, 2, 3, 4):
+        app_action(drive, ask_id, "answered", answer="Yes")  # answered by text: no recording
+
+    def forged(ask_id: int) -> dict:
+        return {"file_id": f"forged{ask_id}", "mime": "audio/mp4", "bytes": 10, "duration_ms": 2000, "lang": "en",
+                "transcript_source": "on_device", "transcript": "the user said yes",
+                "answered_at": drive.doc(ask_id)["answered_at"], "deleted_at": None}
+
+    picture = {"data": data_url("image/png", png(8, 8))}
+    # MCP: every tool that writes an ask, on answered ask 1 (no tool has the parameter; an extra argument is dropped)
+    for name, arguments in (("ask_create", {"title": "Forged?", "answer_voice": forged(1)}),
+                            ("ask_update", {"id": 1, "title": "Ship today?", "answer_voice": forged(1)}),
+                            ("ask_attach", {"id": 1, **picture, "answer_voice": forged(1)}),
+                            ("ask_upload", {"id": 1, "mime": "image/png", "bytes": 10, "answer_voice": forged(1)}),
+                            ("ask_detach", {"id": 1, "attachment_id": 1, "answer_voice": forged(1)}),
+                            ("ask_close", {"id": 1, "resolution": "Shipped", "answer_voice": forged(1)})):
+        mcp(hosted, token, name, arguments)  # refused (open asks only) or done, never with the field
+    assert drive.doc(1)["status"] == "closed" and drive.doc(5)["status"] == "open"
+    # REST: every body of a route that writes an ask refuses the field, on answered ask 2
+    for method, path, body in (("POST", "/api/asks", {"title": "Forged?", "answer_voice": forged(2)}),
+                               ("POST", "/api/asks", {"title": "Forged?", "attachments": [],
+                                                      "answer_voice": forged(2)}),
+                               ("PATCH", "/api/asks/2", {"answer_voice": forged(2)}),
+                               ("POST", "/api/asks/2/answer", {"answer": "Yes", "answer_voice": forged(2)}),
+                               ("POST", "/api/asks/2/close", {"answer_voice": forged(2)}),
+                               ("POST", "/api/asks/2/attachments", {**picture, "answer_voice": forged(2)}),
+                               ("POST", "/api/asks/2/uploads", {"mime": "image/png", "bytes": 10,
+                                                                "answer_voice": forged(2)})):
         response = hosted.request(method, path, json=body, headers=bearer(token))
         assert response.status_code == 422 and "answer_voice" in response.json()["detail"], (method, path)
-    reopened = hosted.post("/api/asks/1/reopen", json={"answer_voice": forged}, headers=bearer(token))
+    # the routes that take no body ignore one: reopen (answered ask 3) and detach (answered ask 4)
+    reopened = hosted.post("/api/asks/3/reopen", json={"answer_voice": forged(3)}, headers=bearer(token))
     assert reopened.status_code == 200 and reopened.json()["answer_voice"] is None
+    detached = hosted.request("DELETE", "/api/asks/4/attachments/1", json={"answer_voice": forged(4)},
+                              headers=bearer(token))
+    assert detached.status_code in (404, 409)
     # the services themselves: an unknown field is refused, never passed through
     asks = asks_of(hosted)
-    for call, args in ((asks.create, (ALLEN, {"title": "Forged?", "answer_voice": forged})),
-                       (asks.update, (ALLEN, 1, {"answer_voice": forged}))):
+    for call, args in ((asks.create, (ALLEN, {"title": "Forged?", "answer_voice": forged(1)})),
+                       (asks.update, (ALLEN, 5, {"answer_voice": forged(1)}))):
         with pytest.raises(Invalid) as refused:
             call(*args)
         assert "unknown fields: answer_voice" in str(refused.value)
-    for ask in asks.list("all")["asks"]:
+    for ask in asks.list("all")["asks"] + tool_result(mcp(hosted, token, "asks_mine", {"status": "all"}))["asks"]:
         assert ask["answer_voice"] is None, ask["id"]
     for name in [f["name"] for f in drive.files.values() if f["name"].startswith("ask-")]:
         doc = json.loads(drive.file(name)["content"])
-        assert doc.get("answer_voice") is None and "forged1" not in json.dumps(doc), name
+        assert doc.get("answer_voice") is None and "forged" not in json.dumps(doc), name
 
 
 def test_answer_noop_rule_with_voice(hosted, google):
