@@ -477,17 +477,26 @@ def test_failed_recording_delete_is_logged_without_content(hosted, google, caplo
 
 # ---------- what the agent gets ----------
 
+def voice_parts(events: list) -> list[dict]:
+    """The voice objects in an ask's history: the voice and previous_voice of `answered`, the answer_voice of
+    `reopened`, in order."""
+    return [e["payload"][key] for e in events for key in ("voice", "previous_voice", "answer_voice")
+            if isinstance(e.get("payload"), dict) and isinstance(e["payload"].get(key), dict)]
+
+
 def test_only_owner_gets_url(hosted, google):
     """For the owner agent only (asks_mine, ask_get, its REST) answer_voice carries url and url_expires_at:
     <public URL>/media/v1/<token>, the token sealed with the bridge's key (AES-GCM, context "media"), so it reveals
     nothing; valid 1 h, a new one on every read. Other agents get url null, and so does everyone once the recording is
-    deleted. The link is never written to Drive."""
+    deleted. The link is never written to Drive. The text the device heard is the owner's too: every other reader gets
+    transcript null, in answer_voice and in the history (the user edits that text before sending)."""
     allen = agent(hosted, google)
     feynman = agent(hosted, google, "Feynman")
     allen_id = agent_id(hosted, google)
     drive = google.drive(DENIS_SUB)
     tool_result(mcp(hosted, allen, "ask_create", {"title": "Ship?"}))
-    voice = answered_by_voice(drive, 1)
+    answered_by_voice(drive, 1, transcript="yes ship it")
+    voice = answered_by_voice(drive, 1, text="Yes, ship it today", transcript="yes ship it today")
 
     reads = {"asks_mine": tool_result(mcp(hosted, allen, "asks_mine"))["asks"][0],
              "ask_get": tool_result(mcp(hosted, allen, "ask_get", {"id": 1})),
@@ -516,10 +525,17 @@ def test_only_owner_gets_url(hosted, google):
               hosted.get("/api/asks/1", headers=bearer(feynman)).json(),
               hosted.get("/api/asks", headers=bearer(feynman)).json()["asks"][0])
     for ask in others:
-        assert stored(ask["answer_voice"]) == voice
+        assert stored(ask["answer_voice"]) == {**voice, "transcript": None}
         assert (ask["answer_voice"]["url"], ask["answer_voice"]["url_expires_at"]) == (None, None)
     events = tool_result(mcp(hosted, allen, "ask_get", {"id": 1}))["events"]
     assert "/media/v1/" not in json.dumps(events)  # the history is the file's: no links in it
+    assert [part["transcript"] for part in voice_parts(events)] == ["yes ship it", "yes ship it today", "yes ship it"]
+    for history in (tool_result(mcp(hosted, feynman, "ask_get", {"id": 1}))["events"],
+                    hosted.get("/api/asks/1", headers=bearer(feynman)).json()["events"]):
+        assert [part["transcript"] for part in voice_parts(history)] == [None, None, None]
+        assert [part["file_id"] for part in voice_parts(history)] == [part["file_id"] for part in voice_parts(events)]
+    for ask in others:
+        assert "yes ship it" not in json.dumps(ask)
     assert "/media/v1/" not in json.dumps(drive.doc(1))
 
     closed = tool_result(mcp(hosted, allen, "ask_close", {"id": 1, "resolution": "Shipped"}))
@@ -528,9 +544,20 @@ def test_only_owner_gets_url(hosted, google):
         assert ask["answer_voice"]["file_id"] is None
         assert (ask["answer_voice"]["url"], ask["answer_voice"]["url_expires_at"]) == (None, None)
     assert "/media/v1/" not in json.dumps(drive.doc(1))
+    assert tool_result(mcp(hosted, feynman, "ask_get", {"id": 1}))["answer_voice"]["transcript"] is None
+    assert tool_result(mcp(hosted, allen, "ask_get", {"id": 1}))["answer_voice"]["transcript"] == "yes ship it today"
     # an ask without a voice answer: null, as before
     assert tool_result(mcp(hosted, allen, "ask_create", {"title": "Paint?"}))["answer_voice"] is None
     assert tool_result(mcp(hosted, allen, "ask_get", {"id": 2}))["answer_voice"] is None
+    # reopened: the reopened event carries the voice answer, its text still the owner's alone
+    tool_result(mcp(hosted, allen, "ask_create", {"title": "Print?"}))
+    answered_by_voice(drive, 3, transcript="print it")
+    hosted.post("/api/asks/3/reopen", headers=bearer(allen)).raise_for_status()
+    mine = tool_result(mcp(hosted, allen, "ask_get", {"id": 3}))["events"]
+    theirs = tool_result(mcp(hosted, feynman, "ask_get", {"id": 3}))["events"]
+    assert [part["transcript"] for part in voice_parts(mine)] == ["print it", "print it"]
+    assert [part["transcript"] for part in voice_parts(theirs)] == [None, None]
+    assert theirs[-1]["kind"] == "reopened" and "print it" not in json.dumps(theirs)
 
 
 def test_webhook_body_carries_voice_url(hosted, google):

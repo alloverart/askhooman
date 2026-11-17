@@ -24,7 +24,8 @@ the recording exists, answer_voice adds `url` and `url_expires_at` (for_reader):
 where the token is {user, agent, ask_id, file_id, exp} sealed with the bridge's key (VoiceLinks: Keyring, AES-GCM,
 context "media"), so it reveals nothing and can't be made or changed outside the bridge. It is valid for an hour and
 made anew on every read; GET /media/v1/<token> (voice_api.py) sends the recording from the user's Drive. Everyone
-else gets url null.
+else gets url null, and transcript null too, in answer_voice and in the history (the voice, previous_voice and
+answer_voice of event payloads): the user edits the heard text before sending, so only the agent that asked sees it.
 
 Nothing here touches Drive or logs anything of a voice answer.
 """
@@ -139,16 +140,35 @@ class VoiceLinks:
         return sealed
 
 
+VOICE_PARTS = ("voice", "previous_voice", ANSWER_VOICE)  # where event payloads carry a voice answer
+
+
+def _unheard(event):
+    """An event as another agent sees it: the voice answers in its payload without their transcript."""
+    payload = event.get("payload") if isinstance(event, dict) else None
+    if not isinstance(payload, dict) or not any(isinstance(payload.get(key), dict) for key in VOICE_PARTS):
+        return event
+    hidden = {key: {**payload[key], "transcript": None} for key in VOICE_PARTS if isinstance(payload.get(key), dict)}
+    return {**event, "payload": {**payload, **hidden}}
+
+
 def for_reader(ask: dict, links: VoiceLinks, reader) -> dict:
-    """The ask as `reader` gets it: answer_voice, when there is one, with url and url_expires_at, a link only for the
-    agent that asked (`reader` a HostedIdentity of that agent) while the ask is answered and the recording exists
-    (a closed ask's never has one, whatever an older app left in it), null otherwise."""
+    """The ask as `reader` gets it. For the agent that asked (`reader` a HostedIdentity of that agent): answer_voice,
+    when there is one, with url and url_expires_at, a link while the ask is answered and the recording exists (a
+    closed ask's never has one, whatever an older app left in it). For everyone else: url null, and transcript null
+    in answer_voice and in the voice answers of the history."""
+    owner = bool(getattr(reader, "role", None) == "agent" and reader.agent == ask.get("agent")
+                 and getattr(reader, "user", "") and getattr(reader, "agent_id", ""))
+    shown = ask
     voice = ask.get(ANSWER_VOICE)
-    if not isinstance(voice, dict):
-        return ask
-    url = expires = None
-    owner = (getattr(reader, "role", None) == "agent" and reader.agent == ask.get("agent")
-             and getattr(reader, "user", "") and getattr(reader, "agent_id", ""))
-    if owner and ask.get("status") == "answered" and voice["file_id"] is not None:
-        url, expires = links.link(reader.user, reader.agent_id, ask["id"], voice["file_id"])
-    return {**ask, ANSWER_VOICE: {**voice, "url": url, "url_expires_at": expires}}
+    if isinstance(voice, dict):
+        url = expires = None
+        if owner and ask.get("status") == "answered" and voice["file_id"] is not None:
+            url, expires = links.link(reader.user, reader.agent_id, ask["id"], voice["file_id"])
+        voice = {**voice, "url": url, "url_expires_at": expires}
+        if not owner:
+            voice["transcript"] = None
+        shown = {**shown, ANSWER_VOICE: voice}
+    if not owner and isinstance(ask.get("events"), list):
+        shown = {**shown, "events": [_unheard(event) for event in ask["events"]]}
+    return shown
