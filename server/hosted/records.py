@@ -16,9 +16,12 @@ files over MAX_FILE_BYTES (by their `size`, and while reading) are skipped as un
 decompressed, a list downloads only the files its `limit` can need (chosen from appProperties first), and the
 per-instance cache holds validated records only, within a byte budget.
 
-Hosted asks carry one more field than single-tenant ones, `attachments` (SPEC v5 step 4; hosted/attachments.py
-writes the media files): HOSTED_ASK is the ask Kind with that field, read as a list of objects and `[]` on older
-files. A create may write media files first (`media`) and undo them if the ask file write fails (`rollback`).
+Hosted asks carry two more fields than single-tenant ones. `attachments` (SPEC v5 step 4; hosted/attachments.py
+writes the media files): read as a list of objects and `[]` on older files. A create may write media files first
+(`media`) and undo them if the ask file write fails (`rollback`). `answer_voice` (SPEC v5 "5. Voice answers"): only the
+user's apps write it; every read checks it (voice.clean_voice: null when bad or another answer's), every write of the
+bridge drops a bad or stale one, and an agent's close or reopen deletes the recording after the ask is written
+(HostedAsks). HOSTED_ASK is the ask Kind with both fields.
 """
 
 import copy
@@ -36,7 +39,9 @@ from ..db import utc_now
 from ..drive import FILE_FIELDS, DriveBadFile, DriveClient, DriveError, DriveNotFound, parse_name
 from ..mirror import ASK, TASK, Kind, app_properties, build_doc
 from ..rules import (
+    ANSWER_VOICE,
     STATUS_FILTERS,
+    AskError,
     Change,
     Conflict,
     NotFound,
@@ -71,6 +76,7 @@ from ..task_rules import (
 )
 from ..task_rules import STATUS_FILTERS as TASK_FILTERS
 from ..tokens import Identity
+from .voice import clean_voice
 
 log = logging.getLogger("asks.hosted.records")
 
@@ -85,13 +91,13 @@ LOCK_STRIPES = 64
 ASK_STATUSES = ("open", "answered", "closed")
 TASK_STATUSES = OPEN + FINISHED
 ATTACHMENTS = "attachments"
-HOSTED_ASK = dataclasses.replace(ASK, fields=(*ASK.fields, ATTACHMENTS))  # the ask object of the hosted bridge
+HOSTED_ASK = dataclasses.replace(ASK, fields=(*ASK.fields, ANSWER_VOICE, ATTACHMENTS))  # the hosted bridge's ask
 
 
 def new_hosted_record(who: Identity, ask_id: int, fields: dict, now: str) -> dict:
-    """A fresh open ask as the hosted REST returns it: rules.new_record plus `attachments` (empty until the media
-    service adds the files)."""
-    return {**new_record(who, ask_id, fields, now), ATTACHMENTS: []}
+    """A fresh open ask as the hosted REST returns it: rules.new_record plus `answer_voice` (null: only an answer from
+    the apps sets it) and `attachments` (empty until the media service adds the files)."""
+    return {**new_record(who, ask_id, fields, now), ANSWER_VOICE: None, ATTACHMENTS: []}
 
 
 class _Changed(Exception):
@@ -294,6 +300,8 @@ class DriveCollection:
                 record[field] = []
         if ATTACHMENTS in record:  # each attachment is an object (a user may put anything into their own folder)
             record[ATTACHMENTS] = [item for item in record[ATTACHMENTS] if isinstance(item, dict)]
+        if ANSWER_VOICE in record:  # checked, and only for the answer it was made with
+            record[ANSWER_VOICE] = clean_voice(record[ANSWER_VOICE], record.get("answered_at"))
         return record
 
     def _missing(self, item_id) -> NotFound:
@@ -444,6 +452,9 @@ class DriveCollection:
 
     def _write(self, who: Identity, item_id: int, meta: dict, doc: dict, change: Change) -> dict:
         doc.update(change.updates)
+        if ANSWER_VOICE in self.kind.fields and doc.get(ANSWER_VOICE) is not None \
+                and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at")) is None:
+            doc[ANSWER_VOICE] = None  # bad, or another answer's (an older app kept it): it read as null, now it is
         events = doc.get("events") if isinstance(doc.get("events"), list) else []
         ids = [e["id"] for e in events if isinstance(e, dict) and isinstance(e.get("id"), int)]
         events.append({"id": max(ids, default=0) + 1, self.kind.key: item_id, "at": change.at, "actor": who.actor,
@@ -495,10 +506,46 @@ class HostedAsks:
         return self.items.mutate(who, ask_id, lambda load: plan_answer(who, answer, load, utc_now()))
 
     def close(self, who: Identity, ask_id: int, resolution=None) -> dict:
-        return self.items.mutate(who, ask_id, lambda load: plan_close(who, resolution, load, utc_now()))
+        return self._ending(who, ask_id, lambda load: plan_close(who, resolution, load, utc_now()))
 
     def reopen(self, who: Identity, ask_id: int) -> dict:
-        return self.items.mutate(who, ask_id, lambda load: plan_reopen(who, load, utc_now()))
+        return self._ending(who, ask_id, lambda load: plan_reopen(who, load, utc_now()))
+
+    def _ending(self, who: Identity, ask_id: int, plan) -> dict:
+        """A close or a reopen, which ends the answer's voice recording: whoever makes the transition deletes the
+        file (SPEC v5), so after the ask is written the bridge deletes the one the ask had (an agent's close or
+        reopen; the apps delete it for the user)."""
+        ended: dict = {}
+
+        def planned(load):
+            current, change = plan(load)
+            ended["voice"] = current.get(ANSWER_VOICE)  # checked: a bad or stale one is None and stays the sweep's
+            return current, change
+
+        ask = self.items.mutate(who, ask_id, planned)
+        voice = ended.get("voice")
+        if voice is not None and voice["file_id"] is not None:
+            self._delete_recording(ask_id, voice["file_id"])
+        return ask
+
+    def _delete_recording(self, ask_id: int, file_id: str) -> None:
+        """Best effort, the ask is written already: deleted only when Drive says the file is this ask's recording
+        (appProperties kind "voice" and ask_id), since the user can name any file in their own ask file. A failure is
+        logged, never with the recording or the transcript, and the file is left to the apps' sweep."""
+        records = self.items.records
+        try:
+            meta = records.call(records.drive.get_meta, file_id)
+            if meta is None:
+                return  # already gone
+            props = meta.get("appProperties") or {}
+            if props.get("kind") != "voice" or props.get("ask_id") != str(ask_id):
+                log.warning("hosted: file %s named by ask #%s is not its voice recording: not deleted", file_id,
+                            ask_id)
+                return
+            records.call(records.drive.delete, file_id)
+        except (AskError, DriveError) as exc:
+            log.warning("hosted: could not delete the voice recording %s of ask #%s (left to the apps' sweep): %s",
+                        file_id, ask_id, exc)
 
 
 class HostedTasks:

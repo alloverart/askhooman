@@ -70,14 +70,15 @@ def get(client, ask_id) -> dict:
 
 
 def assert_mirrored(client, fake, ask_id, rev=None) -> dict:
-    """The file holds exactly what REST returns (ask + events), written by the bridge. `attachments` is the one
-    REST field the single-tenant mirror doesn't write: always [] here (SPEC v5 step 4, hosted only), the apps read a
-    missing one as [], and a file that has one keeps it like any field the bridge doesn't know."""
+    """The file holds exactly what REST returns (ask + events), written by the bridge. `attachments` and
+    `answer_voice` are the REST fields the single-tenant mirror doesn't write: always [] and null here (SPEC v5 step 4
+    and "5. Voice answers", hosted only), the apps read a missing one as [] or null, and a file that has one keeps it
+    like any field the bridge doesn't know."""
     ask = get(client, ask_id)
-    assert ask.pop("attachments") == []
+    assert ask.pop("attachments") == [] and ask.pop("answer_voice") is None
     file = fake.file(f"ask-{ask_id}.json")
     doc = json.loads(file["content"])
-    assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "writer", "attachments")} == ask
+    assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "writer", "attachments", "answer_voice")} == ask
     assert (doc["schema"], doc["writer"]) == (1, "bridge")
     assert file["appProperties"] == {"ask_id": str(ask_id), "status": ask["status"], "agent": ask["agent"],
                                      "rev": str(doc["rev"])}
@@ -203,7 +204,8 @@ def test_app_answer_is_replayed_as_denis(dclient, fake, sender, notifier):
     replayed = get(dclient, ask["id"])
     assert (replayed["status"], replayed["answer"]) == ("answered", "Да, шей")
     assert [(e["kind"], e["actor"]) for e in replayed["events"]] == [("created", "allen"), ("answered", "denis")]
-    assert replayed["events"][-1]["payload"] == {"answer": "Да, шей", "previous_answer": None}
+    assert replayed["events"][-1]["payload"] == {"answer": "Да, шей", "previous_answer": None, "voice": None,
+                                                 "previous_voice": None}
     assert notifier.flush()
     assert sender.texts == [answer_text(replayed)]
     assert_mirrored(dclient, fake, ask["id"], rev=3)  # app rev 2 + 1: the file converged to the bridge

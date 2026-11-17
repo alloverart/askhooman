@@ -90,6 +90,7 @@ def ask_from_row(row: sqlite3.Row) -> dict:
     ask["options"] = json.loads(ask["options"] or "[]")
     ask["links"] = json.loads(ask["links"] or "[]")
     ask["attachments"] = []  # pictures and video live on the hosted bridge only (SPEC v5 step 4); never null
+    ask["answer_voice"] = None  # voice answers too (SPEC v5 "5. Voice answers"): always null here
     return ask
 
 
