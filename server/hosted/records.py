@@ -99,6 +99,12 @@ def new_hosted_record(who: Identity, ask_id: int, fields: dict, now: str) -> dic
     return {**new_record(who, ask_id, fields, now), ANSWER_VOICE: None, ATTACHMENTS: []}
 
 
+class BadFile(Unavailable):
+    """A file in the user's Drive that isn't a valid record of its kind (an unknown or missing status, not JSON):
+    still 503 for REST and MCP as before, but the voice route tells it apart from Drive being down (a 404: retrying
+    a broken file doesn't help)."""
+
+
 class _Changed(Exception):
     """The file changed between our read and our write: start over."""
 
@@ -211,7 +217,7 @@ class UserRecords:
         except DriveNotFound:
             raise
         except DriveBadFile as exc:
-            raise Unavailable(f"a file in Google Drive is not readable: {exc}") from None
+            raise BadFile(f"a file in Google Drive is not readable: {exc}") from None
         except DriveError as exc:
             if exc.reason in ("not_linked", "invalid_grant"):
                 if exc.reason == "invalid_grant":
@@ -323,7 +329,7 @@ class DriveCollection:
         except DriveNotFound:
             raise self._missing(item_id) from None
         if self._record(doc, item_id) is None:
-            raise Unavailable(f"{self.kind.file(item_id)} in Google Drive is not a valid {self.kind.name}")
+            raise BadFile(f"{self.kind.file(item_id)} in Google Drive is not a valid {self.kind.name}")
         return meta, doc
 
     def _entry_of(self, doc: dict, item_id: int | None = None) -> dict | None:
@@ -374,7 +380,7 @@ class DriveCollection:
         except DriveNotFound:
             raise self._missing(item_id) from None
         if entry is None or entry["id"] != item_id:
-            raise Unavailable(f"{self.kind.file(item_id)} in Google Drive is not a valid {self.kind.name}")
+            raise BadFile(f"{self.kind.file(item_id)} in Google Drive is not a valid {self.kind.name}")
         entry = self.decorate(entry, entry["events"])
         if not with_events:
             entry.pop("events")
