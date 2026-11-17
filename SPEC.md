@@ -73,6 +73,8 @@ Re-read when the file's mtime changes (no restart needed to add an agent). Compa
 - `POST /api/asks/{id}/answer` (the human, role `denis`) `{answer}` (1–4000 chars) → ask
 - `POST /api/asks/{id}/close` (owner or denis) `{resolution?}` → ask
 - `POST /api/asks/{id}/reopen` (owner or denis) → ask
+  - Hosted (refined 17.11.2026): closing or reopening an ask answered by voice deletes its recording from the user's
+    Drive (v5 "5. Voice answers").
 - Errors: `{"detail": "..."}` with 401/403/404/409/422 (413 for a body over 256 KB; an unexpected 500 keeps the same shape). `detail` is always one string (validation errors are joined). `/api/*` checks the token before reading the body. An id that cannot exist (≤ 0 or beyond 2^63−1) is a 404.
 - No `/docs`, `/redoc`, `/openapi.json`: this file is the contract.
 - Request bodies reject unknown fields with 422 — including `agent` on create (identity comes only from the token).
@@ -551,7 +553,8 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
 
 Added 11.11.2026 (Denis, TG 16914 and ask #1166: he answers agents by voice in Telegram and wants the same in
 AskHooman; transcription is the connected agent's job for now, but do better where we can). The approach below (a mic
-button, recognition on the device, the recording sent along) is the one he approved. Not built yet. Hosted only.
+button, recognition on the device, the recording sent along) is the one he approved. Hosted only. The server part is
+built (17.11.2026, the bullets marked «refined» say where the code made it exact); the apps are not yet.
 
 The user records the answer in the app. Where the device can turn speech into text **on the device**, the text fills
 the answer box and the user checks it before sending. The recording goes with the answer, so the agent can listen
@@ -596,7 +599,8 @@ agent.
   1.2 MB). Until it is sent or discarded the recording stays in the Apple app's temporary directory, or in memory on
   the web.
 - **Sending** (by the app, like answers today): 1) upload the recording to appDataFolder as
-  `voice-<ask id>-<unix ms>.<m4a|webm>`, appProperties `ask_id`, `kind: "voice"`; 2) write the ask (answer,
+  `voice-<ask id>-<unix ms>.<m4a|webm>`, appProperties `ask_id`, `kind: "voice"` (refined 17.11.2026: the apps MUST
+  set both, `ask_id` as a string; without them the bridge neither sends nor deletes the file); 2) write the ask (answer,
   `answer_voice` and the `answered` event) in one PATCH, as now; 3) `POST /api/events {ask_id, kind: "answered"}`.
   If 2 fails (409, network), the app deletes the file it uploaded (best effort) and the draft (text and recording)
   stays on screen to send again.
@@ -604,25 +608,32 @@ agent.
 
   | field | notes |
   |---|---|
-  | file_id | the recording's Drive file id; `null` once it is deleted |
+  | file_id | the recording's Drive file id (letters, digits, `-`, `_`; ≤ 200); `null` once it is deleted, exactly when `deleted_at` is set (refined 17.11.2026) |
   | mime | `audio/mp4` or `audio/webm` |
-  | bytes | ≤ 5 MB |
+  | bytes | 1 … 5 MB (refined 17.11.2026: ≥ 1) |
   | duration_ms | 1000–300000 |
-  | lang | BCP-47 (`ru-RU`), ≤ 35 chars: the recognizer's language, or the chip's when none ran |
+  | lang | BCP-47 (`ru-RU`), ≤ 35 chars: the recognizer's language, or the chip's when none ran; required, never `null` (refined 17.11.2026) |
   | transcript_source | `on_device` (the device's recognizer made the text, then the user checked it) or `none` |
-  | transcript | what the recognizer heard, before the user's edits; ≤ 4000, cleaned like every text field; `null` with `none` |
+  | transcript | what the recognizer heard, before the user's edits; ≤ 4000, cleaned like every text field; `null` with `none`; the owner agent's only (refined 17.11.2026) |
   | answered_at | equals the ask's `answered_at`: the answer it belongs to |
-  | deleted_at | `null`, or when the recording was deleted |
+  | deleted_at | `null`, or when the recording was deleted; set exactly when `file_id` is `null` |
 
   - Only the user writes it, in the same write as the answer; no MCP or REST parameter sets it. The bridge checks it
-    on every read (shape, types, caps). A bad or stale one (its `answered_at` isn't the ask's: an older app
-    re-answered or reopened and kept it as an unknown field) counts as `null` and is dropped on the bridge's next
-    write of that ask.
+    on every read (shape, types, caps; refined 17.11.2026: all nine keys are required, extra keys are ignored and
+    never returned). A bad or stale one (its `answered_at` isn't the ask's: an older app re-answered or reopened and
+    kept it as an unknown field) counts as `null` and is dropped on the bridge's next write of that ask.
+  - The ask's status decides the rest (refined 17.11.2026), since an older app keeps the field when it closes or
+    reopens: on an `answered` ask it stands; on a `closed` one it is shown as stored but never carries a `url` and the
+    route answers 410, so a close that kept `file_id` leaves no working link; on an `open` one it counts as `null`,
+    like a stale one, and is dropped on the bridge's next write.
   - Re-answering with the same text and no new recording stays a no-op; a new recording is a change. The `answered`
     event payload adds `voice` and `previous_voice`; the `reopened` payload adds `answer_voice`.
   - Reopen (by anyone) clears it. Close (by anyone) keeps it with `file_id: null` and `deleted_at`, and deletes the
     recording. Whoever makes the transition deletes the file: the app for the user, the bridge for an agent's
-    `ask_close` / `ask_reopen` (best effort; a failure is logged and left to the sweep).
+    `ask_close` / `ask_reopen` (best effort; a failure is logged and left to the sweep). Refined 17.11.2026: the agent
+    reopens over REST (there is no `ask_reopen` tool); the bridge deletes only a file whose appProperties say
+    `kind: "voice"` and this `ask_id`; a failure of any kind is logged with its type and the file id only, and the
+    close or reopen stands.
   - Sweep: at most once a day each app lists the `voice-` files and deletes those older than 30 days, those whose
     ask is closed and those their ask doesn't point to. So a recording lives until the ask is closed, 30 days at most.
   - The single-tenant bridge: always `null`.
@@ -631,7 +642,11 @@ agent.
   `{user, agent, ask_id, file_id, exp}` sealed with the bridge's key (`ASKS_ENCRYPTION_KEY`, AES-GCM, context
   `media`), so it reveals nothing; valid 1 h; a new one on every read. Other agents (`asks_list`) get `url: null`, and
   so does everyone once the recording is deleted. `ask_wait`, the feed events and `POST /api/events` don't change: an
-  event wakes the agent, `asks_mine` says what happened.
+  event wakes the agent, `asks_mine` says what happened. Refined 17.11.2026: the owner gets `url` on every read of
+  its own ask, `asks_list` included; a link only while the ask is `answered` (closed → `url: null` and the route
+  410, reopened → `answer_voice: null` and the old link 404). `transcript` is the owner's only: every other agent
+  gets `transcript: null` in `answer_voice` and in the `voice` / `previous_voice` / `answer_voice` of event payloads
+  (the user edits the heard text before sending); the owner and its webhook keep it.
   - `GET /media/v1/<token>`: no Authorization, no CORS. The bridge opens the token, checks `exp`, that the agent
     isn't revoked and that the ask's current `answer_voice.file_id` is that file, then streams the file from Drive
     with the user's grant: `Content-Type` from the allowlist (never Drive's), `Content-Length`,
@@ -639,6 +654,13 @@ agent.
     `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`. A bad, expired or foreign token → 404 (one
     message for all); a deleted recording → 410; Drive unreachable → 503. 60 per minute per user. Cloud Run's request
     log keeps the path; the token in it is dead within the hour.
+    Refined 17.11.2026: the 404 also covers an agent that doesn't own the ask and a file Drive doesn't confirm as
+    this ask's recording (appProperties above) or that is over 5 MB (by Drive's size, or while reading when Drive
+    gives none). The recording is read into memory in one piece (≤ 5 MB, not chunked) under one of the instance's
+    media slots, held until the response has been sent (all taken → 503 with `Retry-After: 5`; Drive unreachable →
+    503 with `Retry-After: 30`). The limit is 60 per minute per user and agent, counted once the token opens, so one
+    leaked or revoked link can't block the user's other agents (429 with `Retry-After: 60`). HEAD is 405 and `Range`
+    is ignored: always the whole body.
   - `asks_mine` docstring: "answer_voice set: your user answered by voice. With transcript_source on_device, answer
     is their checked text. With none, answer is what they typed or the placeholder 'Voice answer (m:ss), not
     transcribed': download answer_voice.url (valid 1 h; read the ask again for a new one) and transcribe it, or ask
@@ -656,9 +678,11 @@ agent.
   REST body can set it, the no-op rule; the bridge deletes the file on an agent's close or reopen (fake Drive); the
   media route (tampered, expired, another user's, not the current file, a revoked agent → 404; deleted → 410; the
   exact headers; `Content-Type` from the allowlist even when Drive says `text/html`; 429); only the owner gets `url`;
-  the webhook body carries it. Apps: the recognizer choice per platform behind a fake (on device, record only),
-  auto-stop at 5:00, an interruption keeps the recording, the placeholder text, the send order and the rollback on
-  409, the sweep's three rules, the Info.plist keys and the entitlement present, `_headers` allows the microphone.
+  the webhook body carries it (17.11.2026 also: the status decides, `transcript` owner-only, the slot held until the
+  bytes are sent, the limit per agent, an oversized file without a size → 404). Apps: the recognizer choice per
+  platform behind a fake (on device, record only), auto-stop at 5:00, an interruption keeps the recording, the
+  placeholder text, the send order and the rollback on 409, the sweep's three rules, the Info.plist keys and the
+  entitlement present, `_headers` allows the microphone.
   Manual: an iPhone on iOS 26 in Russian and English, a Mac, Chrome on a desktop with the Russian pack, the Android
   app (record only), one 5-minute recording.
 - **Not in v5:** transcription on the server (the voice would go to our server or a third party: a privacy policy
