@@ -8,8 +8,9 @@ so one leaked or revoked link can't block the user's other agents); the agent is
 the ask is its own; the ask's CURRENT answer_voice names that file; Drive says the file is this ask's recording
 (appProperties kind "voice" and ask_id, as the apps upload it) of at most 5 MB (by Drive's size, and while reading when
 Drive gives none). A recording that was deleted (file_id null, a closed ask whatever an older app left in it, or gone
-from Drive) is 410; a reopened ask has no voice answer (404); Drive unreachable is 503. Then the bytes are read from
-the user's Drive with the user's grant and sent with
+from Drive) is 410; a reopened ask has no voice answer, and an ask file the bridge can't read as an ask (an unknown or
+missing status, not JSON) has none either (404); Drive unreachable is 503. Then the bytes are read from the user's
+Drive with the user's grant and sent with
 
     Content-Type             answer_voice.mime (audio/mp4 or audio/webm: the allowlist), never Drive's
     Content-Length           the bytes read
@@ -34,7 +35,7 @@ from ..rules import ANSWER_VOICE, AskError, NotFound
 from .accounts import Accounts
 from .media_api import FETCH_SLOTS, Slots
 from .ratelimit import RateLimiter
-from .records import DrivePool, HostedAsks
+from .records import BadFile, DrivePool, HostedAsks
 from .voice import MEDIA_PATH, VOICE_MAX_BYTES, VOICE_TYPES, VoiceLinks
 
 log = logging.getLogger("asks.hosted.voice")
@@ -105,7 +106,7 @@ def add_voice_route(app: FastAPI, links: VoiceLinks, accounts: Accounts, pool: D
         records = pool.records(user)
         try:
             ask = HostedAsks(records).get(sealed["ask_id"], with_events=False)
-        except NotFound:
+        except (NotFound, BadFile):  # a broken ask file: retrying won't help
             return _refuse(404, NO_SUCH)
         except AskError:
             return _refuse(503, UNAVAILABLE, {"Retry-After": "30"})

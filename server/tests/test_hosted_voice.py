@@ -9,6 +9,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 
@@ -802,6 +803,62 @@ def test_media_route_headers(google):
                          hosted.options(path, headers={"Origin": "https://app.example",
                                                        "Access-Control-Request-Method": "GET"})):
             assert not any(h.startswith("access-control-") for h in response.headers), dict(response.headers)
+
+
+def test_media_slot_given_back_when_sending_fails(google):
+    """The client goes away while the recording is being sent (the send raises): the slot still comes back."""
+    app, _ = build(google)
+    with TestClient(app, base_url=PUBLIC) as hosted:
+        token = agent(hosted, google)
+        tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+        answered_by_voice(google.drive(DENIS_SUB), 1)
+        path = link(hosted, token)
+    slots = app.state.media.guard.slots
+    host = PUBLIC.split("://", 1)[1]
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "https",
+             "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+             "headers": [(b"host", host.encode())], "client": ("127.0.0.1", 5000), "server": (host, 443)}
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message["type"])
+        if message["type"] == "http.response.body":
+            raise OSError("the client went away")
+
+    async def run():
+        with pytest.raises(OSError):
+            await app(scope, receive, send)
+
+    anyio.run(run)
+    assert sent == ["http.response.start", "http.response.body"]
+    assert slots.in_use == 0
+
+
+def test_media_route_broken_ask_file_404(hosted, google):
+    """An ask file the bridge can't read as an ask (an unknown or missing status, not JSON at all): the one 404, not a
+    503 that would invite the agent to retry a broken file."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    for title in ("Ship?", "Paint?", "Print?"):
+        tool_result(mcp(hosted, token, "ask_create", {"title": title}))
+    paths = []
+    for ask_id in (1, 2, 3):
+        answered_by_voice(drive, ask_id)
+        paths.append(link(hosted, token, ask_id))
+    rewrite(drive, 1, status="pending")
+    file = drive.file("ask-2.json")
+    doc = json.loads(file["content"])
+    doc.pop("status")
+    drive.write(file["id"], doc, {})
+    broken = drive.files[drive.file("ask-3.json")["id"]]
+    broken.update(content=b"not json at all", modifiedTime=drive._tick())  # a write, as Drive dates it
+    for path in paths:
+        response = hosted.get(path)
+        assert (response.status_code, response.json()) == (404, NOT_FOUND), path
+        assert "retry-after" not in response.headers
 
 
 def test_media_route_content_type_from_allowlist(hosted, google):
