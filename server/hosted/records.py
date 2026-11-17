@@ -41,7 +41,6 @@ from ..mirror import ASK, TASK, Kind, app_properties, build_doc
 from ..rules import (
     ANSWER_VOICE,
     STATUS_FILTERS,
-    AskError,
     Change,
     Conflict,
     NotFound,
@@ -538,8 +537,9 @@ class HostedAsks:
 
     def _delete_recording(self, ask_id: int, file_id: str) -> None:
         """Best effort, the ask is written already: deleted only when Drive says the file is this ask's recording
-        (appProperties kind "voice" and ask_id), since the user can name any file in their own ask file. A failure is
-        logged, never with the recording or the transcript, and the file is left to the apps' sweep."""
+        (appProperties kind "voice" and ask_id), since the user can name any file in their own ask file. Any failure
+        is logged with its type and the file id only (never a message that could carry the recording or the
+        transcript), and the file is left to the apps' sweep: the close or reopen stands."""
         records = self.items.records
         try:
             meta = records.call(records.drive.get_meta, file_id)
@@ -551,9 +551,9 @@ class HostedAsks:
                             ask_id)
                 return
             records.call(records.drive.delete, file_id)
-        except (AskError, DriveError) as exc:
-            log.warning("hosted: could not delete the voice recording %s of ask #%s (left to the apps' sweep): %s",
-                        file_id, ask_id, exc)
+        except Exception as exc:  # nothing may fail the transition that is already written
+            log.warning("hosted: could not delete the voice recording %s (left to the apps' sweep): %s", file_id,
+                        type(exc).__name__)
 
 
 class HostedTasks:

@@ -471,8 +471,29 @@ def test_failed_recording_delete_is_logged_without_content(hosted, google, caplo
     assert closed["status"] == "closed" and closed["answer_voice"]["file_id"] is None
     assert voice["file_id"] in drive.files  # left to the sweep
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "could not delete the voice recording" in logged and f"ask #1" in logged
+    assert f"could not delete the voice recording {voice['file_id']} (left to the apps' sweep): Unavailable" in logged
     assert "secret plan" not in logged and "AUDIO-OF-THE-USER" not in logged and "ship on friday" not in logged
+
+
+def test_recording_delete_never_fails_the_close(hosted, google, caplog, monkeypatch):
+    """Whatever goes wrong while deleting the recording, the close (already written) stands: the failure is logged
+    with its type and the file id only."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    voice = answered_by_voice(drive, 1, transcript="the secret plan")
+
+    def broken(file_id):
+        raise RuntimeError(f"unexpected trouble with {file_id}: the secret plan")
+
+    monkeypatch.setattr(hosted.app.state.pool.client(DENIS_SUB), "delete", broken)
+    with caplog.at_level(logging.WARNING):
+        closed = tool_result(mcp(hosted, token, "ask_close", {"id": 1, "resolution": "Shipped"}))
+    assert closed["status"] == "closed" and drive.doc(1)["status"] == "closed"
+    assert voice["file_id"] in drive.files
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert f"could not delete the voice recording {voice['file_id']} (left to the apps' sweep): RuntimeError" in logged
+    assert "secret plan" not in logged
 
 
 # ---------- what the agent gets ----------
