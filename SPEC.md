@@ -721,9 +721,321 @@ his own action). Server, MCP and CLI implemented 15.11.2026; the apps follow.
 - **Not in this step:** attachments on a task question, a separate "reminder" kind for things the user does
   without answering (they are a question like "Done?"), filtering `GET /api/tasks` by `question_open`.
 
+### 7. Files in answers
+
+Approved 18.11.2026 (owner, ask 1337, «Да, делай так»; his reason: Telegram's small size limits, and a safe way to send
+a file with passwords). Hosted only. Design only: nothing here is built yet.
+
+The user attaches files to an answer: up to 6, any type, each up to 100 MB. The files go from the app **straight to the
+user's own Google Drive** (the hidden appDataFolder, like voice recordings and pictures) and never touch our server on
+the way in. The agent that asked sees them as a list in `asks_mine` and downloads each through the bridge's proxy,
+`/media/v1/<token>`, which streams it from the user's Drive. A file can be marked **secret**: it is deleted from Drive
+right after the agent's first complete download. Nothing about a file's content is ever logged, pinged or put in chat.
+
+What this reuses from section 5 (voice answers, the person → agent direction): the app uploads with the user's own
+Drive token before the answer is written, the answer and the file list are written in one PATCH, the same marker and
+settle rules, `POST /api/events` afterwards, the sealed short-lived link on `/media/v1/`, the 404/410/409/429/503
+rules, the apps' sweep, and the bridge deleting on an agent's close or reopen. Where it **differs** (each below, with
+the reason): the bridge streams instead of reading the file into memory (voice is held whole, ≤ 5 MB, `server/hosted/voice_api.py:54-60`,
+`server/drive.py:289-312`: at 100 MB that is 200 MB per download in a 512 MiB instance); uploads are resumable and
+chunked; there is a per-file secret flag; and a download may change the ask (`downloaded_at`).
+
+#### 7.1 Can 100 MB go through the bridge? (checked)
+
+- **Into the bridge: no, and the design doesn't need it.** Cloud Run's documented limits: maximum HTTP/1 request size
+  32 MiB (no limit with an HTTP/2 server), maximum HTTP/1 response size 32 MiB unless `Transfer-Encoding: chunked` or
+  streaming is used, request timeout at most 60 minutes, per-instance bandwidth 600 Mbps (sum of ingress and egress)
+  (https://cloud.google.com/run/quotas, "Request limits" and "Bandwidth limits", page last updated 2026-11-10). The
+  bridge runs `uvicorn` (HTTP/1) with `--memory=512Mi` (`deploy/hosted/Dockerfile`, `deploy/hosted/README.md:69,86`), so a
+  100 MB PUT to the bridge would be refused by the frontend at 32 MiB. The app therefore uploads to Drive itself
+  (7.3); the agent's `qtu_` upload path (section 4) is unchanged.
+- **Out of the bridge: yes, streamed.** A response that is streamed (no whole body in memory) is not subject to the
+  32 MiB response limit. The bridge sends the file chunk by chunk from Drive's `files.get?alt=media` stream (1 MiB
+  chunks, 7.5). The service's request timeout is not set in the deploy config (`deploy/hosted/README.md:69`,
+  `.github/workflows/deploy.yml:49` set no `--timeout`), so Cloud Run's default applies, which I believe is 300 s but did not verify on
+  a documentation page: 100 MB takes 160 s at 5 Mbps and 400 s at 2 Mbps. **Decision:** add `--timeout=900` to the
+  deploy workflow's `gcloud run deploy` (long polls end at 50 s, so nothing else is affected), and support `Range`
+  on non-secret files so a slow agent can resume (7.5).
+- **Honest limit:** 100 MB per file stands. A secret file cannot be resumed (a second request is a second download),
+  and its link lives 15 minutes, so the agent needs about 1 Mbps for a 100 MB secret file; the docstring says so (7.8).
+
+#### 7.2 Data model
+
+The ask gets `answer_files`: an array, never null, `[]` when there are none and on older asks, in the order the user
+attached them. It belongs to the current answer, exactly like `answer_voice` (the same `answered_at` rule: a list whose
+items' `answered_at` isn't the ask's is stale and reads as `[]`; on an `open` ask it reads as `[]`; on a `closed` ask
+it is shown as stored but carries no `url`). Voice and files can be in one answer.
+
+| field | notes |
+|---|---|
+| id | 1, 2, 3… within the answer (a re-answer starts again at 1); also the claim `n` in the link |
+| name | the file's name as the user's device gave it, sanitised (below), 1–200 chars; never used as a path anywhere |
+| mime | `type/subtype` as the device reported (`^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$`, lower-cased), else `application/octet-stream`. Informational only: Drive stores every file as `application/octet-stream` and the bridge serves it as such |
+| bytes | 1 … 104 857 600 (100 MiB; «100 MB» in the UI). Empty files are refused. The bridge compares it with Drive's own `size` before sending and refuses on a mismatch |
+| file_id | the Drive file id (letters, digits, `-`, `_`; ≤ 200); `null` once deleted, exactly when `deleted_at` is set |
+| secret | boolean, set by the user per file at attach time; never changed afterwards |
+| uploaded_at | when the app finished uploading it (the app's clock, ISO-8601 with ms and `Z`) |
+| answered_at | equals the ask's `answered_at` |
+| downloaded_at | `null`, or when the agent's first complete download ended (written by the bridge) |
+| deleted_at | `null`, or when the file was deleted from Drive |
+| deleted_reason | `null`, or `downloaded` (a secret file after its download), `closed`, `reopened`, `expired` (a secret file not downloaded in time) |
+
+- **No `sha256`.** A browser would have to hold 100 MB in memory to hash it, a phone would spend minutes. The agent
+  checks `Content-Length` (the bridge sends Drive's size, verified against `bytes`). Drive's `md5Checksum` could be
+  passed on as a header later (not verified that Drive returns it for appDataFolder files; not in this step).
+- **Limits:** ≤ 6 files per answer; ≤ 100 MB each; so ≤ 600 MB per answer (no separate total: the owner's numbers
+  multiply). The user's Drive quota is the real ceiling: appDataFolder files count against the user's storage (my
+  understanding of Drive; the appdata guide page did not say it, so not verified), hence the sweep (7.6) and the
+  "Your Google Drive is full" error.
+- **Types:** everything is allowed, executables and archives included. Refusing by extension is theatre (rename the
+  file), the bridge never opens a file, and the only reader is the user's own agent. The risk is the agent running
+  what it was sent: the agent docs forbid it (7.8) and the UI says AskHooman does not scan (7.5). The bytes are never
+  interpreted by the bridge: Content-Type is always `application/octet-stream`, `Content-Disposition: attachment`,
+  `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`.
+- **Name sanitising** (the app on input, the bridge again on every read, so a hand-edited ask file can't carry
+  more): Unicode NFC; control characters, bidi controls, `/`, `\`, NUL and the Windows-reserved `<>:"|?*` replaced by `_`
+  (the same control/format/bidi stripping as client and agent names, section v4); leading dots and spaces stripped
+  (no hidden files, no `..`); at most 200 characters, cut before the extension; empty after cleaning → `file`. The
+  name is data for the agent, who must save under a name of its own choosing (7.8). Download header:
+  `Content-Disposition: attachment; filename="ask-<id>-file-<n>[.<ext>]"; filename*=UTF-8''<percent-encoded name>`
+  where `<ext>` is the sanitised name's last extension if it is 1–10 ASCII letters or digits.
+- **Drive file:** name `afile-<ask id>-<n>-<unix ms>` (no user text in it; it does not match the ask listing's
+  `name contains 'ask-'`, `server/drive.py:27`), `mimeType: application/octet-stream`, appProperties `ask_id` (string),
+  `kind: "file"`, `file` (= `n`, string), `secret` (`"1"` or `"0"`). Without `kind` and `ask_id` the bridge neither
+  sends nor deletes the file, as for voice.
+- **Events:** the `answered` payload adds `files` and `previous_files` (the arrays), `reopened` adds `answer_files`;
+  the bridge adds `file_downloaded` `{id}` (actor: the owner agent) on a first download. Apps skip kinds they don't
+  know. Another agent (not the owner) sees every `name` as `null` in `answer_files` and in those payloads, and no `url`.
+- **Single-tenant bridge:** always `[]` (`server/db.py:93`'s pattern for `answer_voice`).
+- **Answer text.** With no text and no option the answer text is `2 files attached` (`1 file attached`), so an answer
+  is never empty and webhooks and pings show something true and nothing more: no names, no mention of secret.
+  With a voice recording and no text, section 5's placeholder wins; the count is added after it: `Voice answer
+  (0:42), not transcribed · 2 files attached`.
+
+#### 7.3 Upload: the app to the user's Drive
+
+By the app, with the user's Drive token (web and Android: `POST /api/drive/token`; Apple: its Google sign-in); no new
+OAuth scope (7.7). Files are sent one after another, never in parallel.
+
+1. **Per file**, before anything is written to the ask: size ≤ 5 MB → one multipart request (the code voice uses:
+   `web/src/lib/drive.ts:660-692`); larger → a **resumable session**: `POST https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable`
+   with the metadata (name, parents `["appDataFolder"]`, mimeType, appProperties above) and
+   `X-Upload-Content-Type` / `X-Upload-Content-Length`; the session URL comes back in `Location` (the bridge's own client
+   already checks that a session URL is Drive's: `server/drive.py:23,350-354`; the apps do the same check). Then
+   `PUT` chunks of **8 MiB** (a multiple of 256 KiB, as Drive requires) with `Content-Range`. Drive's documented
+   rules (https://developers.google.com/workspace/drive/api/guides/manage-uploads): chunks are multiples of 256 KB except
+   the last; an interrupted upload is resumed by asking the session for its state and sending the rest; a session URI
+   expires after one week.
+2. **Progress and interruption.** The web app sends chunks with `XMLHttpRequest` (`fetch` has no upload progress);
+   Apple uses `URLSession` uploads from a file handle. Each chunk is retried 3 times (1 s, 4 s, 15 s). After a network
+   error the app asks the session how far it got (`PUT` with `Content-Range: bytes */<total>`, a 308 answer's `Range`)
+   and continues from there; a 5xx or a rate-limit 403 is retried the same way; 401 refreshes the token and goes on;
+   404 or 410 (session gone) starts that file again once. Quota exhausted (403 `storageQuotaExceeded`) stops with
+   "Your Google Drive is full" (7.5). A file that fails for good shows "Couldn't upload" with Retry and Remove and
+   **blocks Send**; the other files are kept. Leaving the page mid-upload asks first (`beforeunload`); an iPhone that
+   goes to the background resumes with the same session when the app returns.
+3. **Check after upload:** the app reads the new file's `size` (Drive's answer) and compares it with the local size;
+   a mismatch deletes the file and counts as a failure. The bridge checks the same again before it sends.
+4. **Then the answer**, exactly section 5's order: all files uploaded → one PATCH with `answer`, `answer_voice`,
+   `answer_files`, the `answered` event → `POST /api/events {ask_id, kind: "answered"}`. The marker (section 5's local
+   record of an upload that has no answer yet; `web/src/lib/drive.ts:425-460`) holds the **list** of file ids; the
+   settle rules apply to the set: the send has landed if a read of the ask shows an answer carrying those ids, and
+   a definite refusal (409) deletes every uploaded file of the set (best effort) while the draft, with its chips,
+   stays on screen. A write whose outcome is unknown keeps the marker and is settled by the next read; files of an
+   abandoned send are left to the sweep. (I read the call site and its comments, not every numbered rule of the
+   marker logic; the rules apply per set and the implementer re-reads them.)
+5. **Re-answering:** a new set replaces the old: after the write succeeds the app deletes, best effort, the old
+   answer's files that are not in the new set; the old entries survive only in the event's `previous_files`, and the
+   new `answer_files` holds only the new set.
+6. Bridge-side nothing is needed for an upload: it never sees one. (The bridge does not issue upload sessions: the
+   app needs no endpoint, and no file bytes or Drive session URLs ever pass through our logs.)
+
+#### 7.4 What the agent sees
+
+For the **owner agent** only (`asks_mine`, `ask_get`, `asks_list` for its own asks, REST) every item of
+`answer_files` adds `url` and `url_expires_at`: `<ASKS_PUBLIC_URL>/media/v1/<token>`, the section 5 token with one
+more claim, `n` (the file's `id`); a token without `n` is a voice link and a token with it can't open the recording
+(`voice.py:56` takes `n` as an optional claim; the route picks the record by it). Sealed with `ASKS_ENCRYPTION_KEY`,
+context `media` (`voice.py:53`). A new token on every read.
+
+| file | link valid | downloads |
+|---|---|---|
+| normal | 1 h (`LINK_TTL`, `voice.py:54`) | any number, until the ask is closed; `Range: bytes=N-` answers 206 |
+| secret | **15 min** | **one** complete download, then the file is deleted (below) |
+
+The **webhook** body (`ask.answered`) carries `answer_files` metadata but `url: null` and `url_expires_at: null` on
+every item (the agent reads `asks_mine` for links): a 15-minute secret link must not sit in a receiver's delivery log.
+`ask_wait`, the feed and `POST /api/events` don't change.
+
+**The route** `GET /media/v1/<token>` for a file (checked in section 5's order, one 404 message for all of them):
+token opens and is not expired → rate limit (a new bucket `files`, 60/min per user and agent, like `voice`) → the agent
+isn't revoked and owns the ask → the ask's current `answer_files` has item `n` with this `file_id` (closed ask or
+deleted item → 410; reopened → 404) → Drive confirms the file is this ask's (`kind: "file"`, `ask_id`, `file` = `n`)
+and its `size` equals `bytes` (else 404, logged by ids only) → a stream slot (below) → stream. `HEAD` is 405. Headers as
+7.2, `Content-Length` = `bytes`, `Cache-Control: private, no-store`. Drive unreachable → 503 `Retry-After: 30`.
+
+- **Streaming, not buffering.** A new `DriveClient.stream_media(file_id)` (same token refresh, `Accept-Encoding:
+  identity` and compressed-body refusal as `_download_capped`) yields 1 MiB chunks into a `StreamingResponse`; memory
+  per download is a few MiB. Because memory is no longer the limit but bandwidth and threads are, files get their own
+  **4 stream slots per instance** (separate from the 4 media slots, so a download can't starve pictures); all taken →
+  503 `Retry-After: 5`. The sent length is checked against `bytes` at the end; a short Drive stream aborts the response.
+- **Secret: the first complete download wins.** Before the first byte the bridge **claims** the file in the metadata
+  store (`fileclaims/<digest of user:ask:n>`, written in a transaction like `UploadGrants.claim`, `server/hosted/uploads.py:91-102`, with a
+  lease of 15 minutes). A second request while the claim is held → 409 `being downloaded`. The claim is in the store, not in memory,
+  because a concurrent second request may reach another instance. If the client
+  disconnects before the last chunk has been sent (the send raises or the task is cancelled) the claim is released and
+  nothing is deleted: the same link works again until it expires. After the **last chunk has been handed to the
+  server** (the code after the stream loop runs only if the client was still taking data) the bridge deletes the file
+  from Drive, writes `downloaded_at`, `deleted_at`, `deleted_reason: "downloaded"`, `file_id: null` and a
+  `file_downloaded` event into the ask (read-modify-write, the usual 3 attempts; a failure is logged by ids and left
+  to the next read, which sees Drive's 404 and writes it), and keeps the claim. Delete first, write second: the
+  secret goes first. **«First download» therefore means: the bridge finished sending without an error.** It cannot
+  know that the agent's last bytes arrived; an agent that finds its file shorter than `Content-Length` must tell
+  its user to send it again. The docstring says so.
+- **A second download of a secret file** → 410 `the file was deleted after the first download`. **A secret file that
+  was not downloaded** is deleted by the sweep (7.6); the agent's later request → 410, `deleted_reason: "expired"`.
+- **Normal file:** `downloaded_at` is written once, on the first complete download (a Drive write, no event beyond
+  `file_downloaded`); later downloads write nothing. It feeds the user's "Downloaded by your agent".
+- **`asks_mine` size:** metadata only plus the links; nothing is fetched until the agent follows a link.
+
+#### 7.5 The apps
+
+Hosted only; shipped dark like voice (`web/src/lib/voiceSwitch.ts` pattern: `?files=on` / `?files=off`, kept in the
+browser's storage, default off until the privacy policy has the files text; Apple behind the same build flag).
+
+- **The answer box:** a paperclip button labelled **Attach** (tooltip and VoiceOver label «Attach files»), left of the
+  mic and Send. It opens the system file picker, any type, multiple. Dropping files on the web answer box does the
+  same. Not shown on a closed ask.
+- **First use, once per device**, a dialog: «Files go to your Google Drive, and your agent downloads them from there.
+  AskHooman does not scan or open them. Only attach files you trust.» (OK.)
+- **The file chip**, above the box, one per file, a card of two lines:
+  - line 1: file-type icon, name (truncated in the middle: `Q3 repor…final.pdf`), size (`4.2 MB`), state, ×;
+  - line 2: a checkbox **«Secret — delete after the agent downloads it»** with an (i) that opens:
+    «The file is deleted from your Google Drive right after your agent has downloaded it once. If it hasn't been
+    downloaded within 24 hours, it is deleted anyway. A secret file's contents are never put in chat or logs.»
+  - A ticked file shows a lock before the name. States: `Waiting`, `Uploading 43%`, `Uploaded`, `Couldn't upload`
+    (with **Retry** and **Remove** instead of ×). The checkbox is locked after Send.
+  - On phones the chips are full-width, stacked, each at least 44 pt tall (the checkbox row too); the box scrolls
+    when 6 are attached. On a wide window they are the same cards in one column.
+- **Send** is disabled while a file uploads: it reads «Uploading 2 of 3…», and becomes «Send» when all are
+  uploaded; a failed file keeps it disabled until Retry or Remove. A voice chip and file chips can both be there.
+- **Errors** (a banner above the chips; exact):
+  - «You can attach up to 6 files.»
+  - «“{name}” is larger than 100 MB.»
+  - «“{name}” is empty.»
+  - «Couldn't upload “{name}”. Check your connection and try again.»
+  - «Your Google Drive is full. Free some space and try again.»
+  - 409 on the send: the existing «This question has already changed…»; the chips stay.
+  - Drive refused the token: the existing «Continue with Google».
+- **Seen after sending** (under the answer, per file; the user's own answer view): `report.pdf · 4.2 MB · Not
+  downloaded yet`; `· Downloaded Nov 18, 14:02`; secret: `Secret · not downloaded yet`, `Secret · deleted after download
+  (Nov 18, 14:02)`, `Secret · deleted, not downloaded in 24 hours`; after the ask is closed: `· Deleted when the ask
+  was closed`. The user can open their own non-secret file from Drive (`files.get?alt=media`, the viewer rules of
+  section 4); a secret file has no "open".
+- **Notifications and push texts** show the answer text only (7.2); never a file name.
+- The web app's Content-Security-Policy already allows `connect-src https://www.googleapis.com`
+  (`web/vite.config.ts:38`), which covers Drive's upload session URLs; the Drive resumable calls from a browser
+  (CORS on the session `PUT`) are **not verified in this repository's tests**: test them first on Chrome and Safari.
+  Android is the web app, so one pass covers it.
+
+#### 7.6 The sweep
+
+- **Normal files are deleted when the ask is closed** (by the user, by the agent's `ask_close`, like voice), and on
+  reopen. Reason: the user's Drive is his; a 600 MB answer should not stay after the agent has what it needs and
+  closed the ask, and an ask the user closed himself is one he no longer wants files for. Files of an ask that stays
+  open or answered live at most **30 days** after the answer (the voice rule). This is open question 5.
+- **Secret files that were not downloaded** are deleted **24 hours after `answered_at`** (`deleted_reason:
+  expired`). Reason: an agent is woken within minutes; a day covers a sleeping one, and a password lying in Drive
+  longer than that is the thing the flag is for.
+- Whoever makes a transition deletes: the app for the user's close, reopen and re-answer; the bridge for the agent's
+  `ask_close` and `ask_reopen` (best effort, only a file whose appProperties say `kind: "file"` and this `ask_id`,
+  failures logged by ids and left to the sweep; the close stands).
+- **Sweeps.** The apps: at most once a day, as for voice, list `afile-` files and delete those older than 30 days, those
+  whose ask is closed, those their ask doesn't name, and secret ones more than 24 hours past the ask's `answered_at`
+  (Drive's clock from the listing's `Date` header, as voice does). The bridge: **lazily**, on every read of an ask
+  it already makes (`asks_mine`, `ask_get`, a download) it deletes that ask's expired secret files and writes
+  `deleted_at` / `expired`. There is no scheduler in the deployment (min-instances 0, `deploy/hosted/README.md:69`),
+  so an unread ask with an undownloaded secret is cleaned when the user opens any app or the agent next looks:
+  **the 24 h is a ceiling only when someone looks**. A Cloud Scheduler job calling a sweep endpoint would make it
+  firm; not built (open question 6).
+- Delete Account leaves the files, like asks and media (section v4's note); the user can delete the hidden app
+  data in Drive.
+
+#### 7.7 Privacy and security
+
+- **Scopes: no change.** The apps and the bridge hold only `drive.appdata` (`server/drive.py:25`, `server/hosted/google.py:27-28`);
+  Google calls it a non-sensitive scope (https://developers.google.com/workspace/drive/api/guides/appdata), and it is
+  enough to create, read and delete files in the app's own hidden folder (`files.delete` lists `drive.appdata`:
+  https://developers.google.com/workspace/drive/api/reference/rest/v3/files/delete). The bridge reads a file the app
+  uploaded because both OAuth clients are one Google Cloud project (section 2), exactly as it already does for voice.
+  No new consent, no re-verification.
+- **Nothing of a file in logs:** no names, no sizes beyond what an error needs, no content, no tokens. Logs carry the
+  ask id, the item `n` and the Drive file id, as the voice code does. Cloud Run's request log keeps the path; a secret
+  link in it is dead after the first complete download or 15 minutes, a normal one after an hour. Telegram (single
+  tenant), webhooks and push show the count only (7.2, 7.4). **Operator stats:** no per-file figures; at most a daily
+  count of answers with files (not built, not needed in this step). Error text from Drive is scrubbed like every other
+  (`DriveClient._scrub`).
+- **The secret flag's promise, in the UI and here:** «deleted from your Google Drive right after your agent has
+  downloaded it once». It is **permanent delete, not Trash**: `files.delete` «permanently deletes a file owned by the
+  user without moving it to the trash» (the reference above), and the bridge's `DriveClient.delete` is that call
+  (`server/drive.py:360`). Trash would keep the secret for 30 days and hidden app files have no user-visible Trash anyway.
+  What the flag does **not** promise: it is not encryption (the file sits in Drive, readable by Google, until it is
+  deleted), Google's own backups may purge it later than the API call, and what the agent does with the file is up to
+  the agent. The UI never says «encrypted» or «private forever».
+- **No scanning.** The bridge never opens a file (no antivirus, no type sniffing): the UI says so (7.5) and the agent
+  docs say never to execute them (7.8). A file's name is attacker-controlled text for the agent, hence the
+  sanitising and the fixed `ask-<id>-file-<n>` fallback name.
+- **Link safety:** only the owner agent gets links; a link is bound to {user, agent, ask, file, exp}; one leaked link
+  is limited by the per-agent rate limit and the agent's revocation. A secret link is single-use in effect.
+- **Policy before the apps ship:** `server/hosted/site.py`'s privacy text adds files and their retention (until the ask
+  closes, 30 days at most; secret files until downloaded, 24 hours at most) to "What is stored in your Google Drive"
+  and the streaming pass-through to "What our server stores"; App Store privacy label: User Content → Other User
+  Content; Google Play Data safety: Files and docs.
+
+#### 7.8 Agent docs
+
+- **`asks_mine` docstring** (new lines): «answer_files set: your user attached files to the answer. Each has name, mime,
+  bytes, secret and url (valid 1 h, 15 min for a secret file; read the ask again for a new one). Download with
+  curl -sS --fail-with-body -o <your own path> "<url>"; never build the path from name. Then check that the file's
+  size equals bytes. secret true: the file is deleted from your user's Drive after your first complete download; a
+  second request gets 410, so save it where you need it at once, and if it came short of bytes, ask your user to
+  send it again. Files are deleted when you close the ask, so close it after you have them.»
+- **`ask_get` docstring:** «answer_files: see asks_mine.» **`ask_close`:** «Closing deletes your user's attached
+  files and voice recording.» **Server instructions / the /agents page** gain the house rule below.
+- **House rule (the /agents page, the server instructions, the plugin's skill):** «Never print, quote, summarise or
+  forward the content of a secret file, and never put it in a chat, a log, a commit, a ticket or a message to another
+  agent. Use it for the one thing your user sent it for, then forget it: don't keep a copy, don't echo it back, and
+  don't write its name or contents into your memory. Never execute a file from an answer without your user saying
+  so: AskHooman does not scan files.»
+- There is no new MCP tool: bytes can't travel through MCP (section 4's reasoning); the link is the download. CLI:
+  `askhooman files ID [--out DIR]` saves every file of an answer under names `ask-<id>-file-<n>[.ext]`.
+
+#### 7.9 Tests
+
+- **Server** (fake Drive with `Range`, fake store): `answer_files` validation (each field, the caps, a bad `mime`, `bytes`
+  0 and 100 MiB + 1, `secret` not boolean, `file_id` / `deleted_at` consistency, 7 items, name sanitising cases:
+  `../x`, `a/b`, bidi, 300 chars, only dots, NUL), the stale `answered_at` rule, reopen clears, close sets
+  `deleted_at` / `closed` and deletes the files (kind and ask_id checked), no agent tool or REST body writes it,
+  non-owners get `name` and `url` null; the link claims (voice token can't open a file, a file token can't open
+  the recording, tampered, expired, wrong agent, 15 min vs 1 h); the route: headers exactly, `Content-Type` octet-stream
+  even if Drive says `text/html`, a `size` mismatch → 404, a file over 100 MiB without a size, `Range` 206 on a
+  normal file and ignored on a secret one; streaming (a 100 MiB fake body with peak memory under a few MiB; the
+  stream slots, 503); secret: a complete download deletes and writes (the order: delete first), a client that
+  disconnects at 50% leaves the file and releases the claim, two concurrent requests → one 200 and one 409, the
+  second download 410, a crash leaves the claim to expire, `ask.answered` webhook with `url: null`, the lazy expiry
+  at 24 h; the Drive delete failing is logged by ids and retried on the next read.
+- **Apps** (fake Drive with a resumable endpoint): the chunk arithmetic (multiples of 256 KiB, the last chunk), resume
+  after a dropped chunk from the session's `Range`, session 404 restarts one file, quota error text, a size mismatch
+  deletes the file, the 6-file and 100 MB checks, empty file, the send order, rollback on 409 (every file of the set
+  deleted), the marker holds the set, Send disabled while uploading, name cleaning, the sweep's four rules, the
+  switch default; the answered view's lines. **Manual** (Chrome desktop, the Android app, an iPhone, a Mac): one 100 MB
+  file over a throttled connection with the network cut and restored mid-way, six files at once, a secret file
+  downloaded by `curl` once and then again (410), a `curl` killed at 50%, and a 100 MB download through the real
+  Cloud Run service (the 32 MiB response limit and `--timeout=900`, never tried in this repository).
+
 ### Order
 
-1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the agent's event feed + `ask_wait`, the Claude Code channel plugin, `askhooman listen`, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery` / `last_seen`, the Wake-up row in the apps. 3. `set_my_name`. 4. Pictures and video: the server (media files, `ask_attach` / `ask_upload` / `ask_detach`, `attachments` on create, REST, CLI, docstrings), then the web app (which is the Android app too), then iOS and macOS. 5. Voice answers, after pictures: the server (`answer_voice` rules, the media route, docstrings) and the privacy policy first, then the web app, then iOS and macOS, with the store privacy labels in the same release. 6. Task questions: the server (rules, REST, MCP `task_ask` / `task_unask`, CLI, docstrings), then the web app, then iOS and macOS. Each step ships on its own; existing tools and file formats keep working throughout.
+1. Replies on tasks (rules, REST, MCP `task_answer`, Drive writes by the app, apps' reply box). 2. `task.replied` event, the agent's event feed + `ask_wait`, the Claude Code channel plugin, `askhooman listen`, the `wake` switch, `set_my_webhook` / `test_my_webhook`, `last_delivery` / `last_seen`, the Wake-up row in the apps. 3. `set_my_name`. 4. Pictures and video: the server (media files, `ask_attach` / `ask_upload` / `ask_detach`, `attachments` on create, REST, CLI, docstrings), then the web app (which is the Android app too), then iOS and macOS. 5. Voice answers, after pictures: the server (`answer_voice` rules, the media route, docstrings) and the privacy policy first, then the web app, then iOS and macOS, with the store privacy labels in the same release. 6. Task questions: the server (rules, REST, MCP `task_ask` / `task_unask`, CLI, docstrings), then the web app, then iOS and macOS. 7. Files in answers: the server first (`answer_files` rules and reads, the file route with streaming, the secret claim, the lazy expiry, docstrings, `--timeout=900` in the deploy workflow, the privacy policy), then the agents' side (CLI `askhooman files`, the /agents page rule); then the web app (which is the Android app too: resumable upload, chips, sweep), then iOS and macOS, with the store privacy labels in the same release. Test the browser's resumable upload to Drive and a 100 MB streamed download through Cloud Run before the web build is written. Each step ships on its own; existing tools and file formats keep working throughout.
 
 ### Open questions (Denis)
 
@@ -735,3 +1047,11 @@ his own action). Server, MCP and CLI implemented 15.11.2026; the apps follow.
    marketing agents' clips?
 4. Transcription on our server (e.g. Whisper), later and as a paid feature, since the audio would go to our server or a
    third party: worth the privacy policy change and the cost?
+5. Files in answers (7.6): files of an ask are deleted when the ask is closed (30 days at most), like voice. Right,
+   or should they stay a few days after the close so the user can still open what he sent?
+6. Secret files that the agent never downloads are deleted 24 hours after the answer, but only when someone reads the
+   ask (the agent, or any AskHooman app); the server has no scheduler. Is «24 hours, when someone looks» enough, or
+   should we add a scheduled job (a small Cloud Scheduler cost) so it is exact?
+7. «Deleted after the first download» means the bridge finished sending without an error; if the agent's connection
+   dies on the last bytes, the file is gone and the user must send it again (7.4). Accept that, or keep a secret file
+   for a few more minutes after the download (the promise then reads «deleted within 15 minutes»)?
