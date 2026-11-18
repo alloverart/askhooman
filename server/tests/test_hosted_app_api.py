@@ -431,7 +431,14 @@ def test_store_pages(hosted):
                   "We keep only your account email, an encrypted Google token and your agents' names and keys"):
         assert words in landing, words
     assert "In review at the App Store" not in landing and landing.count("Available now") == 4
-    for words in ("Effective 1 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
+    for words in ("Effective 18 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
+                  # 18.11.2026: pictures, videos and voice answers; what connected agents read
+                  "the app saves the recording there with your answer",
+                  "A voice recording is kept until the ask is closed, and 30 days at most",
+                  "pass through our server without being kept",
+                  "agent you connect can read all the asks and tasks in your account",
+                  "go only to the agent that asked",
+                  "the link to a voice recording stops working within an",
                   "will adhere to the <a href=\"https://developers.google.com/terms/api-services-user-data-policy\">"
                   "Google API Services User Data Policy</a>, including the Limited Use requirements",
                   "drive.appdata", "appDataFolder", "never copied to our database", "Google Cloud",
