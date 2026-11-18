@@ -552,9 +552,15 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
 ### 5. Voice answers
 
 Added 11.11.2026 (Denis, TG 16914 and ask #1166: he answers agents by voice in Telegram and wants the same in
-AskHooman; transcription is the connected agent's job for now, but do better where we can). The approach below (a mic
-button, recognition on the device, the recording sent along) is the one he approved. Hosted only. The server part is
-built (17.11.2026, the bullets marked «refined» say where the code made it exact); the apps are not yet.
+AskHooman; transcription is the connected agent's job). The approach below (a mic button, the recording sent along) is
+the one he approved. Hosted only. The server part is built (17.11.2026, the bullets marked «refined» say where the code
+made it exact); the apps are built too.
+
+18.11.2026: recognition removed, recordings only (owner's decision, ask 1334); server transcription — later, paid.
+
+The user records the answer in the app and sends the recording. The apps do not turn speech into text: no on-device
+recognizer, no model download, no speech-recognition permission. The agent gets the recording, so it can listen to it or
+transcribe it itself. Audio leaves the device only to the user's own Drive, and from there to the user's own agent.
 
 The user records the answer in the app. Where the device can turn speech into text **on the device**, the text fills
 the answer box and the user checks it before sending. The recording goes with the answer, so the agent can listen
@@ -562,37 +568,24 @@ again or transcribe it itself. Audio leaves the device only to the user's own Dr
 agent.
 
 - **Recording** (every app): a mic button next to Send in the answer box. Tap to start, Stop to end (no hold-to-talk:
-  answers run to minutes). While recording: a timer, a level meter, the language chip (below), Cancel (discards) and
-  Stop. With a recognizer the words appear in the box as they are heard (unsettled words grey). After Stop the box
-  holds the text, editable, with a voice chip above it, "▶ 0:42 · RU · ×" (play back, remove). Recording again
+  answers run to minutes). While recording: a timer, a level meter, Cancel (discards) and Stop.
+  After Stop the answer box (empty, or with what the user typed) has a voice chip above it, "▶ 0:42 · ×" (the length
+  only; play back, remove). Recording again
   replaces the recording: one per answer. Option buttons work as now (the option, then the text on the next line).
-  Send sends the text and the recording. An answered ask keeps the chip under the answer, playing from Drive, until
+  Send sends the recording and any text the user typed. An answered ask keeps the chip under the answer, playing from Drive, until
   the recording is deleted.
   - Recording stops by itself at 5:00 (a warning at 4:30), on an audio interruption (a call), and when the app goes
     to the background or the screen locks; what was recorded is kept. Under 1 s is discarded.
-  - With no text at all (no recognizer, nothing typed, no option) the answer text is `Voice answer (0:42), not
-    transcribed`, so an answer is never empty and old apps, webhooks and Telegram pings show something true.
-  - First use, once per device: "Your agent gets the recording too, so it can listen again or transcribe it. Speech
-    is turned into text on this device." (or "This device can't turn speech into text; your agent will.")
+  - With no text at all (nothing typed, no option) the answer text is `Voice answer (0:42), not transcribed`, so an
+    answer is never empty and old apps, webhooks and Telegram pings show something true.
+  - First use, once per device: "Your agent gets the recording, so it can listen to it or transcribe it."
   - Permissions: iOS and macOS `NSMicrophoneUsageDescription` ("AskHooman records your voice answer to an agent's
-    question.") and `NSSpeechRecognitionUsageDescription` ("Your voice answer is turned into text on this
-    device."), plus the macOS sandbox entitlement `com.apple.security.device.audio-input`. Web: `_headers` gets
+    question."), and no speech-recognition key, plus the macOS sandbox entitlement `com.apple.security.device.audio-input`. Web: `_headers` gets
     `Permissions-Policy: camera=(), microphone=(self), geolocation=()` (today's `microphone=()` blocks it). The
     Android app needs no change: Chrome asks for app.askhooman.com. Refused → the mic button says where to allow it,
     and typing works as before.
-- **Speech to text, on the device only.** Never a cloud recognizer: Apple's server mode, Chrome's default Google
-  service and Safari's `webkitSpeechRecognition` all send the audio away.
-
-  | where | recognizer | Russian | otherwise |
-  |---|---|---|---|
-  | iOS 26+, macOS 26+ | `SpeechAnalyzer` + `SpeechTranscriber`; the model is installed once through `AssetInventory`, with progress | yes: `ru_RU` is one of its locales | record only |
-  | iOS 17–18, macOS 14–15 | `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true`, only when `supportsOnDeviceRecognition` is true for the locale | as the OS reports | record only |
-  | web on Chrome or Edge 139+, desktop | Web Speech API with `processLocally = true`, fed the recorder's own mic track (`start(track)`); the language pack through `SpeechRecognition.install()` after the user taps Download | when `available()` says so for `ru-RU` | record only |
-  | Safari and Firefox on the web; the Android app (Chrome on Android has neither `processLocally` nor `start(track)`) | none | – | record only |
-
-  Record only = the recording goes to the agent with whatever the user typed; the keyboard's own dictation (iOS,
-  Gboard) still works in the box. Language: a recognizer takes one language per recording, so the chip cycles
-  through the device's preferred languages that the recognizer supports (at most 3), remembered per device.
+- **Language.** There is no recognizer and no language choice. `lang` (below) is the device's or browser's first
+  preferred language, sent with every recording.
 - **Audio.** Apple: AAC-LC, mono, 24 kHz, 32 kbit/s, in M4A (`audio/mp4`). Web: `MediaRecorder` with the first
   supported of `audio/webm;codecs=opus` (Chrome, Edge, Firefox, Android) and `audio/mp4` (Safari),
   `audioBitsPerSecond: 32000`. Allowed types `audio/mp4` and `audio/webm`; 1 s to 5 min; ≤ 5 MB (5 minutes are about
@@ -612,9 +605,9 @@ agent.
   | mime | `audio/mp4` or `audio/webm` |
   | bytes | 1 … 5 MB (refined 17.11.2026: ≥ 1) |
   | duration_ms | 1000–300000 |
-  | lang | BCP-47 (`ru-RU`), ≤ 35 chars: the recognizer's language, or the chip's when none ran; required, never `null` (refined 17.11.2026) |
-  | transcript_source | `on_device` (the device's recognizer made the text, then the user checked it) or `none` |
-  | transcript | what the recognizer heard, before the user's edits; ≤ 4000, cleaned like every text field; `null` with `none`; the owner agent's only (refined 17.11.2026) |
+  | lang | BCP-47 (`ru-RU`), ≤ 35 chars: the device's or browser's first preferred language; required, never `null` (refined 17.11.2026) |
+  | transcript_source | the apps always write `none`; the server and readers still accept `on_device` (answers written before 18.11.2026, when the device's recognizer made the text) |
+  | transcript | the apps always write `null`; accepted with `on_device` in old answers (what the recognizer heard, before the user's edits; ≤ 4000, cleaned like every text field); the owner agent's only (refined 17.11.2026) |
   | answered_at | equals the ask's `answered_at`: the answer it belongs to |
   | deleted_at | `null`, or when the recording was deleted; set exactly when `file_id` is `null` |
 
@@ -665,13 +658,14 @@ agent.
     `Retry-After: 5`; Drive unreachable → 503 with `Retry-After: 30`). The limit is 60 per minute per user and agent,
     counted once the token opens, so one leaked or revoked link can't block the user's other agents (429 with
     `Retry-After: 60`). HEAD is 405 and `Range` is ignored: always the whole body.
-  - `asks_mine` docstring: "answer_voice set: your user answered by voice. With transcript_source on_device, answer
-    is their checked text. With none, answer is what they typed or the placeholder 'Voice answer (m:ss), not
-    transcribed': download answer_voice.url (valid 1 h; read the ask again for a new one) and transcribe it, or ask
-    them. The recording is deleted when you close the ask."
+  - `asks_mine` docstring: "answer_voice set: your user answered by voice. The recording is what they said: download
+    answer_voice.url (valid 1 h; read the ask again for a new one) and listen to it or transcribe it. answer is what
+    they typed, or the placeholder 'Voice answer (m:ss), not transcribed'. Only an answer written before 18.11.2026 can
+    have transcript_source on_device: then answer is their checked text. The recording is deleted when you close the
+    ask."
 - **Privacy.** A voice recording is personal data. It is stored only in the user's Drive and kept until the ask is
   closed, 30 days at most; the bridge passes it to the owner agent on request and stores or logs nothing of it (no
-  transcripts in logs either). Recognition runs on the device: no audio goes to Apple's or Google's speech services.
+  transcripts in logs either). The apps run no speech recognition, so no audio goes to Apple's or Google's speech services.
   What the agent's side does with the recording (a transcription API, for example) is up to the agent, and the
   first-use note says so. Before the apps ship it: the privacy policy (`server/hosted/site.py`) adds pictures,
   videos and voice recordings to "What is stored in your Google Drive" (with the retention), and the fetching and
@@ -683,14 +677,11 @@ agent.
   media route (tampered, expired, another user's, not the current file, a revoked agent → 404; deleted → 410; the
   exact headers; `Content-Type` from the allowlist even when Drive says `text/html`; 429); only the owner gets `url`;
   the webhook body carries it (17.11.2026 also: the status decides, `transcript` owner-only, the slot held until the
-  bytes are sent, the limit per agent, an oversized file without a size → 404). Apps: the recognizer choice per
-  platform behind a fake (on device, record only), auto-stop at 5:00, an interruption keeps the recording, the
-  placeholder text, the send order and the rollback on 409, the sweep's three rules, the Info.plist keys and the
-  entitlement present, `_headers` allows the microphone.
-  Manual: an iPhone on iOS 26 in Russian and English, a Mac, Chrome on a desktop with the Russian pack, the Android
-  app (record only), one 5-minute recording.
-- **Not in v5:** transcription on the server (the voice would go to our server or a third party: a privacy policy
-  change and a cost), cloud recognizers, voice replies on tasks, attachments on tasks.
+  bytes are sent, the limit per agent, an oversized file without a size → 404). Apps: a voice answer always carries
+  `transcript_source: none`, `transcript: null` and the device's first language, auto-stop at 5:00, an interruption keeps the recording, the
+  placeholder text, the send order and the rollback on 409, the sweep's three rules, the Info.plist has the microphone key and no speech-recognition key, the entitlement present, `_headers` allows the microphone.
+  Manual: an iPhone, a Mac, Chrome on a desktop and the Android app, each with one recording; one 5-minute recording.
+- **Not in v5:** speech recognition in the apps (on-device or cloud), transcription on the server (see open question 4),  voice replies on tasks, attachments on tasks.
 
 ### 6. Task questions
 
@@ -736,14 +727,11 @@ his own action). Server, MCP and CLI implemented 15.11.2026; the apps follow.
 
 ### Open questions (Denis)
 
-1. Android and Safari have no on-device recognizer, so there the app records only (the keyboard's dictation still
-   types text). Should they use the browser's cloud recognizer after a one-time notice ("your recording goes to
-   Google / Apple to be turned into text")? The spec says no.
-2. Voice recordings are deleted when the ask is closed, 30 days at most. Keep them longer, so the user can play back
+1. Voice recordings are deleted when the ask is closed, 30 days at most. Keep them longer, so the user can play back
    an old answer?
-3. Pictures and videos stay in the user's Drive until the agent detaches them or the user deletes the app data.
+2. Pictures and videos stay in the user's Drive until the agent detaches them or the user deletes the app data.
    Delete them automatically some days after the ask is closed?
-4. A stored video is at most 20 MB and 3 minutes; anything bigger is a Drive link with a poster. Enough for the
+3. A stored video is at most 20 MB and 3 minutes; anything bigger is a Drive link with a poster. Enough for the
    marketing agents' clips?
-5. Transcription on our server (e.g. Whisper) as a later opt-in, for record-only devices: worth the privacy policy
-   change and the cost?
+4. Transcription on our server (e.g. Whisper), later and as a paid feature, since the audio would go to our server or a
+   third party: worth the privacy policy change and the cost?
