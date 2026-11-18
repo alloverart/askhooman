@@ -65,7 +65,7 @@ SUPPORT_EMAIL = "support@askhooman.com"
 PRIVACY_EMAIL = "privacy@askhooman.com"
 SECURITY_EMAIL = "security@askhooman.com"
 OPERATOR = "Allover Studio, LLC"
-POLICY_DATE = "1 November 2026"
+POLICY_DATE = "18 November 2026"
 USER_DATA_POLICY = "https://developers.google.com/terms/api-services-user-data-policy"
 GOOGLE_CONNECTIONS = "https://myaccount.google.com/connections"
 # Google's required disclosure for apps using Google user data, word for word
@@ -280,6 +280,14 @@ list. AskHooman asks Google only for access to that folder (the <code>drive.appd
 any of your other files. Our server reads and writes these files only to carry out a request from you or one of your
 agents. Their content passes through the server's memory and may be kept briefly in an in-memory cache; it is never
 copied to our database or written to our logs.</p>
+<p>The same folder holds the pictures and videos your agents attach to their asks, and your voice answers: when you
+answer by voice, the app saves the recording there with your answer, together with the text your device heard if it
+turned the speech into text. A voice recording is kept until the ask is closed, and 30 days at most; the text stays with
+your answer. Pictures and videos stay until the agent that attached them removes them, or until you delete AskHooman's
+hidden app data in Google Drive (see below).</p>
+<p>If your device can turn speech into text by itself, it does so there. The recording and the text your device heard
+go only to the agent that asked the question: what that agent's side then does with them (sends the recording to a
+transcription service, for example) is up to that agent.</p>
 
 <h2>What our server stores</h2>
 <ul>
@@ -291,8 +299,16 @@ and was last active, and, if you set one, its webhook address and an encrypted w
 <li><b>Sign-in records:</b> registrations of the apps that connect agents, the OAuth tokens and agent keys your agents
 use, and sign-ins in progress. Tokens and keys are stored only as one-way hashes.</li>
 <li><b>Logs:</b> minimal request logs kept by our hosting provider (time, address, URL and response status) for security
-and troubleshooting. They never contain tokens or the content of your asks and tasks.</li>
+and troubleshooting. They never contain the content of your asks and tasks, or the tokens and keys your agents sign in
+with. The web addresses in them can contain short-lived codes that stop working soon after: the one-time code Google
+sends back to our server when you sign in works only once, and the link to a voice recording stops working within an
+hour.</li>
 </ul>
+<p>Pictures, videos and voice recordings pass through our server without being kept. When an agent attaches a picture
+or video by its web address, the server fetches it once and passes it on to your Drive, as it does with one the agent
+uploads; when the agent that asked a question requests your voice answer to it, the server passes the recording from
+your Drive to that agent. The files themselves are held only in the server's memory while they pass through: they are
+never stored in our database or written to our logs.</p>
 <p>While you connect an agent, the server sets one cookie that ties the sign-in to your browser; it expires within 10
 minutes. There are no other cookies.</p>
 
@@ -321,9 +337,12 @@ artificial intelligence or machine learning models.</li>
 <ul>
 <li><b>Google</b> signs you in and stores your asks and tasks in your Drive. <b>Google Cloud</b> is our processor: it hosts
 our server, its database and its logs.</li>
-<li><b>Your agents and the apps they run in</b> (for example Claude) receive the asks and tasks they wrote and your
-answers, under those apps' own privacy policies.</li>
-<li><b>Your webhook</b>, if you set one for an agent, receives the ask and your answer when you act on it.</li>
+<li><b>Your agents and the apps they run in</b> (for example Claude), under those apps' own privacy policies: every
+agent you connect can read all the asks and tasks in your account, other agents' included, with your answers, your
+replies and their history. A picture or video in an ask reaches them only as its details (such as its caption), never
+as the file. The recording of a voice answer and the text your device heard go only to the agent that asked.</li>
+<li><b>Your webhook</b>, if you set one for an agent, receives the ask and your answer when you act on it (for a voice
+answer, also the text your device heard and a link to the recording that works for an hour).</li>
 </ul>
 <p>We don't share data with anyone else unless the law requires it.</p>
 
