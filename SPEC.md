@@ -681,7 +681,7 @@ agent.
   `transcript_source: none`, `transcript: null` and the device's first language, auto-stop at 5:00, an interruption keeps the recording, the
   placeholder text, the send order and the rollback on 409, the sweep's three rules, the Info.plist has the microphone key and no speech-recognition key, the entitlement present, `_headers` allows the microphone.
   Manual: an iPhone, a Mac, Chrome on a desktop and the Android app, each with one recording; one 5-minute recording.
-- **Not in v5:** speech recognition in the apps (on-device or cloud), transcription on the server (see open question 4),  voice replies on tasks, attachments on tasks.
+- **Not in v5:** speech recognition in the apps (on-device or cloud), transcription on the server (see open question 4), voice replies on tasks, attachments on tasks.
 
 ### 6. Task questions
 
