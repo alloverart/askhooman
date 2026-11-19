@@ -58,9 +58,11 @@ TAGLINE = "Questions from your AI agents, waiting for your decision."
 GITHUB = "https://github.com/alloverart/askhooman"
 # The web app is live (Denis 03.11.2026: «давай на банере прям ссылку сделаем на веб версию — которая уже работает
 # вполне»). The iPhone/iPad and Mac apps are on sale since 14.11.2026 — one App Store record for both, so both cards
-# link to it (Denis 16.11.2026: add the App Store links to the landing). The Android app is in Google Play review.
+# link to it (Denis 16.11.2026: add the App Store links to the landing). The Android app is public on Google Play
+# since 19.11.2026 (ask 1359: add the badge).
 WEB_APP = "https://app.askhooman.com"
 APP_STORE = "https://apps.apple.com/app/id6829153687"
+GOOGLE_PLAY = "https://play.google.com/store/apps/details?id=com.askhooman.app"
 SUPPORT_EMAIL = "support@askhooman.com"
 PRIVACY_EMAIL = "privacy@askhooman.com"
 SECURITY_EMAIL = "security@askhooman.com"
@@ -181,7 +183,7 @@ def landing_page(settings: HostedSettings):
 and gives you one list to answer them all with a tap. Then everyone gets back to work.</p>
 <div class="cta"><a class="btn primary big" href="{WEB_APP}">Open the web app</a><a class="btn big" href="#connect">Connect an
 agent</a><a class="btn big" href="#agents">I'm an agent</a></div>
-<p class="note">Works in any browser today. The iPhone and Mac apps are <a href="{APP_STORE}">on the App Store</a>; the Android app is in Google Play review.</p>
+<p class="note">Works in any browser today. The iPhone and Mac apps are <a href="{APP_STORE}">on the App Store</a>; the Android app is <a href="{GOOGLE_PLAY}">on Google Play</a>.</p>
 </div></div>
 
 <section><h2>The great inversion</h2><p class="lead">Agents do the work and bring you only the decisions. Turns out, AI
@@ -233,7 +235,8 @@ it as <code>Authorization: Bearer &lt;agent key&gt;</code>.</p></section>
 <p class="go"><a href="{APP_STORE}">Download on the App Store</a></p><span class="badge ok">Available now</span></div>
 <div class="card"><h3>Mac</h3><p>Native app with a count in the menu bar.</p>
 <p class="go"><a href="{APP_STORE}">Download on the Mac App Store</a></p><span class="badge ok">Available now</span></div>
-<div class="card"><h3>Android</h3><p>For the rest of your phones.</p><span class="badge">In review at Google Play</span></div>
+<div class="card"><h3>Android</h3><p>For the rest of your phones.</p>
+<p class="go"><a href="{GOOGLE_PLAY}">Get it on Google Play</a></p><span class="badge ok">Available now</span></div>
 <div class="card"><h3>Your agents</h3><p>Claude on the web, desktop and phone, Claude Code on macOS, Linux and Windows,
 VS Code, and any MCP client with OAuth.</p><span class="badge ok">Available now</span></div>
 </div></section>
