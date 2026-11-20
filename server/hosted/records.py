@@ -39,6 +39,7 @@ from ..db import utc_now
 from ..drive import FILE_FIELDS, DriveBadFile, DriveClient, DriveError, DriveNotFound, parse_name
 from ..mirror import ASK, TASK, Kind, app_properties, build_doc
 from ..rules import (
+    ANSWER_FILES,
     ANSWER_VOICE,
     STATUS_FILTERS,
     Change,
@@ -75,6 +76,7 @@ from ..task_rules import (
 )
 from ..task_rules import STATUS_FILTERS as TASK_FILTERS
 from ..tokens import Identity
+from .files import FileClaims, FileLinks, clean_files
 from .voice import VoiceLinks, clean_voice, for_reader
 
 log = logging.getLogger("asks.hosted.records")
@@ -90,13 +92,14 @@ LOCK_STRIPES = 64
 ASK_STATUSES = ("open", "answered", "closed")
 TASK_STATUSES = OPEN + FINISHED
 ATTACHMENTS = "attachments"
-HOSTED_ASK = dataclasses.replace(ASK, fields=(*ASK.fields, ANSWER_VOICE, ATTACHMENTS))  # the hosted bridge's ask
+# the hosted bridge's ask
+HOSTED_ASK = dataclasses.replace(ASK, fields=(*ASK.fields, ANSWER_VOICE, ANSWER_FILES, ATTACHMENTS))
 
 
 def new_hosted_record(who: Identity, ask_id: int, fields: dict, now: str) -> dict:
-    """A fresh open ask as the hosted REST returns it: rules.new_record plus `answer_voice` (null: only an answer from
-    the apps sets it) and `attachments` (empty until the media service adds the files)."""
-    return {**new_record(who, ask_id, fields, now), ANSWER_VOICE: None, ATTACHMENTS: []}
+    """A fresh open ask as the hosted REST returns it: rules.new_record plus `answer_voice` (null) and `answer_files` ([]: only an answer from
+    the apps sets them) and `attachments` (empty until the media service adds the files)."""
+    return {**new_record(who, ask_id, fields, now), ANSWER_VOICE: None, ANSWER_FILES: [], ATTACHMENTS: []}
 
 
 class BadFile(Unavailable):
@@ -148,7 +151,7 @@ class DrivePool:
                 return client
             client = DriveClient(None, None, http=self.http, credentials=lambda: self._credentials(sub),
                                  relink_hint=f"allow Drive access again at {self.link_url}",
-                                 file_fields=f"{FILE_FIELDS},size", max_file_bytes=MAX_FILE_BYTES,
+                                 file_fields=f"{FILE_FIELDS},size,createdTime", max_file_bytes=MAX_FILE_BYTES,
                                  max_files=MAX_FILES)
             self._clients[sub] = client
             while len(self._clients) > self.size:
@@ -230,8 +233,16 @@ class UserRecords:
     def listing(self) -> dict[tuple[str, int], dict]:
         """(kind, id) -> the file's metadata, for every ask and task file (one files.list, at most MAX_FILES;
         files over MAX_FILE_BYTES are left out as unreadable)."""
+        return self.listing_state()[0]
+
+    def listing_state(self) -> tuple[dict[tuple[str, int], dict], set[tuple[str, int]], bool]:
+        """What listing() says, and what it could not say: (the listing, the (kind, id) of the files that are there
+        but over MAX_FILE_BYTES and so left out of it, whether the listing stopped at MAX_FILES). A caller that
+        reads «not in the listing» as «not there» (the sweep) must look at the other two first."""
         found: dict[tuple[str, int], list[dict]] = {}
-        for meta in self.call(self.drive.list_files):
+        skipped: set[tuple[str, int]] = set()
+        listed = self.call(self.drive.list_files)
+        for meta in listed:
             parsed = parse_name(meta.get("name"))
             if parsed is None or not meta.get("id"):
                 continue
@@ -242,12 +253,14 @@ class UserRecords:
             if too_big:
                 log.warning("skipped Drive file %s: %s bytes is more than %d", meta.get("name"), meta.get("size"),
                             MAX_FILE_BYTES)
+                skipped.add(parsed)
                 continue
             found.setdefault(parsed, []).append(meta)
-        if self.drive.truncated:
+        truncated = bool(getattr(listed, "truncated", False))  # this listing's own: not the shared client's
+        if truncated:
             log.warning("a user's appDataFolder has more than %d ask/task files: only the first ones are read",
                         MAX_FILES)
-        return {key: _pick(metas) for key, metas in found.items()}
+        return {key: _pick(metas) for key, metas in found.items()}, skipped, truncated
 
     def find(self, kind: Kind, item_id: int) -> dict | None:
         return _pick(self.call(self.drive.find, kind.file(item_id)))
@@ -307,12 +320,16 @@ class DriveCollection:
             record[ATTACHMENTS] = [item for item in record[ATTACHMENTS] if isinstance(item, dict)]
         if ANSWER_VOICE in record:  # checked, only for the answer it was made with, null on an open ask
             record[ANSWER_VOICE] = clean_voice(record[ANSWER_VOICE], record.get("answered_at"), record.get("status"))
+        if ANSWER_FILES in record:  # the same for the files: checked, this answer's, [] on an open ask
+            record[ANSWER_FILES] = clean_files(record[ANSWER_FILES], record.get("answered_at"), record.get("status"))
         return record
 
-    def _drop_bad_voice(self, doc: dict) -> None:
+    def _drop_bad_answer(self, doc: dict) -> None:
         if ANSWER_VOICE in self.kind.fields and doc.get(ANSWER_VOICE) is not None \
                 and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at"), doc.get("status")) is None:
             doc[ANSWER_VOICE] = None
+        if ANSWER_FILES in self.kind.fields and doc.get(ANSWER_FILES) not in (None, []):
+            doc[ANSWER_FILES] = clean_files(doc[ANSWER_FILES], doc.get("answered_at"), doc.get("status"))
 
     def _missing(self, item_id) -> NotFound:
         return NotFound(f"no {self.kind.name} #{item_id}")
@@ -461,11 +478,11 @@ class DriveCollection:
         raise Conflict(f"{self.kind.name} #{item_id} is being changed by someone else right now; try again")
 
     def _write(self, who: Identity, item_id: int, meta: dict, doc: dict, change: Change) -> dict:
-        # answer_voice that read as null (bad, another answer's, or on an open ask: an older app kept it) is dropped,
+        # answer_voice (and answer_files) that read as null (bad, another answer's, or on an open ask: an older app kept it) is dropped,
         # checked on the file as read and again as written: a close must not make one left on an open ask valid again
-        self._drop_bad_voice(doc)
+        self._drop_bad_answer(doc)
         doc.update(change.updates)
-        self._drop_bad_voice(doc)
+        self._drop_bad_answer(doc)
         events = doc.get("events") if isinstance(doc.get("events"), list) else []
         ids = [e["id"] for e in events if isinstance(e, dict) and isinstance(e.get("id"), int)]
         events.append({"id": max(ids, default=0) + 1, self.kind.key: item_id, "at": change.at, "actor": who.actor,
@@ -498,21 +515,29 @@ class HostedAsks:
     ask returned has its answer_voice as that agent gets it: with url and url_expires_at (voice.for_reader). Without
     (the bridge's own reads), answer_voice is as checked."""
 
-    def __init__(self, records: UserRecords, links: VoiceLinks | None = None, reader: Identity | None = None):
+    def __init__(self, records: UserRecords, links: VoiceLinks | None = None, reader: Identity | None = None,
+                 file_links: FileLinks | None = None, claims: FileClaims | None = None):
         self.items = DriveCollection(records, HOSTED_ASK, STATUS_FILTERS, ASK_STATUSES, ask_order,
                                      ("options", "links", ATTACHMENTS), {"open": 0, "answered": 1, "closed": 2})
         self.links = links
         self.reader = reader
+        self.file_links = file_links
+        self.claims = claims
 
-    def _out(self, ask: dict) -> dict:
-        return for_reader(ask, self.links, self.reader) if self.links is not None else ask
+    def _out(self, ask: dict, file_urls: bool = False) -> dict:
+        """The ask as the reader gets it; its normal files carry links only with `file_urls` (ask_get, asks_mine): not
+        in the everyone's view and not in what a write returns (SPEC 7.4)."""
+        if self.links is None:
+            return ask
+        return for_reader(ask, self.links, self.reader, file_links=self.file_links if file_urls else None)
 
     def get(self, ask_id: int, with_events: bool = True) -> dict:
-        return self._out(self.items.get(ask_id, with_events))
+        return self._out(self.items.get(ask_id, with_events), True)
 
-    def list(self, status: str = "active", agent: str | None = None, limit: int = 200) -> dict:
+    def list(self, status: str = "active", agent: str | None = None, limit: int = 200, file_urls: bool = False) -> dict:
+        """The asks; a file link only with `file_urls` (asks_mine), not in the everyone's view (SPEC 7.4)."""
         found = self.items.list(status, agent, limit)
-        return {**found, "asks": [self._out(ask) for ask in found["asks"]]}
+        return {**found, "asks": [self._out(ask, file_urls) for ask in found["asks"]]}
 
     def create(self, who: Identity, data: dict) -> dict:
         """An ask without attachments; with them, attachments.AskMedia.create writes the files first."""
@@ -522,7 +547,13 @@ class HostedAsks:
         return self._out(self.items.mutate(who, ask_id, lambda load: plan_update(who, data, load, utc_now())))
 
     def answer(self, who: Identity, ask_id: int, answer) -> dict:
-        return self._out(self.items.mutate(who, ask_id, lambda load: plan_answer(who, answer, load, utc_now())))
+        ask = self.items.mutate(who, ask_id, lambda load: plan_answer(who, answer, load, utc_now()))
+        try:  # a new answer has a new answered_at: the old claims (SPEC 7.3) are dead weight
+            self._drop_claims(ask_id)
+        except Exception as exc:  # the answer is written: a claim left behind is the sweep's
+            log.warning("hosted: could not delete the claims of ask #%s (left to the sweep): %s", ask_id,
+                        type(exc).__name__)
+        return self._out(ask)
 
     def close(self, who: Identity, ask_id: int, resolution=None) -> dict:
         return self._ending(who, ask_id, lambda load: plan_close(who, resolution, load, utc_now()))
@@ -531,21 +562,62 @@ class HostedAsks:
         return self._ending(who, ask_id, lambda load: plan_reopen(who, load, utc_now()))
 
     def _ending(self, who: Identity, ask_id: int, plan) -> dict:
-        """A close or a reopen, which ends the answer's voice recording: whoever makes the transition deletes the
-        file (SPEC v5), so after the ask is written the bridge deletes the one the ask had (an agent's close or
-        reopen; the apps delete it for the user)."""
+        """A close or a reopen, which ends the answer's voice recording and its files: whoever makes the transition
+        deletes them (SPEC v5, 7.6), so after the ask is written the bridge deletes the ones the ask had (an agent's
+        close or reopen; the apps delete them for the user)."""
         ended: dict = {}
 
         def planned(load):
             current, change = plan(load)
             ended["voice"] = current.get(ANSWER_VOICE)  # checked: a bad or stale one is None and stays the sweep's
+            ended["files"] = current.get(ANSWER_FILES) or []  # the same: checked on read
+            # a reopen clears answer_files and stores no per-item reason: the reason only names the log line
+            # (task-7-report.md, Ruling on reopen)
+            ended["reason"] = "reopened" if change.kind == "reopened" else "closed"
             return current, change
 
         ask = self.items.mutate(who, ask_id, planned)
         voice = ended.get("voice")
         if voice is not None and voice["file_id"] is not None:
             self._delete_recording(ask_id, voice["file_id"])
+        for item in ended.get("files", []):
+            if item.get("file_id") is not None:
+                self._delete_answer_file(ask_id, item["id"], item["file_id"], ended["reason"])
+        try:
+            self._drop_claims(ask_id)
+        except Exception as exc:  # the ask is written: a claim left behind is the sweep's
+            log.warning("hosted: could not delete the claims of ask #%s (left to the sweep): %s", ask_id,
+                        type(exc).__name__)
         return self._out(ask)
+
+    def _drop_claims(self, ask_id: int) -> None:
+        """The seam of the claim documents of the ask's secret files (SPEC 7.4 «Cleanup of claims»): called after
+        every close or reopen by the agent, once the ask is written."""
+        if self.claims is not None:
+            self.claims.delete_for_ask(self.items.records.sub, ask_id)
+
+    def _delete_answer_file(self, ask_id: int, item_id: int, file_id: str, reason: str) -> bool:
+        """One file of the answer, best effort like the recording: deleted only when Drive says it is a file of this
+        ask (appProperties kind "file", ask_id and file = the item id). A failure is logged with ids only (never a name, a message that
+        could carry a link, or content) and the file is left to the sweep: the close or reopen stands. True if the file
+        is gone from Drive (deleted now, or already gone), False if it is still there (not this ask's, or a failure)."""
+        records = self.items.records
+        try:
+            meta = records.call(records.drive.get_meta, file_id)
+            if meta is None:
+                return True  # already gone
+            props = meta.get("appProperties") or {}
+            if (props.get("kind") != "file" or props.get("ask_id") != str(ask_id)
+                    or props.get("file") != str(item_id)):
+                log.warning("hosted: file %s named by ask #%s item %s is not its answer file: not deleted", file_id,
+                            ask_id, item_id)
+                return False
+            records.call(records.drive.delete, file_id)
+            return True
+        except Exception as exc:  # nothing may fail the transition that is already written
+            log.warning("hosted: could not delete answer file %s of ask #%s item %s on %s (left to the sweep): %s",
+                        file_id, ask_id, item_id, reason, type(exc).__name__)
+            return False
 
     def _delete_recording(self, ask_id: int, file_id: str) -> None:
         """Best effort, the ask is written already: deleted only when Drive says the file is this ask's recording

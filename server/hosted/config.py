@@ -20,6 +20,9 @@ ASKS_ADMIN_EMAILS           Google accounts (emails, comma-separated) that see t
                             (GET /api/admin/stats). Empty (default): nobody. They count as internal users too
 ASKS_INTERNAL_EMAILS        more accounts of the operator's own people (emails, or "@domain" for a whole domain),
                             comma-separated: the stats show them apart from external users and no sign-up ping
+ASKS_SWEEP_SERVICE_ACCOUNT  the email of the service account Cloud Scheduler signs POST /internal/sweep with (the bridge's own
+                            runtime account): its Google OIDC ID token (audience ASKS_PUBLIC_URL) is the only credential the
+                            route takes. Empty (default): the route refuses everyone
 ASKS_OPERATOR_TELEGRAM_CHAT a Telegram chat id that gets a ping on every new external user (optional)
 ASKS_OPERATOR_TELEGRAM_TOKEN the bot token for that ping, inline or a path; required with the chat
 """
@@ -134,6 +137,7 @@ class HostedSettings:
     cors_origins: tuple[str, ...] = ()  # the web app's origins, for the App API only (app_api.AppCors)
     admin_emails: tuple[str, ...] = ()  # see the operator's stats (lower-case)
     internal_emails: tuple[str, ...] = ()  # the operator's own people: emails or "@domain" (lower-case)
+    sweep_service_account: str | None = None  # who may call POST /internal/sweep (lower-case email)
     operator_chat: str | None = None  # Telegram chat for the new-user ping
     operator_token: str | None = None
 
@@ -209,6 +213,8 @@ class HostedSettings:
             cors_origins=cors_origins,
             admin_emails=email_list(env.get("ASKS_ADMIN_EMAILS", ""), "ASKS_ADMIN_EMAILS"),
             internal_emails=email_list(env.get("ASKS_INTERNAL_EMAILS", ""), "ASKS_INTERNAL_EMAILS", domains=True),
+            sweep_service_account=(email_list(env.get("ASKS_SWEEP_SERVICE_ACCOUNT", ""), "ASKS_SWEEP_SERVICE_ACCOUNT")
+                                   or (None,))[0],
             operator_chat=operator_chat,
             operator_token=operator_token,
         )

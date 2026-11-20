@@ -35,6 +35,13 @@ Pictures and video (the hosted bridge; PNG, JPEG, WebP up to 5 MB and 4096 px, M
   asks.py attach 12 --url https://example.com/a.png    the bridge fetches it
   asks.py attach 12 --url https://drive.google.com/file/d/x/view --link --title "Mockup"   a link card
   asks.py detach 12 2
+
+Files your user attached to an answer (the hosted bridge): saved as ask-<id>-file-<n>[.ext] in --out (default the
+current directory), never under the user's name for them; the size is checked against the one the ask says. A file over
+31 MiB comes in parts of 31 MiB (Range requests, each checked and tried up to three times; a 429 is waited out, and a
+link that expires mid-file is renewed once by reading the ask again).
+  asks.py files 12 --out ./in           the normal files
+  asks.py files 12 --secret             also the secret ones: each can be fetched once, then it is deleted
 """
 
 from __future__ import annotations  # keeps it runnable on macOS /usr/bin/python3 (3.9)
@@ -668,6 +675,323 @@ def cmd_detach(client, args):
         print(f"detached #{args.n} from ask #{args.id}")
 
 
+# ---------- files in answers (SPEC 7.8) ----------
+
+FILE_CHUNK = 1 << 20
+EXT = re.compile(r"[A-Za-z0-9]{1,10}")
+# The most body one file response of the bridge carries (server/hosted/files.py PART_BYTES, 31 MiB: Cloud Run refuses a
+# response of 32 MiB or more); a normal file larger than that is fetched in closed Range parts of this size.
+PART_BYTES = 32505856
+PART_TRIES = 3  # a part that fails (a cut connection, a short body, a 5xx) is fetched again from its start, twice
+PART_PAUSE_MAX = 30  # seconds: the longest Retry-After of a 5xx waited for before the next try
+# A 429 on a part (the bridge's `files` bucket: 20 requests a minute per agent, and a 100 MiB file is 4 parts) is
+# waited out and the same part asked again; these waits don't use up its tries, and a file gets at most PART_WAITS.
+PART_WAITS = 6
+RATE_PAUSE_MAX = 60  # seconds: the longest Retry-After of a 429 waited for; a longer one (the 1 GiB an hour byte
+# budget says 3600) fails at once with the server's message
+RATE_PAUSE = 10  # seconds waited after a 429 that names no Retry-After
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # the bearer goes to the configured server only
+
+
+def file_save_name(ask_id: int, item: dict) -> str:
+    """ask-<id>-file-<n>[.<ext>]: the user's name is data, never a path; only its last extension (1-10 ASCII letters
+    or digits) is kept, as the bridge's Content-Disposition does."""
+    name = f"ask-{ask_id}-file-{int(item['id'])}"
+    stem, dot, ext = (item.get("name") or "").rpartition(".")
+    if dot and stem and EXT.fullmatch(ext):
+        name += "." + ext
+    return name
+
+
+SECRET_LOST = " - a secret file is deleted once it is sent: ask your user to send it again"
+
+
+def _open_part_file(part: str, label: str) -> int:
+    """The .part file a download writes: created or truncated, never through a symlink, readable by the owner only."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(part, flags, 0o600)
+    except OSError as exc:
+        raise CliError(f"{label}: cannot write {part}: {exc.strerror}")
+
+
+def save_stream(resp, path: str, size: int, label: str, lost: str = "") -> None:
+    """Write the open response to `path`.part (no symlinks), check it came to exactly `size` bytes, then rename it onto
+    `path`. On any failure only the .part file this call wrote is removed, by its exact path. `lost` is added to the
+    message of a body that came short, long or broke off (a secret file can't be fetched again)."""
+    part = path + ".part"
+    fd = _open_part_file(part, label)
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = resp.read(FILE_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > size:
+                    raise CliError(f"{label}: more than the {size} bytes the ask says{lost}")
+                out.write(chunk)
+        if total != size:
+            raise CliError(f"{label}: got {total} of {size} bytes{lost}")
+        os.replace(part, path)  # only a complete file takes the fixed name; an earlier good copy survives a failure
+    except (OSError, http.client.HTTPException) as exc:  # a cut connection, a full disk
+        _remove_own(part)
+        if isinstance(exc, CliError):
+            raise
+        raise CliError(f"{label}: download failed: {type(exc).__name__}{lost}")
+    except CliError:
+        _remove_own(part)
+        raise
+
+
+def _remove_own(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def url_allowed(url: str, base_url: str) -> bool:
+    """A normal file's link must be https; plain http only when the configured server itself is a local http one."""
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme == "https":
+        return True
+    local = ("127.0.0.1", "localhost", "::1")
+    base = urllib.parse.urlsplit(base_url)
+    return (scheme == "http" and base.scheme == "http" and base.hostname in local
+            and urllib.parse.urlsplit(url).hostname in local)
+
+
+def fetch_file(url: str, path: str, size: int, label: str, token: str | None = None, lost: str = "") -> None:
+    headers = {"User-Agent": "asks-cli/0.1"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    opener = urllib.request.build_opener(_NoRedirect) if token else urllib.request.build_opener()
+    try:
+        with opener.open(req, timeout=60) as resp:
+            save_stream(resp, path, size, label, lost)
+    except urllib.error.HTTPError as exc:
+        raise CliError(f"{label}: HTTP {exc.code}: {error_detail(exc)}", status=exc.code)
+    except urllib.error.URLError as exc:
+        raise CliError(f"{label}: cannot reach the server: {exc.reason}")
+    except (TimeoutError, socket.timeout):
+        raise CliError(f"{label}: the download stalled{lost}")
+
+
+class _PartFailed(Exception):
+    """A part that may be fetched again from its start: the message if it was the last try, and the seconds the
+    server asked to wait (Retry-After of a 5xx) before the next one."""
+
+    def __init__(self, message: str, wait: float = 0.0):
+        super().__init__(message)
+        self.wait = wait
+
+
+class _PartLimited(_PartFailed):
+    """A 429 on a part: wait `wait` seconds and ask for the same part again (not one of its tries)."""
+
+
+class _LinkExpired(_PartFailed):
+    """A 404 on a part: the link's hour may have run out (the bridge says so for a stale link too)."""
+
+
+def _retry_after(exc: urllib.error.HTTPError, default: float = 0.0) -> float:
+    """The seconds a refusal asks the client to wait (not negative); `default` when it names none or no number."""
+    try:
+        value = exc.headers.get("Retry-After")
+        return max(float(value), 0.0) if value else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_part(opener, url: str, out, start: int, end: int, size: int, label: str) -> None:
+    """Append bytes `start`-`end` of the file to `out` with one closed Range GET. The answer must be a 206 with
+    Content-Range exactly `bytes start-end/size` and a Content-Length of the part, else CliError (a server that
+    answers another range will do so again). A cut connection, a short body or a 5xx raise _PartFailed."""
+    want = end - start + 1
+    req = urllib.request.Request(url, headers={"User-Agent": "asks-cli/0.1", "Range": f"bytes={start}-{end}"},
+                                 method="GET")
+    try:
+        with opener.open(req, timeout=60) as resp:
+            if resp.status != 206:
+                raise CliError(f"{label}: the server answered a part with HTTP {resp.status}, not 206: refused")
+            if resp.headers.get("Content-Range") != f"bytes {start}-{end}/{size}":
+                raise CliError(f"{label}: the part {start}-{end} came with another Content-Range: refused")
+            if resp.headers.get("Content-Length") != str(want):
+                raise CliError(f"{label}: the part {start}-{end} came with another Content-Length: refused")
+            got = 0
+            while got < want:
+                chunk = resp.read(min(FILE_CHUNK, want - got))
+                if not chunk:
+                    break
+                got += len(chunk)
+                try:
+                    out.write(chunk)
+                except OSError as exc:  # a full disk: not the network, so not tried again
+                    raise CliError(f"{label}: cannot write: {exc.strerror}")
+            if got != want:
+                raise _PartFailed(f"{label}: got {start + got} of {size} bytes")
+    except urllib.error.HTTPError as exc:
+        message = f"{label}: HTTP {exc.code}: {error_detail(exc)}"
+        if exc.code >= 500:
+            raise _PartFailed(message, min(_retry_after(exc), PART_PAUSE_MAX))
+        if exc.code == 429:
+            wait = _retry_after(exc, RATE_PAUSE)
+            if wait > RATE_PAUSE_MAX:  # not a busy minute (the byte budget): waiting would not help
+                raise CliError(message, status=429)
+            raise _PartLimited(message, wait)
+        if exc.code == 404:
+            raise _LinkExpired(message)
+        raise CliError(message, status=exc.code)
+    except urllib.error.URLError as exc:
+        raise _PartFailed(f"{label}: cannot reach the server: {exc.reason}")
+    except (TimeoutError, socket.timeout):
+        raise _PartFailed(f"{label}: the download stalled")
+    except (OSError, http.client.HTTPException) as exc:  # a connection cut mid-part
+        raise _PartFailed(f"{label}: download failed: {type(exc).__name__}")
+
+
+def fetch_in_parts(url: str, path: str, size: int, label: str, refresh=None) -> None:
+    """A normal file larger than PART_BYTES (the bridge sends at most that in one response): closed Range parts of
+    PART_BYTES, in order, into one `path`.part (no symlinks). Each part is checked (_fetch_part); one that fails is
+    fetched again from its start, the .part cut back to it, up to PART_TRIES times in all. A 429 is waited out
+    (Retry-After; none given: RATE_PAUSE; one over RATE_PAUSE_MAX fails at once) and the same part asked again, at
+    most PART_WAITS times a file, without using up its tries. A 404 (the link expired) calls `refresh()` once for a
+    new link (it raises CliError when the file in the ask is not the same any more) and goes on from that part; a
+    second 404 fails. The total must be `size`, then the .part is renamed onto `path`; on any failure only that .part
+    file is removed, by its exact path."""
+    part = path + ".part"
+    fd = _open_part_file(part, label)
+    opener = urllib.request.build_opener()
+    waits, refreshed = 0, False
+    try:
+        with os.fdopen(fd, "wb") as out:
+            for start in range(0, size, PART_BYTES):
+                end = min(start + PART_BYTES, size) - 1
+                tries = 0
+                while True:
+                    out.seek(start)
+                    out.truncate()
+                    try:
+                        _fetch_part(opener, url, out, start, end, size, label)
+                        break
+                    except _PartLimited as exc:
+                        if waits == PART_WAITS:
+                            raise CliError(str(exc), status=429)
+                        waits += 1
+                        SLEEP(exc.wait)
+                    except _LinkExpired as exc:
+                        if refresh is None or refreshed:
+                            raise CliError(str(exc), status=404)
+                        refreshed = True
+                        url = refresh()
+                    except _PartFailed as exc:
+                        tries += 1
+                        if tries == PART_TRIES:
+                            raise CliError(str(exc))
+                        if exc.wait:
+                            SLEEP(exc.wait)
+            total = out.tell()
+        if total != size:
+            raise CliError(f"{label}: got {total} of {size} bytes")
+        os.replace(part, path)  # only a complete file takes the fixed name; an earlier good copy survives a failure
+    except CliError:
+        _remove_own(part)
+        raise
+    except OSError as exc:  # the .part file itself (seek, truncate, close)
+        _remove_own(part)
+        raise CliError(f"{label}: cannot write {part}: {exc.strerror}")
+
+
+def fresh_link(client, ask_id: int, answered_at, n: int, size: int, label: str) -> str:
+    """A new link for normal file `n` whose link expired mid-download: the ask read again, as cmd_files reads it. The
+    file must be the same: still answered at `answered_at` (the agent never sees a file_id, and another file in an
+    item comes only with a new answer), the item there, normal, `size` bytes, with a link. Else CliError."""
+    ask = client.request("GET", f"/api/asks/{ask_id}")
+    if not isinstance(ask, dict):
+        raise CliError(f"{label}: the link expired and the server's answer to reading the ask again is not an ask")
+    items = ask.get("answer_files")
+    item = next((i for i in (items if isinstance(items, list) else []) if isinstance(i, dict) and i.get("id") == n),
+                None)
+    if (item is None or ask.get("answered_at") != answered_at or item.get("bytes") != size
+            or item.get("secret") is not False or item.get("deleted_at") or not item.get("url")):
+        raise CliError(f"{label}: the link expired and the file in the ask is not the same any more: read the ask "
+                       "again")
+    url = urllib.parse.urljoin(client.base_url + "/", item["url"])
+    if not url_allowed(url, client.base_url):
+        raise CliError(f"{label}: the download link is not https; refusing it")
+    return url
+
+
+def cmd_files(client, args):
+    ask = client.request("GET", f"/api/asks/{args.id}")
+    items = [i for i in (ask.get("answer_files") or []) if isinstance(i, dict) and isinstance(i.get("id"), int)]
+    if not items:
+        print("no files" if not args.raw else "[]")
+        return
+    out_dir = args.out or "."
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        raise CliError(f"cannot create {out_dir}: {exc.strerror}")
+    failed, results = 0, []
+    for item in items:
+        n, size = item["id"], item.get("bytes")
+        name = file_save_name(args.id, item)
+        path = os.path.join(out_dir, name)
+        result = {"id": n, "path": path, "bytes": size, "status": "saved"}
+        if item.get("deleted_at"):
+            result["status"] = "deleted"
+        elif item.get("secret") and not args.secret:
+            result["status"] = "skipped"
+        elif not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            result["status"] = "failed"
+            print(f"error: {name}: the ask gives no size", file=sys.stderr)
+        elif item.get("secret"):
+            try:
+                fetch_file(f"{client.base_url}/api/asks/{args.id}/files/{n}/content", path, size, name, client.token,
+                           SECRET_LOST)
+            except CliError as exc:
+                result["status"] = "failed"
+                print(f"error: {exc}", file=sys.stderr)
+        elif not item.get("url"):
+            result["status"] = "failed"
+            print(f"error: {name}: no download link (blocked or deleted); read the ask again", file=sys.stderr)
+        else:
+            try:
+                url = urllib.parse.urljoin(client.base_url + "/", item["url"])
+                if not url_allowed(url, client.base_url):
+                    raise CliError(f"{name}: the download link is not https; refusing it")
+                if size > PART_BYTES:  # more than one response of the bridge carries: in parts
+                    fetch_in_parts(url, path, size, name, lambda n=n, size=size, name=name: fresh_link(
+                        client, args.id, ask.get("answered_at"), n, size, name))
+                else:
+                    fetch_file(url, path, size, name)
+            except CliError as exc:
+                result["status"] = "failed"
+                print(f"error: {exc}", file=sys.stderr)
+        failed += result["status"] == "failed"
+        results.append(result)
+        if args.raw:
+            continue
+        if result["status"] == "saved":
+            print(f"saved {path} ({size} bytes)")
+        elif result["status"] == "skipped":
+            print(f"skipped file {n} (secret): it can be fetched once; add --secret to fetch it")
+        elif result["status"] == "deleted":
+            print(f"skipped file {n}: already deleted")
+    if args.raw:
+        print_json(results)
+    if failed:
+        raise CliError(f"{failed} of {len(items)} files not saved")
+
+
 # ---------- task commands ----------
 
 def cmd_tasks(client, args):
@@ -894,6 +1218,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--caption", help="caption, up to 300 characters")
     p.add_argument("--source", help="where the original lives (https URL)")
     p.set_defaults(func=cmd_attach)
+
+    p = sub.add_parser("files", parents=[raw], help="save the files your user attached to an answer "
+                                                     "(hosted bridge; ask-<id>-file-<n>[.ext], size checked)")
+    p.add_argument("id", type=int)
+    p.add_argument("--out", metavar="DIR", help="directory to save into (default: the current one)")
+    p.add_argument("--secret", action="store_true",
+                   help="also fetch secret files: each can be fetched once, then AskHooman deletes it")
+    p.set_defaults(func=cmd_files)
 
     p = sub.add_parser("detach", parents=[raw], help="remove attachment N from my open ask")
     p.add_argument("id", type=int)

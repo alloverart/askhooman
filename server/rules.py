@@ -49,6 +49,8 @@ CLEARED_BY_REOPEN = ("answer", "answered_at", "resolution", "closed_by", "closed
 # it checked (hosted/voice.py), the single-tenant bridge always has null. The rules below keep it in step with the
 # answer: a new answer replaces it, close keeps it without the file, reopen clears it.
 ANSWER_VOICE = "answer_voice"
+# Files in an answer (SPEC section 7.2): the same rules as a voice answer, checked by hosted/files.py; always [] single-tenant.
+ANSWER_FILES = "answer_files"
 
 
 class AskError(Exception):
@@ -221,25 +223,65 @@ def plan_update(who: Identity, data: dict, load: Loader, now: str) -> tuple[dict
     return ask, Change(updates, "edited", {"changes": changes}, now)
 
 
-def plan_answer(who: Identity, answer, load: Loader, now: str, voice: dict | None = None) -> tuple[dict, Change | None]:
-    """The human's answer. `voice`: the recording that goes with it (the apps' answer_voice; no MCP tool or REST body
-    passes one), tied to this answer by its answered_at. The same text again without a new recording changes nothing;
-    a new recording is a change. Any new answer replaces the ask's answer_voice (null without a recording)."""
+def answer_text_for(text, option, voice: dict | None, files: list | None) -> str:
+    """The answer text the apps write (SPEC 5 and 7.2): what the user typed, the chosen option first, else, so an answer
+    is never empty, a placeholder: `Voice answer (0:42), not transcribed` for a recording, `2 files attached` for files,
+    both joined by ` · `. It names nothing of a file (no name, no mention of secret). "" when there is nothing at all."""
+    typed = "\n".join(part.strip() for part in (option, text) if isinstance(part, str) and part.strip())
+    if typed:
+        return typed
+    parts = []
+    if voice:
+        seconds = max(int(voice.get("duration_ms") or 0), 0) // 1000
+        parts.append(f"Voice answer ({seconds // 60}:{seconds % 60:02d}), not transcribed")
+    if files:
+        parts.append(f"{len(files)} file{'' if len(files) == 1 else 's'} attached")
+    return " · ".join(parts)
+
+
+def _file_key(item: dict) -> tuple:
+    return (item.get("id"), item.get("file_id"), item.get("secret"))
+
+
+def plan_answer(who: Identity, answer, load: Loader, now: str, voice: dict | None = None,
+                files: list | None = None) -> tuple[dict, Change | None]:
+    """The human's answer. `voice`: the recording and `files`: the files that go with it (the apps' answer_voice and
+    answer_files; no MCP tool or REST body passes either), tied to this answer by its answered_at. The same text again
+    without a new recording and with the same file list (same ids, file_ids and secret flags, none added or dropped)
+    changes nothing; a new recording or a changed list is a change. Any new answer replaces the ask's answer_voice
+    (null without a recording) and answer_files (kept items re-stamped with this answered_at, same id, file_id, secret
+    and uploaded_at; the event's previous_files marks the dropped ones `replaced`). The list is checked
+    (hosted/files.validate_files: shapes, duplicate ids, at most 6 items). New ids are the app's ("max id ever used + 1",
+    SPEC 7.3): the bridge assigns none, and its later guards key on (n, file_id, answered_at), so a reused id can't
+    reach another file."""
     if not who.is_denis:
         raise Forbidden("only the human can answer asks")
+    files = files or []
+    if files and not (isinstance(answer, str) and answer.strip()):
+        answer = answer_text_for(None, None, voice, files)  # an answer with files is never empty
     answer = _text(answer, "answer", ANSWER_MAX, required=True)
+    from .hosted.files import validate_files  # hosted/files.py imports this module: not at the top
+    files = validate_files([{**f, "answered_at": now} if isinstance(f, dict) else f for f in files], now)
     ask = load()
     if ask["status"] not in ("open", "answered"):
         raise Conflict(f"ask #{ask['id']} is closed; reopen it before answering")
-    if ask["status"] == "answered" and ask["answer"] == answer and voice is None:
+    previous_files = ask.get(ANSWER_FILES) or []
+    if (ask["status"] == "answered" and ask["answer"] == answer and voice is None
+            and [_file_key(f) for f in files] == [_file_key(f) for f in previous_files]):
         return ask, None  # same answer again: nothing changes, no event, no second ping
     previous_voice = ask.get(ANSWER_VOICE)
     if voice is not None:
         voice = {**voice, "answered_at": now}
+    kept = {f["id"] for f in files}
+    previous = [f if f["id"] in kept or f.get("deleted_at") is not None else {**f, "deleted_reason": "replaced"}
+                for f in previous_files]
     updates = {"status": "answered", "answer": answer, "answered_at": now, "updated_at": now}
     if voice is not None or previous_voice is not None:  # never set where there is none (no SQLite column for it)
         updates[ANSWER_VOICE] = voice
-    payload = {"answer": answer, "previous_answer": ask["answer"], "voice": voice, "previous_voice": previous_voice}
+    if files or previous_files:
+        updates[ANSWER_FILES] = files
+    payload = {"answer": answer, "previous_answer": ask["answer"], "voice": voice, "previous_voice": previous_voice,
+               "files": files, "previous_files": previous}
     return ask, Change(updates, "answered", payload, now)
 
 
@@ -258,22 +300,29 @@ def plan_close(who: Identity, resolution, load: Loader, now: str) -> tuple[dict,
     voice = ask.get(ANSWER_VOICE)
     if voice is not None and voice.get("file_id") is not None:
         updates[ANSWER_VOICE] = {**voice, "file_id": None, "deleted_at": now}
+    files = ask.get(ANSWER_FILES) or []  # the same for files: kept for the record, deleted (deleted_reason closed)
+    if files:
+        updates[ANSWER_FILES] = [{**f, "file_id": None, "deleted_at": now, "deleted_reason": "closed"}
+                                 if f.get("file_id") is not None else f for f in files]
     return ask, Change(updates, "closed", {"resolution": resolution, "previous_status": ask["status"]}, now)
 
 
 def plan_reopen(who: Identity, load: Loader, now: str) -> tuple[dict, Change]:
-    """Reopen by the owner agent or the human: the answer, the close and a voice answer are cleared; the event
-    carries them (answer_voice too). Whoever reopens deletes the recording, as on close."""
+    """Reopen by the owner agent or the human: the answer, the close, a voice answer and the files are cleared; the
+    event carries them (answer_voice and answer_files too). Whoever reopens deletes the recording, as on close."""
     ask = load()
     check_owner_or_denis(who, ask, "reopen")
     if ask["status"] not in ("closed", "answered"):
         raise Conflict(f"ask #{ask['id']} is already open")
     cleared = {f: ask[f] for f in CLEARED_BY_REOPEN}
     voice = ask.get(ANSWER_VOICE)
+    files = ask.get(ANSWER_FILES) or []
     updates = {"status": "open", **{f: None for f in CLEARED_BY_REOPEN}, "updated_at": now}
     if voice is not None:
         updates[ANSWER_VOICE] = None
-    payload = {"previous_status": ask["status"], **cleared, ANSWER_VOICE: voice}
+    if files:
+        updates[ANSWER_FILES] = []
+    payload = {"previous_status": ask["status"], **cleared, ANSWER_VOICE: voice, ANSWER_FILES: files}
     return ask, Change(updates, "reopened", payload, now)
 
 

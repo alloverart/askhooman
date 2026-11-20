@@ -143,20 +143,66 @@ class VoiceLinks:
 VOICE_PARTS = ("voice", "previous_voice", ANSWER_VOICE)  # where event payloads carry a voice answer
 
 
-def _unheard(event):
-    """An event as another agent sees it: the voice answers in its payload without their transcript."""
+FILE_PARTS = ("files", "previous_files", "answer_files")  # where event payloads carry answer_files items
+
+
+AGENT_FILE_KEYS = ("id", "name", "mime", "bytes", "secret", "downloaded_at", "deleted_at", "deleted_reason",
+                   "blocked_at")  # SPEC 7.4: what an agent sees of a file; file_id, uploaded_at, answered_at stay stored
+
+
+def _agent_items(items, named: bool = True):
+    """Files as an agent sees them (SPEC 7.4): only AGENT_FILE_KEYS, so the Drive file id never leaves the bridge;
+    another agent gets no name and no mime, as the type says what the file is."""
+    shown = []
+    for item in items:
+        if isinstance(item, dict):
+            item = {key: item[key] for key in AGENT_FILE_KEYS if key in item}
+            if not named:
+                item = {**item, "name": None, "mime": None}
+        shown.append(item)
+    return shown
+
+
+def _unheard(event, owner: bool = False):
+    """An event as an agent sees it: the files in its payload as _agent_items; for another agent also the voice
+    answers without their transcript and the files without name and mime."""
     payload = event.get("payload") if isinstance(event, dict) else None
-    if not isinstance(payload, dict) or not any(isinstance(payload.get(key), dict) for key in VOICE_PARTS):
+    if not isinstance(payload, dict):
         return event
-    hidden = {key: {**payload[key], "transcript": None} for key in VOICE_PARTS if isinstance(payload.get(key), dict)}
-    return {**event, "payload": {**payload, **hidden}}
+    hidden = {} if owner else {key: {**payload[key], "transcript": None} for key in VOICE_PARTS
+                               if isinstance(payload.get(key), dict)}
+    hidden.update({key: _agent_items(payload[key], owner) for key in FILE_PARTS if isinstance(payload.get(key), list)})
+    return {**event, "payload": {**payload, **hidden}} if hidden else event
 
 
-def for_reader(ask: dict, links: VoiceLinks, reader) -> dict:
+def _file_view(ask: dict, items: list, reader, owner: bool, file_urls: bool, file_links) -> list:
+    """answer_files as `reader` gets it (_agent_items). The owner, with `file_urls` and a `file_links`, on an answered
+    ask: a normal file that exists and is not blocked also gets `url` and `url_expires_at`. A secret file never has a
+    url (the agent fetches it through the bearer route). Without `file_urls` (the webhook) no item has a url and a
+    secret file is only {id, secret: true}."""
+    if not owner:
+        return _agent_items(items, False)
+    if not file_urls:
+        return [{"id": item.get("id"), "secret": True} if isinstance(item, dict) and item.get("secret") is True
+                else item for item in _agent_items(items)]
+    shown = _agent_items(items)
+    if file_links is None or ask.get("status") != "answered":
+        return shown
+    for raw, item in zip(items, shown):
+        if (isinstance(raw, dict) and raw.get("secret") is False and raw.get("file_id") is not None
+                and raw.get("blocked_at") is None):
+            item["url"], item["url_expires_at"] = file_links.url_for(reader.user, reader.agent_id, ask["id"],
+                                                                     ask["answered_at"], raw["file_id"], raw["id"])
+    return shown
+
+
+def for_reader(ask: dict, links: VoiceLinks, reader, file_urls: bool = True, file_links=None) -> dict:
     """The ask as `reader` gets it. For the agent that asked (`reader` a HostedIdentity of that agent): answer_voice,
     when there is one, with url and url_expires_at, a link while the ask is answered and the recording exists (a
-    closed ask's never has one, whatever an older app left in it). For everyone else: url null, and transcript null
-    in answer_voice and in the voice answers of the history."""
+    closed ask's never has one, whatever an older app left in it); answer_files with a link on each normal file
+    (files.FileLinks, only when `file_links` is given and `file_urls` is true; the webhook passes file_urls=False and
+    gets no url and a secret file as {id, secret: true}). For everyone else: url null, and transcript null in
+    answer_voice and in the history, no name and no mime in the files."""
     owner = bool(getattr(reader, "role", None) == "agent" and reader.agent == ask.get("agent")
                  and getattr(reader, "user", "") and getattr(reader, "agent_id", ""))
     shown = ask
@@ -169,6 +215,8 @@ def for_reader(ask: dict, links: VoiceLinks, reader) -> dict:
         if not owner:
             voice["transcript"] = None
         shown = {**shown, ANSWER_VOICE: voice}
-    if not owner and isinstance(ask.get("events"), list):
-        shown = {**shown, "events": [_unheard(event) for event in ask["events"]]}
+    if isinstance(ask.get("answer_files"), list):
+        shown = {**shown, "answer_files": _file_view(ask, ask["answer_files"], reader, owner, file_urls, file_links)}
+    if isinstance(ask.get("events"), list):
+        shown = {**shown, "events": [_unheard(event, owner) for event in ask["events"]]}
     return shown

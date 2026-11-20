@@ -28,6 +28,10 @@ LIST_QUERY = "(name contains 'ask-' or name contains 'task-') and trashed = fals
 MULTIPART_MAX = 5 * 1024 * 1024  # bytes: a media file up to this goes up in one multipart request, larger resumable
 REFRESH_MARGIN = 60.0  # refresh the access token this many seconds before Google says it expires
 RATE_LIMIT_REASONS = ("rateLimitExceeded", "userRateLimitExceeded")
+# 403 reasons on a content read that mean Google will not serve THIS file, for good: the file is flagged as malware or
+# spam. (SPEC 7.4: nothing else is documented as permanent for a read; quota, policy and unknown 403s may pass.)
+BLOCK_REASONS = ("cannotDownloadAbusiveFile",)
+STREAM_CHUNK = 1024 * 1024  # bytes per chunk of stream_media
 
 
 class DriveError(Exception):
@@ -43,6 +47,11 @@ class DriveError(Exception):
 
 class DriveNotFound(DriveError):
     """404: the file is gone."""
+
+
+class DriveBlocked(DriveError):
+    """403 on a content read with one of BLOCK_REASONS (cannotDownloadAbusiveFile): Google won't serve this file, for
+    good. Not transient. Any other 403 stays a plain DriveError (quota and the like: try again later)."""
 
 
 class DriveBadFile(DriveError):
@@ -94,6 +103,11 @@ def _quote(value: str) -> str:
 RELINK_HINT = "the link was revoked or expired: link the Google account again and replace the token file"
 
 
+class Listing(list):
+    """What DriveClient.list_files returns: the files, and `truncated`, True when the listing stopped at max_files."""
+    truncated = False
+
+
 class DriveClient:
     def __init__(self, client_file: Path | None, token_file: Path | None, timeout: float = 20.0,
                  transport: httpx.BaseTransport | None = None, *,
@@ -114,7 +128,6 @@ class DriveClient:
         self.file_fields = file_fields
         self.max_file_bytes = max_file_bytes
         self.max_files = max_files
-        self.truncated = False  # the last listing stopped at max_files
         self._lock = threading.Lock()
         self._access: str | None = None
         self._expires = 0.0
@@ -207,7 +220,7 @@ class DriveClient:
         status = response.status_code
         transient = status >= 500 or status == 429 or (status == 403 and reason in RATE_LIMIT_REASONS)
         cls = DriveNotFound if status == 404 else DriveError
-        return cls(self._scrub(f"Drive {method} HTTP {status}: {message}"), transient=transient, status=status)
+        return cls(self._scrub(f"Drive {method} HTTP {status}: {message}"), transient=transient, status=status, reason=reason)
 
     @staticmethod
     def _multipart(metadata: dict, content: dict) -> tuple[bytes, str]:
@@ -236,11 +249,13 @@ class DriveClient:
 
     # ---------- files in appDataFolder ----------
 
-    def list_files(self, query: str | None = None) -> list[dict]:
-        """Every matching file in appDataFolder (all pages): [{id, name, appProperties, modifiedTime}].
-        Default: the ask and task files (Drive matches `name contains` by prefix, so both terms are needed)."""
-        files, page = [], None
-        self.truncated = False
+    def list_files(self, query: str | None = None) -> "Listing":
+        """Every matching file in appDataFolder (all pages): [{id, name, appProperties, modifiedTime}], as a Listing
+        (a list that also says whether it was cut at max_files: that belongs to this listing, never to the client,
+        which other requests of the same user use at the same time). A listing that fills max_files exactly counts as
+        cut: there may be one more. Default: the ask and task files (Drive matches `name contains` by prefix, so both
+        terms are needed)."""
+        files, page = Listing(), None
         while True:
             params = {"spaces": "appDataFolder", "q": query or LIST_QUERY, "pageSize": 1000,
                       "fields": f"nextPageToken,files({self.file_fields})"}
@@ -250,8 +265,9 @@ class DriveClient:
             files.extend(data.get("files") or [])
             page = data.get("nextPageToken")
             if self.max_files is not None and len(files) >= self.max_files:
-                self.truncated = bool(page) or len(files) > self.max_files
-                return files[:self.max_files]
+                found = Listing(files[:self.max_files])
+                found.truncated = True
+                return found
             if not page:
                 return files
 
@@ -318,6 +334,60 @@ class DriveClient:
                 raise DriveError(message, transient=True) from None
         raise DriveError("Drive GET refused the access token twice", transient=True)
 
+    def stream_media(self, file_id: str, start: int = 0, end: int | None = None) -> "MediaStream":
+        """A file's bytes as an iterator of chunks of STREAM_CHUNK (1 MiB; the last is shorter), read raw (no
+        decompression), never held whole. `end` given sends `Range: bytes=start-end` (a part, the last byte included),
+        else `start` > 0 sends `Range: bytes=start-`; a ranged answer must be a 206 whose Content-Range starts at
+        `start` (and ends at `end`, when given). The request is made here, not on the
+        first next(), so a refusal raises at the call, before the caller commits to a response: DriveBlocked for a
+        403 with a reason in BLOCK_REASONS, DriveNotFound for 404, DriveError(transient=True) for rate limits, 5xx and
+        network errors, a plain DriveError for any other 403; DriveBadFile if it came compressed. A failure mid-body
+        raises DriveError(transient=True) from next(). Call close() (or exhaust it) to release the connection."""
+        for attempt in (1, 2):
+            token = self._token()
+            headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+            ranged = bool(start) or end is not None
+            if ranged:
+                headers["Range"] = f"bytes={start}-{'' if end is None else end}"
+            request = self._http.build_request("GET", f"{API_URL}/files/{file_id}", params={"alt": "media"},
+                                               headers=headers)
+            try:
+                response = self._http.send(request, stream=True)
+            except httpx.HTTPError as exc:
+                raise DriveError(self._scrub(f"Drive GET failed: {type(exc).__name__}: {exc}"), transient=True) from None
+            try:
+                if response.status_code == 401 and attempt == 1:
+                    with self._lock:
+                        if self._access == token:
+                            self._access = None
+                    response.close()
+                    continue
+                if response.status_code >= 400:
+                    response.read()
+                    error = self._http_error("GET", response)
+                    if error.status == 403 and error.reason in BLOCK_REASONS:
+                        error = DriveBlocked(str(error), status=403, reason=error.reason)
+                    raise error
+                if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+                    raise DriveBadFile(f"file {file_id} came compressed")
+                if ranged and response.status_code != 206:
+                    raise DriveError(f"Drive GET HTTP {response.status_code}: the Range header was ignored",
+                                     status=response.status_code)
+                if ranged:  # a wrong offset would corrupt a resumed download, a wrong end a part
+                    placed = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("content-range", ""))
+                    if (placed is None or int(placed.group(1)) != start
+                            or (end is not None and int(placed.group(2)) != end)):
+                        raise DriveError("Drive GET HTTP 206: Content-Range is not the requested range "
+                                         "or has no total", status=206)
+            except httpx.HTTPError as exc:  # e.g. the error body could not be read
+                response.close()
+                raise DriveError(self._scrub(f"Drive GET failed: {type(exc).__name__}: {exc}"), transient=True) from None
+            except BaseException:
+                response.close()
+                raise
+            return MediaStream(self, response)
+        raise DriveError("Drive GET refused the access token twice", transient=True)
+
     def create(self, name: str, content: dict, app_properties: dict) -> dict:
         metadata = {"name": name, "mimeType": "application/json", "parents": ["appDataFolder"],
                     "appProperties": app_properties}
@@ -367,6 +437,41 @@ class DriveClient:
     def close(self) -> None:
         if self._owns_http:
             self._http.close()
+
+
+class MediaStream:
+    """The chunks of one stream_media call; closing it (or reaching the end) closes the HTTP response."""
+
+    def __init__(self, client: DriveClient, response: httpx.Response):
+        self._client = client
+        self._response = response
+        self._chunks = response.iter_raw(chunk_size=STREAM_CHUNK)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        if self._chunks is None:
+            raise StopIteration
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self.close()
+            raise
+        except httpx.HTTPError as exc:
+            self.close()
+            raise DriveError(self._client._scrub(f"Drive GET failed: {type(exc).__name__}: {exc}"),
+                             transient=True) from None
+
+    def __enter__(self) -> "MediaStream":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._chunks = None
+        self._response.close()
 
 
 OUR_FILE = re.compile(r"^(ask|task)-([1-9][0-9]{0,18})\.json$")

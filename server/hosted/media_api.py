@@ -67,6 +67,8 @@ from .records import ATTACHMENTS
 from .uploads import UPLOAD_PATH, UploadGrant, UploadGrants
 
 MEDIA_SLOTS = 4  # per instance
+STREAM_SLOTS = 4  # per instance: file downloads streaming from Drive (bandwidth and threads, not memory)
+STREAM_SLOTS_PER_AGENT = 2  # of them, one agent holds at most this many on an instance: one can't 503 everyone
 FETCH_SLOTS = 1  # a url fetch or an upload PUT: at most 20 MB
 CREATE_SLOTS = 2  # an ask_create with any fetched item: at most 40 MB
 UPLOAD_IDLE = 20.0  # seconds a PUT may wait for the next piece of its body
@@ -95,27 +97,40 @@ class MediaRateLimited(AskError):
 
 
 class Slots:
-    """Media held in flight by this instance, counted in slots: take() says no at once instead of waiting."""
+    """Media held in flight by this instance, counted in slots: take() says no at once instead of waiting. With
+    `per_owner`, one owner (an agent: take(n, owner)) holds at most that many of them."""
 
-    def __init__(self, size: int = MEDIA_SLOTS):
+    def __init__(self, size: int = MEDIA_SLOTS, per_owner: int | None = None):
         self.size = size
+        self.per_owner = per_owner
         self._in_use = 0
+        self._owned: dict[str, int] = {}
         self._lock = threading.Lock()
 
     @property
     def in_use(self) -> int:
         return self._in_use
 
-    def take(self, n: int) -> bool:
+    def take(self, n: int, owner: str | None = None) -> bool:
         with self._lock:
             if self._in_use + n > self.size:
                 return False
+            if owner is not None and self.per_owner is not None and self._owned.get(owner, 0) + n > self.per_owner:
+                return False
             self._in_use += n
+            if owner is not None:
+                self._owned[owner] = self._owned.get(owner, 0) + n
             return True
 
-    def give(self, n: int) -> None:
+    def give(self, n: int, owner: str | None = None) -> None:
         with self._lock:
             self._in_use = max(self._in_use - n, 0)
+            if owner is not None and owner in self._owned:
+                left = self._owned[owner] - n
+                if left > 0:
+                    self._owned[owner] = left
+                else:
+                    del self._owned[owner]
 
 
 class MediaGuard:

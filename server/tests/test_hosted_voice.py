@@ -362,14 +362,16 @@ def test_answer_noop_rule_with_voice(hosted, google):
     assert isinstance(change, Change) and change.kind == "answered"
     assert change.updates["answer_voice"] == {**newer, "answered_at": now} and change.updates["answered_at"] == now
     assert change.payload == {"answer": "Да", "previous_answer": "Да", "voice": {**newer, "answered_at": now},
-                              "previous_voice": voice}
+                              "previous_voice": voice,
+                              "files": [], "previous_files": []}
     _, change = plan_answer(DENIS, "Нет", lambda: ask, now)  # new text, no recording: the old one no longer belongs
     assert change.updates["answer_voice"] is None
-    assert change.payload == {"answer": "Нет", "previous_answer": "Да", "voice": None, "previous_voice": voice}
+    assert change.payload == {"answer": "Нет", "previous_answer": "Да", "voice": None, "previous_voice": voice,
+                              "files": [], "previous_files": []}
     plain = {**ask, "answer_voice": None}
     _, change = plan_answer(DENIS, "Нет", lambda: plain, now)
     assert "answer_voice" not in change.updates  # nothing to clear (the single-tenant bridge has no column for it)
-    assert change.payload == {"answer": "Нет", "previous_answer": "Да", "voice": None, "previous_voice": None}
+    assert change.payload == {"answer": "Нет", "previous_answer": "Да", "voice": None, "previous_voice": None, "files": [], "previous_files": []}
 
     # on the hosted bridge's files: the same text again writes nothing
     token = agent(hosted, google)
@@ -1052,5 +1054,5 @@ def test_single_tenant_answer_voice_null(client):
     assert client.get("/api/asks", headers=auth(ALLEN_TOKEN)).json()["asks"][0]["answer_voice"] is None
     answered_event, reopened_event = ask["events"][1:]
     assert answered_event["payload"] == {"answer": "Yes", "previous_answer": None, "voice": None,
-                                         "previous_voice": None}
+                                         "previous_voice": None, "files": [], "previous_files": []}
     assert reopened_event["payload"]["answer_voice"] is None

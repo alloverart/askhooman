@@ -18,6 +18,7 @@ No local disk state, so any number of instances can run side by side.
 """
 
 import logging
+import time
 from contextlib import asynccontextmanager
 
 import anyio.to_thread
@@ -25,11 +26,13 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
-from starlette.responses import JSONResponse
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from ..app import RequestGuard, add_api_routes, add_error_handlers, setup_logging
-from ..mcp_tools import IDENTITY_SCOPE_KEY, FeedTool, LookTool, MediaTool, WebhookTool, build_mcp
+from ..db import utc_now
+from ..mcp_tools import IDENTITY_SCOPE_KEY, FeedTool, LookTool, MediaTool, SecretFileTool, WebhookTool, build_mcp
 from ..tokens import bearer_token
 from . import site
 from .accounts import SCOPE, Accounts, HostedIdentity
@@ -39,6 +42,7 @@ from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
 from .feed import EventFeed, add_feed_route
+from .files_api import add_file_routes, is_content_path, secret_file_tool
 from .google import GoogleError, GoogleOAuth
 from .looks import AGENT_COLORS, own_look
 from .media_api import MEDIA_SLOTS, MediaGuard, MediaService, Slots, add_media_routes
@@ -50,12 +54,18 @@ from .safe_http import public_client
 from .self_webhook import ping_own_webhook, set_own_webhook
 from .stats import internal_check
 from .store import MemoryStore
+from .sweep import sweep
 from .uploads import UPLOAD_PATH, UPLOAD_PREFIX, UploadGrant, UploadGrants
+from .files import FileClaims, FileLinks
 from .voice import VoiceLinks
 from .voice_api import add_voice_route
 from .webhooks import WebhookSender
 
 log = logging.getLogger("asks.hosted")
+
+SWEEP_BUDGET = 600.0  # seconds a run works, files included: the deploy's request timeout is 900
+SWEEP_LIMIT = 20  # users per slice
+SWEEP_BEHIND_RUNS = 2  # runs in a row that end with users left before the sweep says it is falling behind
 
 
 class ResourceAuth:
@@ -166,10 +176,13 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     # Voice answers (SPEC v5 "5. Voice answers"): the agent that asked gets a link to the recording on each read.
     voice_links = VoiceLinks(keyring, settings.public_url)
+    # Files in answers (SPEC 7.4): the same for a normal file, sealed under its own context.
+    file_links = FileLinks(keyring, settings.public_url)
+    file_claims = FileClaims(store)
 
     def services(who: HostedIdentity):
         records = pool.records(who.user)
-        return HostedAsks(records, voice_links, who), HostedTasks(records)
+        return HostedAsks(records, voice_links, who, file_links, file_claims), HostedTasks(records)
 
     # Pictures and video in asks (SPEC v5 step 4): one service and one guard (the `media` bucket, the slots) for
     # the REST routes and the MCP tools alike.
@@ -191,7 +204,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         lambda who, url, rotate: set_own_webhook(accounts, limiter, who, url, rotate),
         lambda who: ping_own_webhook(accounts, webhooks, limiter, who))
     mcp = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user), webhook=own_webhook,
-                    media=MediaTool(media.create, media.attach, media.upload, media.detach))
+                    media=MediaTool(media.create, media.attach, media.upload, media.detach),
+                    secret_file=SecretFileTool(lambda who, ask_id, n: secret_fetch(who, ask_id, n)))
     mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,
@@ -233,6 +247,13 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
             raise HTTPException(401, "an upload token works only for its own PUT /api/uploads",
                                 headers={"WWW-Authenticate": "Bearer"})
         if not is_app_path(path, method):
+            if token is not None and is_content_path(path) and token.count(".") == 2:  # a Google ID token?
+                try:
+                    google.verify_id_token(token, settings.app_client_ids)
+                except Exception:  # GoogleError, or Google's certs unreachable: not a Google ID token as far as we
+                    pass  # can tell; the agent check below says what is wrong with it
+                else:
+                    raise HTTPException(403, "this file is for the agent that asked: fetch it with its own token")
             return resource_auth.identify(headers.get("authorization"), ip, headers.get("host"))
         if token is None:
             raise HTTPException(401, "sign in with Google", headers={"WWW-Authenticate": "Bearer"})
@@ -248,10 +269,79 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
             raise HTTPException(503, "temporarily unavailable, try again", headers={"Retry-After": "5"}) from None
         return AppUser(claims["sub"], claims.get("email"), claims.get("email_verified") in (True, "true"))
 
+    def sweep_caller_ok(headers, client) -> bool:
+        """POST /internal/sweep: a Google OIDC ID token of the configured service account for this service's URL
+        (SPEC 7.6). A failed check counts against the usual bearer-failure limit; a blocked address is refused."""
+        ip = client_ip(headers, (client or (None,))[0], settings.trust_forwarded)
+        if limiter.blocked("bearer_fail", ip):
+            return False
+        token = bearer_token(headers.get("authorization"))
+        ok = False
+        if token is not None and settings.sweep_service_account and token.count(".") == 2:
+            try:
+                claims = google.verify_id_token(token, [settings.public_url])
+                ok = (isinstance(claims.get("email"), str) and claims["email"].lower() == settings.sweep_service_account
+                      and claims.get("email_verified") in (True, "true"))
+            except Exception:  # GoogleError, or Google's certs unreachable: not proven, so not let in
+                ok = False
+        if not ok:
+            limiter.allow("bearer_fail", ip)
+        return ok
+
+    async def sweep_endpoint(request: Request) -> Response:
+        if not await anyio.to_thread.run_sync(sweep_caller_ok, request.headers, request.client and
+                                               (request.client.host, request.client.port)):
+            return Response(status_code=401)  # nothing said
+        explicit = request.query_params.get("cursor") or None
+        scheduled = explicit is None and "limit" not in request.query_params  # Cloud Scheduler's bare POST
+        try:
+            limit = min(max(int(request.query_params.get("limit", SWEEP_LIMIT)), 1), 200)
+        except ValueError:
+            limit = SWEEP_LIMIT
+        started = time.monotonic()
+        deadline, totals = started + SWEEP_BUDGET, {}
+        # a bare POST (Cloud Scheduler) resumes where the last run stopped: the cursor is kept in the store
+        cursor = explicit or ((await anyio.to_thread.run_sync(store.get, "sweep", "cursor")) or {}).get("cursor")
+        users = await anyio.to_thread.run_sync(store.all, "users")  # once per request; the slices are cut from it
+        while True:  # slices until every user is done or the budget is
+            cursor, stats = await anyio.to_thread.run_sync(
+                lambda: sweep(store, pool, time.time(), cursor, limit, users, deadline))
+            for key, count in stats.items():
+                totals[key] = totals.get(key, 0) + count
+            if not explicit:
+                await anyio.to_thread.run_sync(store.put, "sweep", "cursor", {"cursor": cursor})
+            if cursor is None or time.monotonic() >= deadline:
+                break
+        log.info("hosted sweep: %s, next cursor %s", totals, "yes" if cursor else "none")
+        try:  # what the operator sees (GET /api/admin/stats): when it ran and what it did, counts only
+            try:
+                before = (await anyio.to_thread.run_sync(store.get, "sweep", "last_run")) or {}
+            except Exception as exc:  # unknown count: the note is still written (a finished run resets it)
+                log.warning("hosted sweep: could not read the last run: %s", type(exc).__name__)
+                before = {}
+            if scheduled:  # runs in a row with work left: only the scheduler's runs count, a hand-made one is not it
+                behind = (before.get("more_in_a_row", 0) + 1) if cursor is not None else 0
+            else:
+                behind = before.get("more_in_a_row", 0)
+            await anyio.to_thread.run_sync(
+                store.put, "sweep", "last_run",
+                {"at": utc_now(), "stats": totals, "more": cursor is not None, "more_in_a_row": behind})
+            if scheduled and behind >= SWEEP_BEHIND_RUNS:
+                log.warning("hosted sweep falling behind: %d runs in a row ended with users left (counts %s): the "
+                            "slice or the budget is too small for the number of users", behind, totals)
+        except Exception as exc:  # the run is done; a note that did not get written is not an error
+            log.warning("hosted sweep: could not note the run: %s", type(exc).__name__)
+        return JSONResponse({"next_cursor": cursor, "stats": totals})
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         log.info("AskHooman hosted bridge: %s (aliases: %s, CORS for the App API: %s, store=%s)", settings.public_url,
                  ", ".join(settings.aliases) or "none", ", ".join(settings.cors_origins) or "none", settings.store)
+        if not settings.sweep_service_account:
+            log.warning("hosted: ASKS_SWEEP_SERVICE_ACCOUNT is not set: POST /internal/sweep refuses everyone, so no "
+                        "answer file is ever swept (a secret file nobody fetched is not deleted after 24 h, the files "
+                        "of a closed ask stay): set it and create the Cloud Scheduler job, deploy/hosted/README.md, "
+                        "Upgrading an existing deployment")
         async with mcp.session_manager.run():
             yield
         await anyio.to_thread.run_sync(webhooks.flush, 5.0)
@@ -270,6 +360,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.state.uploads = grants
     app.state.media = media
     app.state.voice_links = voice_links
+    app.state.file_links = file_links
+    app.state.file_claims = file_claims
     app.state.auth_server = auth_server
     app.state.mcp = mcp
     add_error_handlers(app)
@@ -280,11 +372,15 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     add_api_routes(app, services, ask_create=media.create)
     add_media_routes(app, media)
-    add_voice_route(app, voice_links, accounts, pool, limiter, media.guard.slots)
+    file_download = add_file_routes(app, file_links, accounts, pool, limiter, file_claims)
+    secret_fetch = secret_file_tool(app, accounts, pool, limiter, file_claims)  # ask_secret_file (built before app)
+    add_voice_route(app, voice_links, accounts, pool, limiter, media.guard.slots, file_download)
     add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed, voice_links)
     add_feed_route(app, feed, accounts)
     app.router.routes.extend(auth_server.routes())
     app.router.routes.extend(site.routes(settings))
+    app.router.routes.append(Route("/internal/sweep", endpoint=sweep_endpoint, methods=["POST"],
+                                   include_in_schema=False))  # no CORS: AppCors answers its own paths only
     app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, settings.trust_forwarded),
                                    include_in_schema=False))
     app.add_middleware(RequestGuard, authenticate=authenticate)

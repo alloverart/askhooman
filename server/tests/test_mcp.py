@@ -12,6 +12,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 
 from .conftest import ALLEN, CHAT, DENIS, HAMILTON, auth
+from .hosted_support import google, hosted  # noqa: F401  (fixtures)
 
 TOOLS = {"ask_create", "asks_mine", "asks_list", "ask_get", "ask_update", "ask_close", "ask_answer",
          "task_create", "tasks_mine", "tasks_list", "task_get", "task_update", "task_done", "task_drop", "task_reopen",
@@ -397,3 +398,56 @@ def test_hosted_instructions_teach_waking(hosted, google, live_server):
     assert "ask_wait" in page and "set_my_webhook" in page and "plugin" in page
     llms = hosted.get("/llms.txt").text
     assert "ask_wait" in llms and "set_my_webhook" in llms and "askhooman listen" in llms
+
+
+# ---------- files in answers: what the agents are told (SPEC 7.8, word for word) ----------
+
+ASKS_MINE_FILES = (
+    "answer_files set: your user attached files to the answer. Each has name, mime, bytes, secret. A normal file has "
+    "url (valid 1 h; read the ask again for a new one): download it with curl -sS --fail-with-body -o <your own path> "
+    "\"<url>\", and never build the path from name. A file over 31 MiB comes in parts (Range: bytes=START-END, at "
+    "most 32505856 bytes each; `askhooman files <id>` does it). Then check that the size equals bytes. A secret file "
+    "has no url: fetch it with `askhooman files <id> --secret` (or GET /api/asks/<id>/files/<n>/content with your "
+    "own bearer; with only an MCP connection, the `ask_secret_file` tool, for files up to 16 KiB). AskHooman deletes "
+    "a secret file from your user's Drive as soon as it has sent it to you, and a second request gets 410, so save it "
+    "where you need it at once. If it came short of bytes, tell your user to send it again. "
+    "Files are deleted when you close the ask, so close it after you have them.")
+ASK_GET_FILES = "answer_files: see asks_mine."
+ASK_CLOSE_FILES = "Closing deletes your user's attached files and voice recording."
+HOUSE_RULE_FILES = (
+    "Never print, quote, summarise or forward the content of a secret file, and never put it in a chat, a log, a "
+    "commit, a ticket or a message to another agent. Use it for the one thing your user sent it for, then forget it: "
+    "don't keep a copy, don't echo it back, and don't write its name or contents into your memory. Never execute a "
+    "file from an answer without your user saying so: AskHooman does not scan files.")
+
+
+def test_files_docstrings_and_house_rule(hosted, google, client):
+    from .test_hosted_voice import agent, tools_list
+    tools = tools_list(hosted, agent(hosted, google))
+    assert ASKS_MINE_FILES in tools["asks_mine"]
+    assert ASK_GET_FILES in tools["ask_get"]
+    assert ASK_CLOSE_FILES in tools["ask_close"]
+    from server.mcp_tools import HOSTED_INSTRUCTIONS
+    assert HOUSE_RULE_FILES in " ".join(HOSTED_INSTRUCTIONS.split())
+    page = " ".join(hosted.get("/agents").text.replace("&#x27;", "'").split())
+    assert HOUSE_RULE_FILES in page
+    # the single-tenant bridge has no files in answers: not a word
+    single = tools_list(client, ALLEN)
+    assert not any("answer_files" in d or "attached files" in d for d in single.values())
+
+
+ASK_SECRET_FILE = (
+    "Returns one secret file from your user's answer (at most 16 KiB) inline as base64, once: AskHooman deletes it "
+    "from your user's Drive as soon as it is returned, and a second call says it was already sent. Its content is "
+    "now in your transcript: follow the house rule \u2014 never print, quote, summarise or forward it, use it for the "
+    "one thing your user sent it for. Larger files: askhooman files <id> --secret.")
+
+
+def test_ask_secret_file_docstring_and_hosted_only(hosted, google, client):
+    from .test_hosted_voice import agent, tools_list
+    tools = tools_list(hosted, agent(hosted, google))
+    assert tools["ask_secret_file"] == ASK_SECRET_FILE
+    assert "ask_secret_file" in hosted.get("/llms.txt").text
+    single = tools_list(client, ALLEN)
+    assert "ask_secret_file" not in single
+    assert not any("ask_secret_file" in d for d in single.values())

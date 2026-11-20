@@ -67,7 +67,8 @@ class AskService:
                 ask["events"] = [event_from_row(r) for r in rows]
         return ask
 
-    def list(self, status: str = "active", agent: str | None = None, limit: int = 200) -> dict:
+    def list(self, status: str = "active", agent: str | None = None, limit: int = 200, file_urls: bool = False) -> dict:
+        # file_urls: the hosted bridge's links to answer files (asks_mine); no files here, so nothing to add
         statuses, agent = check_list_args(STATUS_FILTERS, status, agent, limit)
 
         where = f"status IN ({', '.join('?' * len(statuses))})"

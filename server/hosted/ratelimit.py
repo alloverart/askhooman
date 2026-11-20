@@ -28,7 +28,9 @@ LIMITS = {
     "webhook_test": (10, 3600.0),  # test_my_webhook calls of one agent
     "media": (60, 3600.0),  # attachment calls of one agent: attach, upload request, detach, each item of a create
     "voice": (60, 60.0),  # GET /media/v1/<token> per user and agent: an agent fetching voice answers (voice_api.py)
+    "files": (20, 60.0),  # GET /media/v1/<token> for a file, per user and agent (files_api; each can pin a slot)
 }
+FILE_BYTES = (1024 ** 3, 3600.0)  # bytes per seconds, per agent: the egress of file downloads (ByteBudget)
 MAX_KEYS = 20000
 
 
@@ -86,6 +88,43 @@ class RateLimiter:
             del self._hits[key]
         while len(self._hits) >= self.max_keys:  # still full of live keys: drop the least recently used
             self._hits.popitem(last=False)
+
+
+class ByteBudget:
+    """The byte bucket `file_bytes`: at most `limit` bytes per `window` seconds per key (the agent), charged whole when
+    a download starts. A refused charge records nothing. Per instance, like RateLimiter; bounded the same way."""
+
+    def __init__(self, limit: int = FILE_BYTES[0], window: float = FILE_BYTES[1], clock=time.monotonic,
+                 max_keys: int = MAX_KEYS):
+        self.limit, self.window, self.clock, self.max_keys = limit, window, clock, max_keys
+        self._charges: OrderedDict[str, deque] = OrderedDict()  # key -> deque of (time, bytes)
+        self._lock = threading.Lock()
+
+    def _expire(self, charges: deque, now: float) -> int:
+        while charges and now - charges[0][0] >= self.window:
+            charges.popleft()
+        return sum(n for _, n in charges)
+
+    def charge(self, key: str, n: int) -> bool:
+        """Record `n` bytes for this key and return True, or return False, recording nothing, if they don't fit."""
+        now = self.clock()
+        with self._lock:
+            charges = self._charges.get(key)
+            if charges is None:
+                if len(self._charges) >= self.max_keys:
+                    for idle in [k for k, c in self._charges.items() if self._expire(c, now) == 0]:
+                        del self._charges[idle]
+                    while len(self._charges) >= self.max_keys:
+                        self._charges.popitem(last=False)
+                charges = self._charges[key] = deque()
+            self._charges.move_to_end(key)
+            if n < 0 or self._expire(charges, now) + n > self.limit:
+                return False
+            charges.append((now, n))
+            return True
+
+    def retry_after(self) -> int:
+        return int(self.window)
 
 
 def client_ip(headers, peer: str | None, trust_forwarded: bool) -> str:

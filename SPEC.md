@@ -758,8 +758,10 @@ Constants (one place in the code, checked in every validator and again at the ro
   `deploy/hosted/README.md:69,86`), so a 100 MiB PUT to the bridge would be refused by the frontend at 32 MiB. The app
   therefore uploads to Drive itself (7.3); the agent's `qtu_` upload path (section 4) is unchanged.
 - **Out of the bridge: normal files stream, secret files do not.** A normal file is sent chunk by chunk from Drive's
-  `files.get?alt=media` stream (1 MiB chunks, 7.4), so the 32 MiB response limit does not apply. A secret file is at most
-  10 MiB, read whole and checked before the first byte, and sent as one response (7.4, why).
+  `files.get?alt=media` stream (1 MiB chunks, 7.4). The 32 MiB response limit applies all the same (spike 1, 7.10:
+  measured 20.11.2026), so every response carries at most `PART_BYTES` = 31 MiB and a larger file is fetched in parts
+  (7.4). A secret file is at most 10 MiB, read whole and checked before the first byte, and sent as one response (7.4,
+  why).
 - **Timeout.** The deploy config sets no `--timeout` (`deploy/hosted/README.md:69`, `.github/workflows/deploy.yml:49`), so
   Cloud Run's default applies. **Decision:** add `--timeout=900` to the deploy workflow's `gcloud run deploy` (long polls
   end at 50 s, so nothing else is affected). 100 MiB takes 160 s at 5 Mbps, 400 s at 2 Mbps; normal files support `Range`
@@ -784,7 +786,7 @@ is shown as stored but is never downloadable). Voice and files can be in one ans
 | secret | boolean, set by the user per file at attach time; never changed afterwards |
 | uploaded_at | when the app finished uploading it (the app's clock, ISO-8601 with ms and `Z`) |
 | answered_at | equals the ask's `answered_at` (a kept item is re-stamped, 7.3) |
-| downloaded_at | `null`, or when the first complete delivery ended (written by the bridge, idempotently, 7.4); for a secret file: when AskHooman finished sending it |
+| downloaded_at | `null`, or when the first response that ends at the file's last byte had gone out (the whole file, or the last part alone: a middle part writes nothing; written by the bridge, idempotently, 7.4); for a secret file: when AskHooman finished sending it |
 | blocked_at | `null`, or when Drive refused to serve the file as abusive or otherwise blocked (7.4) |
 | deleted_at | `null`, or when the file was deleted from Drive |
 | deleted_reason | `null`, or `sent` (a secret file after it was sent), `closed`, `reopened`, `expired` (a secret file not sent in 24 h), `replaced` (a re-answer dropped it) |
@@ -813,8 +815,9 @@ is shown as stored but is never downloadable). Voice and files can be in one ans
   `mimeType: application/octet-stream`, appProperties `ask_id` (string), `kind: "file"`, `file` (= `n`, string), `secret`
   (`"1"` or `"0"`). Without `kind` and `ask_id` the bridge neither sends nor deletes the file, as for voice.
 - **Events:** the `answered` payload adds `files` and `previous_files` (the arrays), `reopened` adds `answer_files`;
-  the bridge adds `file_downloaded` `{id}` (actor: the owner agent) when it writes a `downloaded_at`. Apps skip kinds they
-  don't know. Another agent (not the owner) sees `name` and `mime` as `null` in `answer_files` and in those payloads
+  the bridge adds `file_downloaded` `{id}` (actor: the owner agent) when it writes a `downloaded_at`, `file_blocked`
+  `{id}` when Google refused the file (`blocked_at`), and `file_deleted` `{id, reason}` when the hourly sweep deletes it
+  (7.6). Apps skip kinds they don't know. Another agent (not the owner) sees `name` and `mime` as `null` in `answer_files` and in those payloads
   (*review*: the type says what the file is), and no `url`.
 - **Single-tenant bridge:** always `[]` (`server/db.py:93`'s pattern for `answer_voice`); the single-tenant path of the
   apps writes `answer_files = []` and shows no paperclip (7.5) (*review*).
@@ -876,11 +879,14 @@ OAuth scope (7.7). Files are sent one after another, never in parallel.
    current answer's **files as chips**, read from the ask: **keep** all (send as it is: with the same text it is a
    no-op, 7.2), **keep some** (× on the others), or **drop all** (× on each; the answer then has no files). Kept
    items are not uploaded again: they are **re-stamped** (the new `answered_at`; same `id`, `file_id`, `secret`,
-   `uploaded_at`), new files get new ids. A kept item that is already deleted (a secret file that was sent) is not
+   `uploaded_at` and **`downloaded_at`**: a kept item that was sent keeps saying so), new files get new ids. A kept item that is already deleted (a secret file that was sent) is not
    shown as a chip, only as «Sent to your agent». After the write succeeds the app deletes, best effort, the Drive files
    it dropped (`deleted_reason: replaced` in the event's `previous_files`). An agent that is downloading a dropped file
-   meanwhile gets its stream ended with an error (Drive's 404) and **410** when it asks again. A kept secret file's
-   claim (7.4) is keyed by `answered_at`, so the re-stamp gives it a fresh claim and the old claim document is deleted.
+   meanwhile gets its stream ended with an error (Drive's 404) and **410** when it asks again. A secret file's
+   claim (7.4) is **not** keyed by `answered_at` (*round 2*): a Drive file is sent at most once whatever version of the
+   answer names it, so a kept secret item that was sent (its claim is `done`, or it has `downloaded_at`) is not sent
+   again even if every write after the send failed: the bridge answers «already sent» and the sweep deletes the file
+   (7.4, 7.6).
 8. Bridge-side nothing is needed for an upload: it never sees one, issues no sessions, and no file bytes or session URLs
    pass through our logs.
 
@@ -892,15 +898,17 @@ complete download». The bridge cannot know that: uvicorn's `send()` returns sil
 bridge finished sending» is not «the agent has the bytes». It is the best signal available, so it is described
 honestly, everywhere: **«deleted as soon as AskHooman has sent it to your agent»**, never «after your agent downloaded
 it». To keep the loss window small and the failure visible, a secret file is at most 10 MiB, is read whole and
-size-checked before the first byte (a Drive error can't leave a half-sent file), and is sent as **one** non-streamed
-response.
+size-checked before the first byte (a Drive error can't leave a half-sent file), and is sent as **one** response that is not
+streamed from Drive: whole in memory, with its `Content-Length`, but its body goes out in 64 KiB messages (*round 2*), so
+the final message, and with it «sent», comes only after the server has taken every earlier one (back-pressure drained).
 
 **What the owner agent sees.**
 - `asks_mine`, `asks_list`, `ask_get`, REST: every item of `answer_files` with `id`, `name`, `mime`, `bytes`, `secret`,
   `downloaded_at`, `deleted_at`, `deleted_reason`, `blocked_at`, and:
   - a **normal** file: `url` and `url_expires_at` **in `ask_get` and `asks_mine` only** (not in `asks_list`) (*review*):
     `<ASKS_PUBLIC_URL>/media/v1/<token>`, valid 1 h, a new one on every read; any number of downloads until the ask is
-    closed; `Range: bytes=N-` answers 206.
+    closed; `Range: bytes=N-` and `bytes=N-M` answer 206. **A file over 31 MiB comes in parts** (spike 1, 7.10): see
+    «Parts» below; `askhooman files ID` does it.
   - a **secret** file: **no `url` anywhere** (*review*). The agent fetches it with the CLI
     (`askhooman files ID --secret` ) or one REST call, `GET /api/asks/{id}/files/{n}/content`, which needs the owner
     agent's own bearer (OAuth access token or agent key, nothing else) and serves the file **in that same response**:
@@ -921,37 +929,74 @@ response.
 **The route** `GET /media/v1/<token>` (normal files) and `GET /api/asks/{id}/files/{n}/content` (bearer; both files):
 the same checks in this order, one 404 message for the first group, as section 5: token opens and is not expired /
 bearer is the owner → budget (below) → agent not revoked and owns the ask → the ask's current `answer_files` has item
-`n` with this `file_id` and `answered_at` (closed ask or deleted item → 410; reopened or stale → 404) → **for a secret
-file, `now` < min(`uploaded_at`, `answered_at`) + 24 h, else 410 `expired` (the route
-refuses by itself; deletion follows from the sweep)** → Drive confirms the file is this ask's (`kind: "file"`,
+`n` with this `file_id` and `answered_at` (closed ask or deleted item → 410; reopened or stale → 404) → **a secret
+item with `downloaded_at` → 410 `already sent` (a re-answer that kept it has a new claim key, so the claim alone can't
+say so)** → **for a secret
+file, `now` < min(`uploaded_at`, `answered_at`) + 24 h, bounded by Drive's `createdTime` (7.6), else 410 `expired` (the
+route refuses by itself; deletion follows from the sweep)** → for a normal file, what the response may carry («Parts»
+below: 409 or 416, from `bytes` alone) → Drive confirms the file is this ask's (`kind: "file"`,
 `ask_id`, `file` = `n`) and its `size` equals `bytes` and is within `MAX_FILE_BYTES` (`MAX_SECRET_BYTES` for a secret
 file) (else 404, logged by ids only) → claim (secret) → slots → send. `HEAD` is 405. Headers as 7.2, `Content-Length`
-= `bytes`, `Cache-Control: private, no-store`. Drive unreachable → 503 `Retry-After: 30`.
+= the bytes of this response (`bytes`, or the part's), `Cache-Control: private, no-store`. Drive unreachable → 503
+`Retry-After: 30`.
+
+- **Parts** (after spike 1, 7.10). Every file response carries a `Content-Length` and at most `PART_BYTES` = 31 MiB =
+  32 505 856 bytes of body (`server/hosted/files.py`; `MAX_FILE_BYTES` stays 100 MiB). Cloud Run refuses a response of
+  32 MiB or more, and a body without a length is not safe (7.10). For a normal file:
+  - no `Range` (or one in another unit than `bytes`, which is ignored, RFC 9110 §14.2; the unit is
+    case-insensitive): the whole file (200) if `bytes` ≤ `PART_BYTES`; a larger file → **409** «this file is N bytes,
+    more than one response can carry: fetch it in parts with Range: bytes=START-END, at most 32505856 bytes each
+    (askhooman files does this)»;
+  - `Range: bytes=A-B` (a part, on any normal file) and `bytes=A-` (to the end) → 206 with `Content-Range: bytes
+    A-B/<bytes>` and `Content-Length` B−A+1; an end past the file is clamped to its last byte (RFC 9110); Drive is asked
+    for the same range. `bytes=0-` of a file up to `PART_BYTES` is the whole file (200);
+  - a part of more than `PART_BYTES` (closed or open, after the clamp) → **416** «a part can be at most 32505856 bytes:
+    ask for Range: bytes=START-END with END-START+1 <= 32505856»; a start past the end, an end before the start, a
+    number of more than 19 digits, or any other `bytes` form → 416; every 416 carries `Content-Range: bytes
+    */<bytes>`.
+  This is decided from the item's `bytes` before Drive is asked anything about the file (no metadata read, no slot,
+  no charge): a 409 or 416 makes no Drive call for it.
+  An agent fetches a larger file as closed parts of `PART_BYTES` in order, checks each (206, `Content-Range` exactly
+  `bytes A-B/<bytes>`, `Content-Length` and body B−A+1), retries a part that broke from its start, and compares the
+  total with `bytes`; `askhooman files` does exactly this: each part tried up to three times (a cut connection, a
+  short body, a 5xx); a 429 waited out (its `Retry-After`, 10 s when it names none; one asking for more than 60 s,
+  such as the byte budget's hour, fails at once with the server's message) and the same part asked again, at most 6
+  waits a file, which don't use up the tries (the `files` bucket stays 20 a minute, and a
+  100 MiB file is 4 parts); a 404 (the link's hour ran out) answered once by reading the ask again and going on from
+  that part with the item's new `url`, if the file is the same (the ask's `answered_at`, the item, its `bytes`). A
+  secret file is unchanged: at most 10 MiB, one response, `Range` ignored.
 
 - **Budgets** (*review*): the request bucket `files` is **20 per minute per user and agent** (voice has 60, but a voice
   fetch is 5 MiB; an answer has at most 6 files, so 20 covers a fresh download of each plus retries and is a third of
   voice's, since each request can pin a slot and up to 100 MiB of egress); and a **byte bucket `file_bytes`: 1 GiB
-  per hour per agent**, charged with the file's `bytes` when a download starts (a refused one charges nothing); over →
-  429 with `Retry-After`. One leaked link or runaway loop is limited by both.
-- **Drive refusals** (*review*): Drive answers 403 `cannotDownloadAbusiveFile` for a file it flagged as malware or spam,
-  and other 403s (policy, quota of the owner) are possible: **every Drive 403 on the content read → 410** with the
-  message «Google blocked this file», the item gets `blocked_at` (written like `downloaded_at`), and the apps show
-  «Google blocked this file» on the chip (7.5). Rate-limit 403s (`userRateLimitExceeded`, `rateLimitExceeded`) are not
-  a block: 503 `Retry-After: 30`, as the Drive client already classifies them (`RATE_LIMIT_REASONS`, `server/drive.py:30`).
+  per hour per agent**, charged with the bytes of the response when it starts (the whole file, or the part: a part
+  charges its own size, not the file's) (a refused one charges nothing); over → 429 with `Retry-After`. One leaked
+  link or runaway loop is limited by both.
+- **Drive refusals** (*review*, changed after the final review): Drive answers 403 `cannotDownloadAbusiveFile` for a
+  file it flagged as malware or spam. That one reason, and any other Drive documents as permanent for a file read
+  (none is documented today; the list is `BLOCK_REASONS`, `server/drive.py`), is **410** with the message «Google blocked
+  this file»; the item gets `blocked_at` (written like `downloaded_at`), and the apps show «Google blocked this file» on
+  the chip (7.5). **Every other 403** (rate limits `rateLimitExceeded`, `userRateLimitExceeded`, a quota such as
+  `quotaExceeded`, `dailyLimitExceeded`, `downloadQuotaExceeded`, a policy, an unknown reason) is **503** `Retry-After:
+  30` and stamps nothing: `blocked_at` is sticky (the route refuses on it without asking Drive again), so a passing
+  quota must not set it.
 - **Normal file: streaming, not buffering.** A new `DriveClient.stream_media(file_id)` (same token refresh,
   `Accept-Encoding: identity` and compressed-body refusal as `_download_capped`) yields 1 MiB chunks into a
   `StreamingResponse`; memory per download is a few MiB. Files get **4 stream slots per instance**, separate from the 4
-  media slots (bandwidth and threads limit, not memory); all taken → 503 `Retry-After: 5`. The sent length is checked
+  media slots (bandwidth and threads limit, not memory), **at most 2 of them held by one agent** (*review*: one agent
+  can't 503 everyone); all taken, or the agent's two → 503 `Retry-After: 5`. The sent length is checked
   against `bytes`; a Drive stream that ends short or long aborts the response. **Builders' warning** (*review*): the
   response sets `Content-Length`, so the body must match it exactly: a mismatch makes the server cut the connection
   (that is wanted: the agent sees a failed download, not a short file); never "fix" it by dropping the header, the
-  agent's size check depends on it. `downloaded_at` is written on the first response that ended **without an error**
-  and idempotently: read-modify-write of the ask, applied only if the ask is still `answered`, item `n` still has this
-  `file_id` and `answered_at`, and `downloaded_at` is still `null`; a closed or re-answered ask is skipped, not an
-  error. It runs **after the response has gone** (a `BackgroundTask` or the wrapper's `finally`), never in the
-  request path. Later downloads write nothing.
+  agent's size check depends on it. `downloaded_at` is written on the first response that **ends at the file's last
+  byte** (the whole file, or the last part) and ended **without an error**; a middle part writes nothing. «Downloaded»
+  means the server handed the last part over, to Cloud Run's front end, which takes the whole body at once (spike 1):
+  not that the agent has it. It is written idempotently: read-modify-write of the ask, applied only if the ask is still
+  `answered`, item `n` still has this `file_id` and `answered_at`, and `downloaded_at` is still `null`; a closed or
+  re-answered ask is skipped, not an error. It runs **after the response has gone** (a `BackgroundTask` or the
+  wrapper's `finally`), never in the request path. Later downloads write nothing.
 - **Secret file: one response, and a claim that is a state machine** (*review*). The claim is a document in the
-  metadata store, `fileclaims/<digest of user:ask:answered_at:file_id>`, changed only in transactions (as
+  metadata store, `fileclaims/<digest of user:ask:file_id>` (*round 2*: no `answered_at`, so a re-answer that keeps the item finds the same claim; an older held lease simply runs out), changed only in transactions (as
   `UploadGrants.claim`, `server/hosted/uploads.py:91-102`):
   - **none → held:** taken before Drive is read, with a lease `until = now + REQUEST_TIMEOUT + 60 s` (960 s, derived
     from the one constant, so a slow-but-alive send never outlives its lease). A request that finds a held, unexpired
@@ -959,8 +1004,13 @@ file) (else 404, logged by ids only) → claim (secret) → slots → send. `HEA
   - **held → none:** released in a `finally` whenever the send did not complete (a Drive error before the first byte,
     a disconnect seen by the wrapper, an exception), so the agent can try again.
   - **held → done:** when the wrapper's `send` of the **final** `more_body: False` message has returned without an
-    error **and no `http.disconnect` was received before it** (the wrapper listens to `receive` for it). `done` has no
-    expiry and is written **before** the Drive delete. A `done` claim means «sent»: every later request → 410 `the
+    error **and no `http.disconnect` was received before it** (the wrapper listens to `receive` for it). On Cloud Run
+    the body leaves the container in about 30 ms whatever the client does, and in spike 1 the disconnect never arrived
+    before the last send (10 of 10 sends cut by the client at 99 % were reported sent): the check is kept, cheap and
+    meaningful on a self-hosted server with no buffering proxy, but nothing may promise it catches a dropped client on
+    Cloud Run. `done` is
+    written **before** the Drive delete and has `expires_at` = 90 days (*review*; the sweep deletes it then unless its item
+    still names a live file, and Firestore's TTL policy on `expire_time` does too). A `done` claim means «sent»: every later request → 410 `the
     file was deleted after it was sent`.
   - **The Drive delete** (`files.delete`, permanent) runs **after the response**, from the wrapper's `finally` (the
     `_Held` pattern, `server/hosted/voice_api.py:63-74`: the wrapper class wraps the ASGI `send` and marks «sent» only
@@ -975,10 +1025,11 @@ file) (else 404, logged by ids only) → claim (secret) → slots → send. `HEA
   - **Cleanup of claims:** claim documents are deleted when the ask is closed (by the bridge, or found closed by the
     sweep) and in `Accounts.delete_user` (`server/hosted/accounts.py:186`, with the upload tokens), so Delete Account
     leaves none.
-  - **The honest residue:** the bridge cannot see the agent's socket. If a proxy swallowed the end of the response, the
-    claim is `done`, the file is gone and the agent has a short file (the `Content-Length` check catches it): it must
-    tell its user to send the file again (7.8). Nothing in this design can make that window zero; the wording
-    never promises it.
+  - **The honest residue:** the bridge cannot see the agent's socket. **«Sent» means our server handed the file to
+    its host** (Cloud Run's front end), not that the agent received it: if the agent's download then breaks, or a
+    proxy swallowed the end of the response, the claim is `done`, the file is gone and the agent has a short file (the
+    `Content-Length` check catches it): it must ask its user to send the file again (7.8). Nothing in this design can
+    make that window zero; the wording never promises it.
 - **`asks_mine` size:** metadata only plus normal links; nothing is fetched until the agent asks.
 
 #### 7.5 The apps
@@ -1044,9 +1095,33 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
   so a run ends well inside the timeout): list `afile-` files; delete (a) **secret files** 24 h after
   `min(uploaded_at, answered_at)` unless their claim is held and unexpired, and any whose claim is `done` (the retry
   of 7.4); (b) the files of **closed** asks; (c) **orphans**: files no current answer names, older than
-  `SECRET_ORPHAN` (1 h) if secret, `FILE_ORPHAN` (24 h) otherwise (age from the name's upload time); (d) normal files
-  of an ask that is still open or answered, 30 days after `answered_at`. It writes `deleted_at` / `deleted_reason`
+  `SECRET_ORPHAN` (1 h) if secret, `FILE_ORPHAN` (24 h) otherwise (age from Drive's `createdTime`, not the name; only
+  for a file whose ask is known not to name it: no ask file in a complete listing, or an open ask; an ask that is
+  listed but can't be read, or a cut-short listing, keeps its files for a run that can read). The 1 h applies only
+  when the ask is **absent** (no ask file in a complete listing; a closed ask's files go by the closed rule): a secret
+  file of an **open** ask, or of an answered ask that does not name it, is a draft not sent yet (the app uploads on
+  attach, before Send; *rounds 3 and 4*), and lives to its 24 h ceiling (below); (d) normal files of an ask that is still open or answered, **at most 30 days after
+  Drive's `createdTime` + 10 min** (they end `30 days` after `answered_at` when that is sooner, bounded as below). The sent rule of (a) also covers a secret item
+  that has `downloaded_at` and a live file (7.3 step 7). It writes `deleted_at` / `deleted_reason`
   (`expired`, `closed`) into the ask with the idempotent guards of 7.4 and deletes `fileclaims` of closed asks.
+- **A ceiling that needs no ask** (*round 2*): a file whose Drive `createdTime` is older than `createdTime + 24 h` (its
+  Drive appProperties say secret, or its item does) or `+ 30 days` (otherwise) `+ 10 min` is deleted as `expired` even
+  when its ask can't be read or an item's stamp is not a time, unless a held, unexpired claim says a send is in flight.
+  It is never earlier than the rules above. **One user's turn is bounded** (100 ask reads, 120 s): past that the user is
+  cut for the run and the cursor moves on (`user_cut` in the counts). A user with no `afile-` file and no claim is not
+  looked at beyond the one `afile-` listing (their asks are not listed). **Order and reads** (*round 3*): files are taken
+  in the order of nearest expiry (`createdTime` + 24 h or 30 days by Drive's secret mark), and everything that needs no
+  ask file read is decided **before any read**: an ask closed by its listing marks **and confirmed by one `files.get` of the ask file** (the listing is an
+  index that can lag; a mark that is not confirmed is decided by a read), a `done` claim (the file was sent:
+  reason `sent`, whatever the ask says or fails to say), a file past the longest ceiling (`createdTime + 30 days + 10
+  min`), an ask that is open, absent or unreadable. Only then are the capped reads spent, on the files nearest to
+  expiry, so a tail of files is never starved by the cap. The claims of asks closed that way go first too. **Falling behind**: when two of the
+  scheduler's runs in a row (a bare POST: no `cursor`, no `limit`) end with users left (`more`), the bridge logs a WARNING «sweep falling behind» and `GET /api/admin/stats` shows `sweep.behind` and
+  `sweep.more_in_a_row`.
+- **Lifetimes are bounded by Drive's `createdTime`** (*review*): the stamps come from the user's device clock. A secret's
+  end is `min(stamp + 24 h, createdTime + 24 h + 10 min)`, and a stamp more than 10 minutes before `createdTime` counts as
+  `createdTime` (a clock that is behind never deletes early); the normal 30 days the same. The route's 24 h refusal
+  (7.4) and the sweep use this one rule.
 - **Promises this makes true**, and the only ones the UI and the policy make: a secret file is **unreadable after 24
   hours (the route refuses) and deleted from Drive within the hour after**; normal files are deleted when the ask is
   closed (within the hour, or at once when the user or the agent closes it), **30 days at most**.
@@ -1060,7 +1135,9 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
 - **If the user revokes AskHooman's access in Google's settings** (*review*), neither the bridge nor the apps can delete
   anything: files stay in the user's Drive until they remove the app data (Google Drive → Settings → Manage apps →
   AskHooman → Delete hidden app data). The privacy text says so plainly, as the Delete Account note does.
-- Delete Account (bridge side) leaves the files, as it leaves asks and media; the app deletes them first (7.5).
+- Delete Account (bridge side) leaves the asks and media, and deletes the answer files from the user's Drive first,
+  best effort, through the same guard (*round 2*: `kind: "file"` and this ask and item in Drive's own marks, at most 200,
+  before the Google grant is revoked; a failure is logged and the account goes on); the app deletes them first as well (7.5).
 
 #### 7.7 Privacy and security
 
@@ -1090,7 +1167,7 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
   ask, `answered_at`, file, exp}; a secret file has no link. Leaks are bounded by the `files` and `file_bytes` budgets
   and by the agent's revocation.
 - **Policy before the apps ship** (`server/hosted/site.py`): files and their retention (normal: until the ask closes,
-  30 days at most; secret: sent once, 24 hours at most), the streaming pass-through ("our server holds a file only
+  30 days at most; secret: sent once; unreadable after 24 hours and deleted within the hour after, as 7.6 says), the streaming pass-through ("our server holds a file only
   while it passes through, and keeps no copy"), what happens if the user revokes access (files stay until they
   remove the app data), and Delete Account's two steps; App Store privacy label: User Content → Other User Content;
   Google Play Data safety: Files and docs.
@@ -1099,9 +1176,11 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
 
 - **`asks_mine` docstring** (new lines): «answer_files set: your user attached files to the answer. Each has name, mime,
   bytes, secret. A normal file has url (valid 1 h; read the ask again for a new one): download it with curl -sS
-  --fail-with-body -o <your own path> "<url>", and never build the path from name. Then check that the size equals
+  --fail-with-body -o <your own path> "<url>", and never build the path from name. A file over 31 MiB comes in parts
+  (Range: bytes=START-END, at most 32505856 bytes each; `askhooman files <id>` does it). Then check that the size equals
   bytes. A secret file has no url: fetch it with `askhooman files <id> --secret` (or GET /api/asks/<id>/files/<n>/content
-  with your own bearer). AskHooman deletes a secret file from your user's Drive as soon as it has sent it to you, and
+  with your own bearer; with only an MCP connection, the `ask_secret_file` tool, for files up to 16 KiB). AskHooman
+  deletes a secret file from your user's Drive as soon as it has sent it to you, and
   a second request gets 410, so save it where you need it at once. If it came short of bytes, tell your user to send
   it again. Files are deleted when you close the ask, so close it after you have them.»
 - **`ask_get`:** «answer_files: see asks_mine.» **`ask_close`:** «Closing deletes your user's attached files and voice
@@ -1110,11 +1189,23 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
   log, a commit, a ticket or a message to another agent. Use it for the one thing your user sent it for, then forget it:
   don't keep a copy, don't echo it back, and don't write its name or contents into your memory. Never execute a file from
   an answer without your user saying so: AskHooman does not scan files.»
-- There is no MCP tool: bytes can't travel through MCP (section 4's reasoning). CLI: `askhooman files ID [--out DIR]
-  [--secret]` saves the files under names `ask-<id>-file-<n>[.ext]`; `--secret` also fetches the secret ones, through
-  the bearer route. **Limit I could not remove:** an agent that has only an MCP OAuth connection and no shell access to
-  its own bearer cannot fetch a secret file (it has no link by design). The Claude Code plugin and the CLI hold the
-  token, so they can; for other clients the owner must decide (7.10, open question 6).
+- **No MCP tool for normal files:** their bytes travel by the link, not through MCP (section 4's reasoning). CLI:
+  `askhooman files ID [--out DIR] [--secret]` saves the files under names `ask-<id>-file-<n>[.ext]`; `--secret` also
+  fetches the secret ones, through the bearer route.
+- **`ask_secret_file(id, n)` — the one MCP tool for bytes** (owner's decision 19.11.2026, ask 1346, open question 6):
+  for an agent that has only an MCP OAuth connection and no shell access to its bearer. It returns ONE secret file
+  of at most 16 KiB inline (*round 3*: MCP clients cap a tool result, Claude Code at about 25k tokens, so a bigger
+  file would be marked sent and deleted while the client drops it; the CLI and the bearer route take up to 10 MiB):
+  `{name, mime, bytes, content_base64}`. Same checks and the same claim as the bearer route
+  (7.4 «Secret file»): only the ask's own agent; the claim is taken, the whole file read and size-checked, the result
+  returned, then the claim is `done` and the file deleted from Drive; a second call gets «already sent» (the bearer
+  route then answers 410). A file over 16 KiB → «too big for MCP — fetch it with `askhooman files <id> --secret`»,
+  claim not taken. A normal file → «this file has a url — download it with the url». The `files` bucket applies.
+  The bytes never go to the log. Docstring: «Returns one secret file from your user's answer (at most 16 KiB) inline as
+  base64, once: AskHooman deletes it from your user's Drive as soon as it is returned, and a second call says it was
+  already sent. Its content is now in your transcript: follow the house rule — never print, quote, summarise or
+  forward it, use it for the one thing your user sent it for. Larger files: askhooman files <id> --secret.»
+  Cost the owner accepted: the content lands in that agent's transcript.
 
 #### 7.9 Tests
 
@@ -1150,23 +1241,40 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
 #### 7.10 Spikes before the build
 
 Two things this design assumes and no test in the repository shows. Each is a day's work and each result changes the
-design; do them before the web build starts.
-1. **A real download through Cloud Run** (the deployed service, a throttled client): a 100 MiB normal file with
-   `Content-Length`; kills at 50 % and at 99 %; a throttled client slow enough to hit the 300 s default and then the
-   900 s; a 10 MiB secret file killed at 99 % to see what the bridge's wrapper sees (does `http.disconnect` arrive? is the
-   final `send` still reported as complete?). **Decides:** whether `Content-Length` with a streamed body passes the 32 MiB
-   response limit (if not: chunked and no length check for files over 32 MiB); whether `--timeout=900` is enough; how
-   often «sent» is not «received», which sets whether the 10 MiB secret cap stays or the wording gets stronger; and
-   whether the `http.disconnect` check in the wrapper is worth its code.
-2. **Resumable upload from the browser:** from `https://app.askhooman.com` in Chrome and Safari (and Chrome on Android),
-   a 50 MiB file with the session started by `POST` and chunks by `PUT` with `Content-Range`, the connection cut and
-   resumed with `bytes */total`. Google's guide shows browser `fetch` samples with the 308 and `Range` header, but our
-   origin, our CSP and Safari are untested. **Decides:** web uploads in the browser as designed, or the browser sends
-   through a small authenticated bridge endpoint (smaller files only, Cloud Run's 32 MiB), or the limit for the web app
-   is lowered until Apple builds have it.
-3. (small) **Scheduler OIDC against `verify_id_token`:** a token from Cloud Scheduler with the bridge's service
-   account, checked by the existing verifier. **Decides:** reuse it, or write a second verifier for service-account
-   tokens.
+design; do them before the web build starts. **Spikes 1 and 3 DONE 20.11.2026** (a throwaway service in europe-west1,
+the real response classes; report: `.superpowers/sdd/2026-11-19-files-in-answers-server/spikes-report.md`); **spike 2
+moved to the web plan** (it decides only the web app's upload: run it before the web build).
+1. **DONE.** Results: a response with a `Content-Length` of 32 MiB or more is refused (500 «Response size was too
+   large», 0 bytes to the client; 31 MiB passes, 32 MiB and 33 MiB fail), so a streamed 100 MiB body with its length
+   does not pass. **The chunked fallback named below is REMOVED:** a 100 MiB body without a length went through (200 in
+   9.9 s), but when the server aborts mid-body (Drive broke at 10 MiB) or Cloud Run's timeout ends the request (360 s
+   with a 300 s timeout, three clients at 2 Mbit/s), curl over HTTP/2 and HTTP/1.1 and Python urllib all saw a **clean
+   end with 200**: a silent short file. With a length the same server abort is a visible 502 with 0 bytes (Cloud Run
+   holds the whole response first). → Every file response carries a `Content-Length` and at most `PART_BYTES` =
+   31 MiB; a larger file is fetched in closed `Range` parts (7.4 «Parts»), and the CLI checks each part and the total.
+   `--timeout=900` stays: a response with a length is handed to Cloud Run in milliseconds and a slow client is not cut
+   (31 MiB at 0.5 Mbit/s: whole, in 512 s). «Sent» is not «received»: 10 of 10 secret sends cut by the client at
+   99 % were reported sent (the 10 MiB leaves the container in about 30 ms); the 10 MiB cap stays, the wording says it
+   plainly (7.4 «The honest residue»), and the `http.disconnect` check stays without any promise (7.4 «held → done»).
+   The plan was: **A real download through Cloud Run** (the deployed service, a throttled client): a 100 MiB normal
+   file with `Content-Length`; kills at 50 % and at 99 %; a throttled client slow enough to hit the 300 s default and
+   then the 900 s; a 10 MiB secret file killed at 99 % to see what the bridge's wrapper sees (does `http.disconnect`
+   arrive? is the final `send` still reported as complete?). **Decides:** whether `Content-Length` with a streamed body
+   passes the 32 MiB response limit (if not: chunked and no length check for files over 32 MiB); whether
+   `--timeout=900` is enough; how often «sent» is not «received», which sets whether the 10 MiB secret cap stays or the
+   wording gets stronger; and whether the `http.disconnect` check in the wrapper is worth its code.
+2. **Moved to the web plan** (not run with the server). **Resumable upload from the browser:** from
+   `https://app.askhooman.com` in Chrome and Safari (and Chrome on Android), a 50 MiB file with the session started by
+   `POST` and chunks by `PUT` with `Content-Range`, the connection cut and resumed with `bytes */total`. Google's guide
+   shows browser `fetch` samples with the 308 and `Range` header, but our origin, our CSP and Safari are untested.
+   **Decides:** web uploads in the browser as designed, or the browser sends through a small authenticated bridge
+   endpoint (smaller files only, Cloud Run's 32 MiB), or the limit for the web app is lowered until Apple builds have
+   it.
+3. **DONE.** (small) **Scheduler OIDC against `verify_id_token`:** a token from Cloud Scheduler with the bridge's
+   service account, checked by the existing verifier. **Decides:** reuse it, or write a second verifier for
+   service-account tokens. Result: accepted as is (iss `https://accounts.google.com`, aud = the service URL, email =
+   the service account, `email_verified` true; the sweep's own check passes): `verify_id_token` is reused, no second
+   verifier.
 
 ### Order
 
@@ -1184,7 +1292,7 @@ design; do them before the web build starts.
    third party: worth the privacy policy change and the cost?
 5. Files in answers (7.6): files of an ask are deleted when the ask is closed (30 days at most), like voice. Right,
    or should they stay a few days after the close so the user can still open what he sent?
-6. A secret file has no link, so an agent with only an MCP OAuth connection and no shell access to its own token cannot
+6. **Decided 19.11.2026 (ask 1346, B):** the `ask_secret_file` tool (7.8). Was: a secret file has no link, so an agent with only an MCP OAuth connection and no shell access to its own token cannot
    fetch it (7.8); the Claude Code plugin and the CLI can. Accept that for now (secret files are for agents that have
    the CLI), or add a tool that returns a small secret file (a password file, a few hundred KB) inline, which would put
    its content in the agent's transcript?
