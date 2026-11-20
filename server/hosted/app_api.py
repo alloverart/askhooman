@@ -24,7 +24,9 @@
                                  The asks and tasks in the user's Drive stay (they are the user's files).
                                  (GET /api/me is the agents' REST: who the agent token belongs to.)
   GET    /api/account            {email, admin}: who is signed in; admin = the app shows the operator's Admin page
-  GET    /api/admin/stats        the operator's stats (stats.admin_stats): ASKS_ADMIN_EMAILS only, else 403
+  GET    /api/admin/stats        the operator's stats (stats.admin_stats) and `sweep`, the last run of the hourly sweep
+                                 of answer files ({at, stats, more, more_in_a_row, behind}, null before the first): ASKS_ADMIN_EMAILS only,
+                                 else 403
 
 The web app calls these from a browser on another origin: CORS for them, and only them, is opened to the origins
 in ASKS_CORS_ORIGINS (AppCors); empty by default, then CORS stays closed.
@@ -56,6 +58,7 @@ from .looks import clean_avatar, clean_color
 from .ratelimit import RateLimiter
 from .records import DrivePool, HostedAsks, HostedTasks
 from .stats import admin_stats, internal_check
+from .sweep import purge_answer_files
 from .voice import VoiceLinks, for_reader
 from .webhooks import WebhookSender, check_webhook_url
 
@@ -415,6 +418,8 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             raise HTTPException(403, "only the operator's admins see the stats")
         stats = admin_stats(accounts.store.all("users").values(), accounts.store.all("agents").values(),
                             datetime.now(timezone.utc), internal)
+        last = accounts.store.get("sweep", "last_run")  # the last sweep of answer files
+        stats["sweep"] = last and {**last, "behind": last.get("more_in_a_row", 0) >= 2}
         return JSONResponse(stats, headers=NO_STORE)
 
     @app.get("/api/connect-info")
@@ -463,7 +468,8 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             body = payload
             if "ask" in payload and voice_links is not None:  # the owner's view: a voice answer carries its link
                 owner_view = HostedIdentity("agent", agent["slug"], user=user.sub, agent_id=agent["id"])
-                body = {**payload, "ask": for_reader(payload["ask"], voice_links, owner_view)}
+                # the webhook carries no file url (the agent reads asks_mine / ask_get) and a secret file only as {id, secret}
+                body = {**payload, "ask": for_reader(payload["ask"], voice_links, owner_view, file_urls=False)}
             delivery = uuid.uuid4().hex
             webhooks.send(agent["webhook_url"], secret, payload["type"], delivery, {**body, "delivery_id": delivery},
                           agent_id=agent["id"])
@@ -489,6 +495,10 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             refresh = accounts.google_refresh(user.sub)
         except CryptoError:  # sealed with a key that is no longer configured: nothing usable to revoke
             refresh = None
+        if refresh:  # the answer files first: they need the grant that is revoked next (best effort, SPEC 7.6)
+            deleted, failed, left, cut = purge_answer_files(pool, user.sub)
+            log.info("deleted account: %d answer files deleted from Drive, %d not, %s%d left past the cap", deleted,
+                     failed, "at least " if cut else "", left + cut)
         if refresh and not google.revoke(refresh):
             log.warning("Google did not confirm revoking a deleted account's grant (unreachable or already revoked)")
         found = accounts.delete_user(user.sub)

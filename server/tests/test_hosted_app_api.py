@@ -435,13 +435,26 @@ def test_store_pages(hosted):
         assert words in landing, words
     assert "In review at the App Store" not in landing and "In review at Google Play" not in landing
     assert "Google Play review" not in landing and landing.count("Available now") == 5
-    for words in ("Effective 18 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
+    for words in ("Effective 20 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
                   # 18.11.2026: pictures, videos and voice answers; what connected agents read
                   "the app saves the recording there with your answer",
                   "A voice recording is kept until the ask is closed, and 30 days at most",
                   "pass through our server without being kept",
+                  # 19.11.2026: files in answers (SPEC 7.8, "Policy before the apps ship")
+                  "Files you attach to an answer are saved there too",
+                  "our server holds a file only while it passes through, and keeps no copy",
+                  "a normal file until the ask is closed, and 30 days at most",
+                  "a secret file until it has been sent to the agent; if it has not been, it is unreadable after 24 hours "
+                  "and deleted within the hour after",
+                  "If the agent has not fetched it, it can no longer be read 24 hours after you attached it, and our "
+                  "hourly clean-up deletes it from your Drive within the hour after that",
+                  "the files you sent to your agents from your Google Drive",
+                  "stay in the hidden app folder until you remove the app data",
+                  "its name, type and size but never a link; for a secret file only that it exists)",
+                  "to answers stay in the hidden app folder until you remove the app data there in the same way. To remove",
                   "agent you connect can read all the asks and tasks in your account",
-                  "go only to the agent that asked",
+                  "The recording of a voice answer goes only to the agent that asked",
+                  "The apps only record: they do not turn your speech into text",
                   "the link to a voice recording stops working within an",
                   "will adhere to the <a href=\"https://developers.google.com/terms/api-services-user-data-policy\">"
                   "Google API Services User Data Policy</a>, including the Limited Use requirements",
@@ -449,6 +462,11 @@ def test_store_pages(hosted):
                   "Settings → Delete account", "revokes", "stay in your Google Drive", "Delete hidden app data",
                   "Third-party apps", "Children", "Changes", "no ads", "never sell"):
         assert words in privacy, words
+    # final review I6: not the promise «deleted 24 hours after at the latest»: the route refuses at 24 h, the sweep
+    # deletes within the hour after (SPEC 7.6)
+    assert "24 hours after you attached it at the latest" not in privacy and "and 24 hours at most" not in privacy
+    # voice answers are recordings only (owner, ask 1334, 18.11.2026): no device transcript is promised or described
+    assert "text your device heard" not in privacy and "turned the speech into text" not in privacy
     for words in ("mailto:support@askhooman.com", "mailto:privacy@askhooman.com", "mailto:security@askhooman.com",
                   f"claude mcp add --scope user --transport http askhooman {RESOURCE}", "Add custom connector",
                   f'href="{PUBLIC}/oauth/link"', "Settings → Delete account", "Delete hidden app data",

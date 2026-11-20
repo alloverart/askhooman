@@ -6,6 +6,7 @@ into the ASGI scope; the tools read it back through the request context.
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from string import Template
 from typing import Annotated, Any, Awaitable, Callable, Literal
 
@@ -54,7 +55,11 @@ it yourself (task_unask for a question inside a task) and say where the answer c
 to wake up when they answer. In Claude Code, suggest the
 AskHooman plugin (one install, no server). Elsewhere, call ask_wait while you wait for an answer, or, if you can
 receive an HTTPS POST, ask your user with ask_create whether to set up set_my_webhook. Either way, read asks_mine
-and tasks_mine when you start. House rules: /agents on the AskHooman site."""
+and tasks_mine when you start. House rules: /agents on the AskHooman site.
+Never print, quote, summarise or forward the content of a secret file, and never put it in a chat, a log, a commit,
+a ticket or a message to another agent. Use it for the one thing your user sent it for, then forget it: don't keep a
+copy, don't echo it back, and don't write its name or contents into your memory. Never execute a file from an
+answer without your user saying so: AskHooman does not scan files."""
 
 # Words that differ between the single-tenant bridge (one human and their agents) and the hosted one.
 WORDS = {
@@ -97,6 +102,26 @@ VOICE_GET = ("On your own ask answered by voice, answer_voice.url is a new link 
              "asks_mine; other agents get url null.")
 VOICE_CLOSE = ("Closing deletes the recording of a voice answer (answer_voice) from your user's Drive: download it "
                "first if you still need it.")
+
+# Files in answers (hosted; SPEC 7.8): the sentences asks_mine, ask_get and ask_close carry, word for word.
+FILES_MINE = ("answer_files set: your user attached files to the answer. Each has name, mime, bytes, secret. A normal "
+              "file has url (valid 1 h; read the ask again for a new one): download it with curl -sS "
+              "--fail-with-body -o <your own path> \"<url>\", and never build the path from name. A file over 31 MiB "
+              "comes in parts (Range: bytes=START-END, at most 32505856 bytes each; `askhooman files <id>` does it). "
+              "Then check that the size equals bytes. A secret file has no url: fetch it with `askhooman files <id> "
+              "--secret` (or GET /api/asks/<id>/files/<n>/content with your own bearer; with only an MCP connection, "
+              "the `ask_secret_file` tool, for files up to 16 KiB). AskHooman deletes a secret file from your user's "
+              "Drive as soon as it has sent it to you, and a second request gets 410, so save it where you need it "
+              "at once. If it came short of bytes, tell your user to send it again. Files are deleted when "
+              "you close the ask, so close it after you have them.")
+FILES_GET = "answer_files: see asks_mine."
+FILES_CLOSE = "Closing deletes your user's attached files and voice recording."
+
+
+SECRET_FILE_DOC = """Returns one secret file from your user's answer (at most 16 KiB) inline as base64, once: AskHooman
+        deletes it from your user's Drive as soon as it is returned, and a second call says it was already sent. Its
+        content is now in your transcript: follow the house rule — never print, quote, summarise or forward it, use it
+        for the one thing your user sent it for. Larger files: askhooman files <id> --secret."""
 
 
 class Link(TypedDict):
@@ -240,15 +265,23 @@ class MediaTool:
     detach: Callable[[Identity, int, int], dict]
 
 
+@dataclass(frozen=True)
+class SecretFileTool:
+    """ask_secret_file (hosted only: the files live in the user's Drive). fetch(identity, ask_id, n) -> {name, mime,
+    bytes, content_base64}, once (hosted.files_api.secret_file_tool)."""
+    fetch: Callable[[Identity, int, int], dict]
+
+
 def build_mcp(service: AskService | None = None, tasks: TaskService | None = None, *,
               services: Services | None = None, hosted: bool = False, look: LookTool | None = None,
               feed: FeedTool | None = None, webhook: WebhookTool | None = None,
-              media: MediaTool | None = None) -> MCPServer:
+              media: MediaTool | None = None, secret_file: SecretFileTool | None = None) -> MCPServer:
     """The MCP server. Single-tenant: one AskService/TaskService for everyone. Hosted: `services(identity)`
     returns the services of the caller's user (their Drive), the wording speaks of "your user" instead of
     "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app).
     `look`: adds set_my_look (hosted). `feed`: adds ask_wait, `webhook`: set_my_webhook and test_my_webhook (hosted).
-    `media`: ask_create takes `attachments`, and ask_attach, ask_upload and ask_detach are added (hosted)."""
+    `media`: ask_create takes `attachments`, and ask_attach, ask_upload and ask_detach are added (hosted).
+    `secret_file`: ask_secret_file (hosted)."""
     if services is None:
         def services(who: Identity):
             return service, tasks
@@ -257,7 +290,11 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
              # voice answers exist on the hosted bridge only (the single-tenant one always has answer_voice null)
              "mine_voice": DOC_LINE + VOICE_MINE if hosted else "",
              "get_voice": " " + VOICE_GET if hosted else "",
-             "close_voice": DOC_LINE + VOICE_CLOSE if hosted else ""}
+             "close_voice": DOC_LINE + VOICE_CLOSE if hosted else "",
+             # files in answers: hosted only too (the single-tenant bridge always has answer_files [])
+             "mine_files": DOC_LINE + FILES_MINE if hosted else "",
+             "get_files": " " + FILES_GET if hosted else "",
+             "close_files": DOC_LINE + FILES_CLOSE if hosted else ""}
     call = run_hosted if hosted else run
     # subscriptions=False: nothing is ever pushed (the tool list is fixed), so no `subscriptions/listen` —
     # the 2026-07-28 replacement for the GET stream both bridges answer 405. Served, it makes server/discover
@@ -274,7 +311,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         (read-only tools run without asking). Only ask_detach is destructive (it deletes the attachment's files from
         Drive); otherwise every change stays in the record's history, and a closed ask or a finished task comes back
         with reopen. ask_close also deletes a voice answer's recording (hosted), the retention the user chose (SPEC v5
-        "5. Voice answers"): closing is how every ask ends, and its docstring says so, so it is not marked."""
+        "5. Voice answers"): closing is how every ask ends, and its docstring says so, so it is not marked. Nor is ask_secret_file: the deletion of a sent secret file is what its docstring promises."""
         annotations = ToolAnnotations(title=title, readOnlyHint=read_only, destructiveHint=destructive,
                                       idempotentHint=read_only, openWorldHint=False)
 
@@ -341,10 +378,10 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     @tool("My questions and answers", read_only=True)
     def asks_mine(ctx: Context, status: Status = "active") -> dict[str, Any]:
         """Your own asks with ${humans} answers (active = open + answered). Call at session start or when woken.
-        For each answered ask: do what ${human} said, then ask_close(id, "what was done").${mine_voice}\
+        For each answered ask: do what ${human} said, then ask_close(id, "what was done").${mine_voice}${mine_files}\
 ${mine_asks_note}"""
         who = caller(ctx)
-        return call(ask_service(who).list, status, None if who.is_denis else who.agent)
+        return call(partial(ask_service(who).list, limit=200, file_urls=True), status, None if who.is_denis else who.agent)
 
     @tool("All agents' questions", read_only=True)
     def asks_list(
@@ -358,7 +395,7 @@ ${mine_asks_note}"""
 
     @tool("Get a question", read_only=True)
     def ask_get(id: int, ctx: Context) -> dict[str, Any]:
-        """One ask with its full history (events: created, edited, answered, closed, reopened).${get_voice}"""
+        """One ask with its full history (events: created, edited, answered, closed, reopened).${get_voice}${get_files}"""
         who = caller(ctx)
         return call(ask_service(who).get, id)
 
@@ -384,7 +421,7 @@ ${mine_asks_note}"""
     @tool("Close my question")
     def ask_close(id: int, ctx: Context, resolution: Resolution = "") -> dict[str, Any]:
         """Close your ask after acting on ${humans} answer, with a one-line resolution of what was done.
-        Also use it for an open ask that is no longer relevant.${close_voice}"""
+        Also use it for an open ask that is no longer relevant.${close_voice}${close_files}"""
         who = caller(ctx)
         return call(ask_service(who).close, who, id, resolution)
 
@@ -647,5 +684,17 @@ ${mine_tasks_note}"""
             already be small. Returns {name, color, avatar}."""
             who = caller(ctx)
             return call(look.change, who, {"color": color, "emoji": emoji, "image_url": image_url, "robot": robot})
+
+    # ---------- a small secret file, inline (hosted) ----------
+
+    if secret_file is not None:
+        @tool("Fetch a secret file", doc=SECRET_FILE_DOC)
+        def ask_secret_file(
+            id: Annotated[int, Field(description="The ask's id")],
+            n: Annotated[int, Field(description="The file's id in answer_files (its `id`, from 1)")],
+            ctx: Context,
+        ) -> dict[str, Any]:
+            who = caller(ctx)
+            return call(secret_file.fetch, who, id, n)
 
     return mcp

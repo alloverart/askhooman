@@ -5,6 +5,7 @@ import json
 import logging
 import sqlite3
 import time
+import tracemalloc
 
 import httpx
 import pytest
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from server.app import create_app
 from server.config import Settings
-from server.drive import FILE_FIELDS, MULTIPART_MAX, DriveClient, DriveError, parse_name
+from server.drive import FILE_FIELDS, MULTIPART_MAX, DriveBlocked, DriveClient, DriveError, parse_name
 from server.notify import answer_text, close_text, reopen_text
 
 from .conftest import ALLEN, DENIS, auth
@@ -71,14 +72,15 @@ def get(client, ask_id) -> dict:
 
 def assert_mirrored(client, fake, ask_id, rev=None) -> dict:
     """The file holds exactly what REST returns (ask + events), written by the bridge. `attachments` and
-    `answer_voice` are the REST fields the single-tenant mirror doesn't write: always [] and null here (SPEC v5 step 4
+    `answer_voice` and `answer_files` are the REST fields the single-tenant mirror doesn't write: always [] and null here (SPEC v5 step 4
     and "5. Voice answers", hosted only), the apps read a missing one as [] or null, and a file that has one keeps it
     like any field the bridge doesn't know."""
     ask = get(client, ask_id)
     assert ask.pop("attachments") == [] and ask.pop("answer_voice") is None
+    assert ask.pop("answer_files") == []
     file = fake.file(f"ask-{ask_id}.json")
     doc = json.loads(file["content"])
-    assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "writer", "attachments", "answer_voice")} == ask
+    assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "writer", "attachments", "answer_voice", "answer_files")} == ask
     assert (doc["schema"], doc["writer"]) == (1, "bridge")
     assert file["appProperties"] == {"ask_id": str(ask_id), "status": ask["status"], "agent": ask["agent"],
                                      "rev": str(doc["rev"])}
@@ -205,7 +207,7 @@ def test_app_answer_is_replayed_as_denis(dclient, fake, sender, notifier):
     assert (replayed["status"], replayed["answer"]) == ("answered", "Да, шей")
     assert [(e["kind"], e["actor"]) for e in replayed["events"]] == [("created", "allen"), ("answered", "denis")]
     assert replayed["events"][-1]["payload"] == {"answer": "Да, шей", "previous_answer": None, "voice": None,
-                                                 "previous_voice": None}
+                                                 "previous_voice": None, "files": [], "previous_files": []}
     assert notifier.flush()
     assert sender.texts == [answer_text(replayed)]
     assert_mirrored(dclient, fake, ask["id"], rev=3)  # app rev 2 + 1: the file converged to the bridge
@@ -785,3 +787,192 @@ def test_app_task_reply_on_a_task_finished_meanwhile_is_skipped(dclient, fake, s
     assert after["status"] == "done" and [e["kind"] for e in after["events"]] == ["created", "done"]
     doc = assert_task_mirrored(dclient, fake, task["id"])   # rewritten from SQLite
     assert doc["status"] == "done"
+
+
+# ---------- stream_media (SPEC 7.4: a normal file streams in 1 MiB chunks) ----------
+
+MIB = 1024 * 1024
+
+
+def test_stream_media_chunks_and_range(fake, drive_client):
+    raw = media_bytes(5 * MIB)
+    file_id = fake.add("big.bin", raw, mime="application/pdf")
+    chunks = list(drive_client.stream_media(file_id))
+    assert [len(c) for c in chunks] == [MIB] * 5 and b"".join(chunks) == raw
+    call = fake.calls("GET", f"/drive/v3/files/{file_id}")[-1]
+    assert call[2] == {"alt": "media"}
+    assert fake.headers[-1].get("range") is None and fake.headers[-1]["accept-encoding"] == "identity"
+    rest = list(drive_client.stream_media(file_id, start=MIB + 5))
+    assert fake.headers[-1]["range"] == f"bytes={MIB + 5}-"
+    assert b"".join(rest) == raw[MIB + 5:] and [len(c) for c in rest[:-1]] == [MIB] * (len(rest) - 1)
+
+
+
+def test_stream_media_closed_range_header(fake, drive_client, drive_files):
+    """Task 11: `end` given asks Drive for exactly bytes=start-end (also from 0), and the answer must be that range."""
+    raw = media_bytes(3 * MIB)
+    file_id = fake.add("big.bin", raw, mime="application/pdf")
+    part = list(drive_client.stream_media(file_id, start=MIB + 5, end=2 * MIB + 9))
+    assert fake.headers[-1]["range"] == f"bytes={MIB + 5}-{2 * MIB + 9}"
+    assert b"".join(part) == raw[MIB + 5:2 * MIB + 10] and [len(c) for c in part] == [MIB, 5]
+    first = list(drive_client.stream_media(file_id, end=9))  # from the first byte: a Range all the same
+    assert fake.headers[-1]["range"] == "bytes=0-9" and b"".join(first) == raw[:10]
+    list(drive_client.stream_media(file_id))
+    assert fake.headers[-1].get("range") is None  # no end, no start: unchanged
+
+    ranges = {"/short": "bytes 0-4/10", "/other": "bytes 1-9/10", "/ok": "bytes 0-9/20"}
+
+    def handler(request):
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        path = request.url.path.removeprefix("/drive/v3/files")
+        if path == "/whole":
+            return httpx.Response(200, content=b"x" * 10)  # the Range was ignored
+        return httpx.Response(206, stream=httpx.ByteStream(b"x" * 10), headers={"Content-Range": ranges[path]})
+    client = make_client(fake, *drive_files)
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    for bad in ("short", "other"):  # not the range asked for: refused before any byte
+        with pytest.raises(DriveError, match="Content-Range") as raised:
+            client.stream_media(bad, end=9)
+        assert not raised.value.transient
+    with pytest.raises(DriveError, match="Range"):
+        client.stream_media("whole", end=9)
+    assert b"".join(client.stream_media("ok", end=9)) == b"x" * 10
+
+
+def test_stream_media_peak_memory(fake, drive_client):
+    file_id = fake.add("huge.bin", bytes(100 * MIB))  # built before tracing starts
+    total = 0
+    tracemalloc.start()
+    try:
+        for chunk in drive_client.stream_media(file_id):
+            total += len(chunk)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert total == 100 * MIB
+    assert peak < 8 * MIB, peak
+
+
+def test_stream_media_403_abusive_is_blocked(fake, drive_client):
+    file_id = fake.add("bad.bin", b"x")
+    fake.fail_next("GET", f"/drive/v3/files/{file_id}", 403, reason="cannotDownloadAbusiveFile")
+    with pytest.raises(DriveBlocked) as raised:
+        drive_client.stream_media(file_id)
+    assert raised.value.status == 403 and not raised.value.transient and raised.value.reason == "cannotDownloadAbusiveFile"
+
+
+@pytest.mark.parametrize("reason", ["somethingElse", "", "quotaExceeded", "dailyLimitExceeded", "downloadQuotaExceeded"])
+def test_stream_media_403_for_any_other_reason_is_not_a_block(fake, drive_client, reason):
+    """Final review I4: only a reason Drive says is permanent for the file (BLOCK_REASONS) is DriveBlocked."""
+    file_id = fake.add("ok.bin", b"x")
+    fake.fail_next("GET", f"/drive/v3/files/{file_id}", 403, reason=reason)
+    with pytest.raises(DriveError) as raised:
+        drive_client.stream_media(file_id)
+    assert not isinstance(raised.value, DriveBlocked) and raised.value.status == 403
+
+
+def test_stream_media_rate_limit_403_is_transient(fake, drive_client):
+    file_id = fake.add("ok.bin", b"x")
+    for reason in ("userRateLimitExceeded", "rateLimitExceeded"):
+        fake.fail_next("GET", f"/drive/v3/files/{file_id}", 403, reason=reason)
+        with pytest.raises(DriveError) as raised:
+            drive_client.stream_media(file_id)
+        assert raised.value.transient and not isinstance(raised.value, DriveBlocked)
+
+
+def test_stream_media_errors_and_token_refresh(fake, drive_client):
+    with pytest.raises(DriveError) as raised:
+        drive_client.stream_media("nope")
+    assert raised.value.status == 404 and not raised.value.transient
+    file_id = fake.add("a.bin", b"abc")
+    assert b"".join(drive_client.stream_media(file_id)) == b"abc"
+    fake.valid_tokens.clear()  # the access token expired: one refresh, then the stream
+    assert b"".join(drive_client.stream_media(file_id)) == b"abc" and fake.token_calls == 2
+    fake.fail_next("GET", f"/drive/v3/files/{file_id}", 503)
+    with pytest.raises(DriveError) as raised:
+        drive_client.stream_media(file_id)
+    assert raised.value.transient
+    fake.down = True
+    with pytest.raises(DriveError) as raised:
+        drive_client.stream_media(file_id)
+    assert raised.value.transient and REFRESH_TOKEN not in str(raised.value)
+
+
+def test_stream_media_refuses_compressed_and_ignored_range(fake, drive_files):
+    def handler(request):
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        if request.url.path.endswith("/gz"):
+            return httpx.Response(200, stream=httpx.ByteStream(b"zz"), headers={"Content-Encoding": "gzip"})
+        return httpx.Response(200, content=b"whole file")  # a Range header answered with 200: Drive ignored it
+    client = make_client(fake, *drive_files)
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(DriveError, match="compressed"):
+        client.stream_media("gz")
+    with pytest.raises(DriveError, match="Range") as raised:
+        client.stream_media("plain", start=10)
+    assert not raised.value.transient
+
+
+def test_stream_media_close_releases_the_connection(fake, drive_client):
+    file_id = fake.add("c.bin", bytes(3 * MIB))
+    stream = drive_client.stream_media(file_id)
+    response = stream._response
+    assert len(next(stream)) == MIB and not response.is_closed
+    stream.close()
+    assert response.is_closed and list(stream) == []
+    with drive_client.stream_media(file_id) as stream:  # the context manager closes too
+        response = stream._response
+        next(stream)
+    assert response.is_closed
+    stream = drive_client.stream_media(file_id)
+    response = stream._response
+    assert len(list(stream)) == 3 and response.is_closed  # exhaustion closes
+
+
+def test_stream_media_error_mid_body_closes_and_is_transient(fake, drive_files):
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"abc"
+            raise httpx.ReadError("connection reset")
+
+    def handler(request):
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        return httpx.Response(200, stream=Broken())
+    client = make_client(fake, *drive_files)
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    stream = client.stream_media("x")
+    response = stream._response
+    with pytest.raises(DriveError) as raised:  # the 3 bytes are still being gathered into a chunk when it breaks
+        next(stream)
+    assert raised.value.transient and response.is_closed
+
+
+def test_stream_media_checks_content_range_and_error_body_reads(fake, drive_files):
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            raise httpx.ReadError("reset while reading the error")
+            yield b""
+
+    ranges = {"/a": "bytes 5-9/10", "/b": "bytes 0-9/10", "/c": "bytes 10-19/*", "/d": None, "/ok": "bytes 10-19/20"}
+
+    def handler(request):
+        if request.url.host == "oauth2.googleapis.com":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        path = request.url.path.removeprefix("/drive/v3/files")
+        if path == "/err":
+            return httpx.Response(500, stream=Broken())
+        headers = {"Content-Range": ranges[path]} if ranges[path] else {}
+        return httpx.Response(206, stream=httpx.ByteStream(b"x" * 10), headers=headers)
+    client = make_client(fake, *drive_files)
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    for bad in "abcd":  # wrong start, wrong start, no total, no header
+        with pytest.raises(DriveError, match="Content-Range") as raised:
+            client.stream_media(bad, start=10)
+        assert not raised.value.transient
+    assert b"".join(client.stream_media("ok", start=10)) == b"x" * 10
+    with pytest.raises(DriveError) as raised:
+        client.stream_media("err")
+    assert raised.value.transient

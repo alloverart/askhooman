@@ -108,3 +108,84 @@ def test_delete_account_of_an_app_only_user(hosted, google):
     assert google.revocations == []
     assert held_for(hosted.store, DENIS_SUB) == {c: 0 for c in (*USER_COLLECTIONS, "users")}
     assert hosted.delete("/api/me", headers=id_token(google)).status_code == 404
+
+
+def test_delete_user_removes_claims(hosted, google):
+    """The claims of a secret file (SPEC 7.4) carry their user: Delete Account removes them with the rest."""
+    store = hosted.store
+    connect(hosted, google, register(hosted)["client_id"])
+    store.put("fileclaims", "c1", {"user": DENIS_SUB, "ask_id": 1, "state": "done"})
+    store.put("fileclaims", "c2", {"user": OLGA_SUB, "ask_id": 1, "state": "held"})
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    assert set(store.all("fileclaims")) == {"c2"}
+
+
+# ---------- fix round 2: M7 (the answer files go from the user's Drive before the grant does) ----------
+
+def put_answer_file(drive, ask_id, n, secret=False, **props):
+    marks = {"ask_id": str(ask_id), "kind": "file", "file": str(n), "secret": "1" if secret else "0", **props}
+    return drive.add(f"afile-{ask_id}-{n}-1700000000000", b"Q3 report", marks, mime="application/octet-stream")
+
+
+def test_delete_account_deletes_the_answer_files_in_the_users_drive_first(hosted, google):
+    connect(hosted, google, register(hosted)["client_id"])
+    drive = google.drive(DENIS_SUB)
+    mine = [put_answer_file(drive, 1, 1), put_answer_file(drive, 1, 2, secret=True), put_answer_file(drive, 4, 1)]
+    others = [
+        drive.add("afile-9-1-1700000000000", b"x", {}),  # no marks: not ours
+        drive.add("afile-9-2-1700000000000", b"x", {"kind": "voice", "ask_id": "9", "file": "2"}),
+        drive.add("afile-9-3-1700000000000", b"x", {"kind": "file", "ask_id": "8", "file": "3"}),  # another ask's marks
+        drive.add("ask-1.json", {"id": 1}, {"ask_id": "1"}),
+    ]
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    assert not any(file_id in drive.files for file_id in mine)
+    assert all(file_id in drive.files for file_id in others)  # the asks and everything not marked stay
+    assert len(google.revocations) == 1  # and the grant went after the files
+
+
+def test_delete_account_goes_on_when_drive_does_not_answer(hosted, google, caplog):
+    connect(hosted, google, register(hosted)["client_id"])
+    drive = google.drive(DENIS_SUB)
+    kept = put_answer_file(drive, 1, 1)
+    drive.down = True
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    drive.down = False
+    assert kept in drive.files  # the user can remove the app data in Google's settings (the policy says so)
+    assert held_for(hosted.store, DENIS_SUB) == {c: 0 for c in (*USER_COLLECTIONS, "users")}
+    assert "Q3 report" not in caplog.text and "afile-" not in caplog.text
+
+
+def test_delete_account_counts_and_logs_the_files_left_past_the_cap(hosted, google, monkeypatch, caplog):
+    import logging
+    from server.hosted import sweep as sweep_module
+    connect(hosted, google, register(hosted)["client_id"])
+    drive = google.drive(DENIS_SUB)
+    files = [put_answer_file(drive, 1, n) for n in range(1, 6)]
+    monkeypatch.setattr(sweep_module, "PURGE_LIMIT", 2)
+    caplog.set_level(logging.INFO)
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    assert sum(f in drive.files for f in files) == 3
+    assert "2 answer files deleted from Drive, 0 not, 3 left past the cap" in caplog.text
+    assert "afile-" not in caplog.text and "Q3 report" not in caplog.text
+
+
+def test_purge_says_how_many_it_left():
+    from server.hosted.sweep import purge_answer_files
+    class NoDrive:
+        def records(self, user):
+            raise RuntimeError("no grant")
+    assert purge_answer_files(NoDrive(), "u") == (0, 1, 0, False)
+
+
+def test_delete_account_says_at_least_when_the_listing_was_cut(hosted, google, monkeypatch, caplog):
+    import logging
+    from server.hosted import sweep as sweep_module
+    connect(hosted, google, register(hosted)["client_id"])
+    drive = google.drive(DENIS_SUB)
+    for n in range(1, 6):
+        put_answer_file(drive, 1, n)
+    hosted.app.state.pool.client(DENIS_SUB).max_files = 3  # Drive has five, we see three
+    monkeypatch.setattr(sweep_module, "PURGE_LIMIT", 2)
+    caplog.set_level(logging.INFO)
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    assert "2 answer files deleted from Drive, 0 not, at least 2 left past the cap" in caplog.text

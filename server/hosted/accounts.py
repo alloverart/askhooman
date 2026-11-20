@@ -186,7 +186,7 @@ class Accounts:
     def delete_user(self, sub: str) -> bool:
         """Delete Account: forget the user and everything kept for them here: their agents (names, clients,
         webhooks and encrypted webhook secrets), OAuth access and refresh tokens, unredeemed authorization codes,
-        agent keys, pending sign-ins, unused upload tokens (uploads.py), and last the user document (email,
+        agent keys, pending sign-ins, unused upload tokens (uploads.py), the claims of their secret files (fileclaims, each carries its user), and last the user document (email,
         encrypted Google refresh token, id counters). False if there was nothing to delete. The asks and tasks in
         their Drive are not touched, nor the pictures of their asks: they are the user's files. Revoking the Google
         grant is the caller's job (read google_refresh first).
@@ -201,7 +201,7 @@ class Accounts:
             self.store.put("families", family, {"revoked": True, "revoked_at": utc_now(),
                                                 "expires_at": self.clock() + self.settings.refresh_ttl})
         removed: dict[str, int] = {}
-        for collection in ("agents", "tokens", "codes", "keys", "requests", "uploads"):
+        for collection in ("agents", "tokens", "codes", "keys", "requests", "uploads", "fileclaims"):
             for key, _ in self.store.find(collection, "user", sub):
                 self.store.delete(collection, key)
                 removed[collection] = removed.get(collection, 0) + 1

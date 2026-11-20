@@ -4,7 +4,9 @@ Implements just what server/drive.py uses: token refresh, files.list (q, paging)
 and alt=media), multipart create (JSON or binary content) and multipart PATCH, resumable uploads (a session POST
 with the metadata, then one PUT of all the bytes to the session's Location) and files.delete. `name contains 'x'`
 matches names that start with x, as Drive's prefix matching of name terms does (so 'ask-' does not find task-1.json).
-Every request is recorded; `down` simulates an outage, `fail_next` refuses one chosen request.
+files.get alt=media streams the body in 64 KiB pieces (never one big copy) and honours `Range: bytes=N-` and
+`bytes=N-M` (206 with Content-Range; an end past the file is clamped to its last byte). Every request is recorded
+(`requests`, and `headers` for the request headers); `down` simulates an outage, `fail_next` refuses one chosen request.
 `app_action` plays the Swift app: a read-modify-write of a file as the human (SPEC "Who writes what").
 """
 
@@ -49,17 +51,29 @@ def parse_multipart(request: httpx.Request) -> tuple[dict, bytes, str]:
     return json.loads(metadata), content, head.removeprefix(b"Content-Type: ").decode()
 
 
+class _Pieces(httpx.SyncByteStream):
+    """A response body made of 64 KiB slices of `content`, copied one at a time."""
+
+    def __init__(self, content: memoryview):
+        self.content = content
+
+    def __iter__(self):
+        for at in range(0, len(self.content), 65536):
+            yield bytes(self.content[at:at + 65536])
+
+
 class FakeDrive:
     def __init__(self, page_size: int = 1000):
         self.files: dict[str, dict] = {}  # id -> {id, name, mimeType, parents, appProperties, modifiedTime, content, trashed}
         self.requests: list[tuple[str, str, dict]] = []  # (method, path, query params)
+        self.headers: list[dict] = []  # the request headers of each recorded request, same order
         self.down = False
         self.page_size = page_size
         self.valid_tokens: set[str] = set()
         self.token_calls = 0
         self.refresh_error: tuple[int, dict] | None = None
         self.sessions: dict[str, dict] = {}  # upload_id -> {metadata, mime, length, fields}: resumable uploads begun
-        self.failures: list[list] = []  # [method, path_prefix, status, after]: see fail_next
+        self.failures: list[list] = []  # [method, path_prefix, status, after, reason]: see fail_next
         self.lock = threading.RLock()
         self._ids = 0
         self._sessions = 0
@@ -72,14 +86,21 @@ class FakeDrive:
         return self._clock.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
     def add(self, name: str, content, app_properties: dict | None = None, parents=("appDataFolder",),
-            mime: str = "application/json") -> str:
+            mime: str = "application/json", created: float | str | None = None) -> str:
+        """`created`: Drive's createdTime, an epoch or an ISO string (default: the real now)."""
+        if created is None:
+            created = datetime.now(timezone.utc).timestamp()
+        if not isinstance(created, str):
+            created = datetime.fromtimestamp(created, timezone.utc).isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z")
         with self.lock:
             self._ids += 1
             file_id = f"file{self._ids:03d}"
             raw = content if isinstance(content, bytes) else json.dumps(content, ensure_ascii=False).encode()
             self.files[file_id] = {"id": file_id, "name": name, "mimeType": mime,
                                    "parents": list(parents), "appProperties": dict(app_properties or {}),
-                                   "modifiedTime": self._tick(), "content": raw, "trashed": False}
+                                   "modifiedTime": self._tick(), "createdTime": created, "content": raw,
+                                   "trashed": False}
             return file_id
 
     def write(self, file_id: str, doc: dict, app_properties: dict) -> None:
@@ -109,12 +130,13 @@ class FakeDrive:
         with self.lock:
             return [r for r in self.requests if (method is None or r[0] == method) and r[1].startswith(path_prefix)]
 
-    def fail_next(self, method: str, path_prefix: str, status: int, after: int = 0) -> None:
+    def fail_next(self, method: str, path_prefix: str, status: int, after: int = 0, reason: str = "") -> None:
         """Refuse one request with HTTP `status` (Drive's error shape, nothing applied): the next authorized request
         with this method whose path starts with path_prefix, after letting `after` such requests through.
+        `reason`: Drive's errors[0].reason (e.g. cannotDownloadAbusiveFile on a 403).
         Several failures queue up in the order they were set; a request counts only for the first one it matches."""
         with self.lock:
-            self.failures.append([method, path_prefix, status, after])
+            self.failures.append([method, path_prefix, status, after, reason])
 
     def _injected(self, method: str, path: str) -> httpx.Response | None:
         for failure in self.failures:
@@ -125,6 +147,8 @@ class FakeDrive:
                 self.failures.remove(failure)
                 status = failure[2]
                 error = {"code": status, "message": f"fake: injected HTTP {status}"}
+                if failure[4]:
+                    error["errors"] = [{"reason": failure[4]}]
                 return httpx.Response(status, json={"error": error})
         return None
 
@@ -140,6 +164,7 @@ class FakeDrive:
             url = request.url
             params = dict(url.params)
             self.requests.append((request.method, url.path, params))
+            self.headers.append(dict(request.headers))
             if url.host == "oauth2.googleapis.com":
                 return self._token(request)
             if request.headers.get("authorization", "").removeprefix("Bearer ") not in self.valid_tokens:
@@ -152,7 +177,7 @@ class FakeDrive:
                 return self._list(params)
             match = re.fullmatch(r"/drive/v3/files/([^/]+)", path)
             if request.method == "GET" and match:
-                return self._get(match.group(1), params)
+                return self._get(match.group(1), params, request.headers.get("range"))
             if request.method == "DELETE" and match:
                 return self._delete(match.group(1))
             if request.method == "POST" and path == "/upload/drive/v3/files":
@@ -188,7 +213,9 @@ class FakeDrive:
     def _list(self, params: dict) -> httpx.Response:
         assert params.get("spaces") == "appDataFolder", params
         assert params.get("fields") in ("nextPageToken,files(id,name,appProperties,modifiedTime)",  # single-tenant
-                                        "nextPageToken,files(id,name,appProperties,modifiedTime,size)"), params
+                                        "nextPageToken,files(id,name,appProperties,modifiedTime,size)",
+                                        "nextPageToken,files(id,name,appProperties,modifiedTime,size,createdTime)"
+                                        ), params
         query = params.get("q", "")
         exact = re.fullmatch(r"name = '([^']*)' and trashed = false", query)
         terms = re.findall(r"name contains '([^']*)'", query)
@@ -211,13 +238,27 @@ class FakeDrive:
             body["nextPageToken"] = str(start + size)
         return httpx.Response(200, json=body)
 
-    def _get(self, file_id: str, params: dict) -> httpx.Response:
+    def _get(self, file_id: str, params: dict, request_range: str | None = None) -> httpx.Response:
         file = self.files.get(file_id)
         if file is None:
             return httpx.Response(404, json={"error": {"code": 404, "message": f"File not found: {file_id}."}})
         if params.get("alt") == "media":
-            return httpx.Response(200, content=file["content"], headers={"Content-Type": file["mimeType"]})
+            return self._media(file, request_range)
         return httpx.Response(200, json=self._fields(file, params.get("fields")))
+
+    @staticmethod
+    def _media(file: dict, request_range: str | None) -> httpx.Response:
+        content, headers, status = memoryview(file["content"]), {"Content-Type": file["mimeType"]}, 200
+        if request_range:
+            found = re.fullmatch(r"bytes=(\d+)-(\d*)", request_range)
+            start = int(found.group(1))
+            end = min(int(found.group(2)), len(content) - 1) if found.group(2) else len(content) - 1
+            if start >= len(content) or end < start:
+                return httpx.Response(416, json={"error": {"code": 416, "message": "fake: range not satisfiable"}})
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(content)}"
+            content, status = content[start:end + 1], 206
+        headers["Content-Length"] = str(len(content))
+        return httpx.Response(status, headers=headers, stream=_Pieces(content))
 
     def _create(self, request: httpx.Request, params: dict) -> httpx.Response:
         if params.get("uploadType") == "resumable":

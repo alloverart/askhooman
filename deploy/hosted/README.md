@@ -40,7 +40,7 @@ gcloud services enable run.googleapis.com firestore.googleapis.com secretmanager
 
 # 2. Firestore in Native mode, and TTL for documents that expire (the server writes the expire_time field)
 gcloud firestore databases create --location=$REGION --type=firestore-native
-for c in requests codes tokens families clients uploads; do
+for c in requests codes tokens families clients uploads fileclaims; do
   gcloud firestore fields ttls update expire_time --collection-group=$c --enable-ttl --async
 done
 
@@ -66,13 +66,22 @@ gcloud builds submit --config deploy/hosted/cloudbuild.yaml --ignore-file deploy
 
 # 6. The service
 gcloud run deploy qtracker --image=$IMAGE --region=$REGION --service-account=$SA \
-  --allow-unauthenticated --no-cpu-throttling --min-instances=0 --max-instances=3 --concurrency=1000 --memory=512Mi \
-  --set-env-vars=ASKS_PUBLIC_URL=https://<PUBLIC_HOST>,ASKS_GOOGLE_APP_CLIENT_IDS=<APP_CLIENT_ID>,ASKS_FIRESTORE_PROJECT=$PROJECT \
+  --allow-unauthenticated --no-cpu-throttling --min-instances=0 --max-instances=3 --concurrency=1000 --timeout=900 --memory=512Mi \
+  --set-env-vars=ASKS_PUBLIC_URL=https://<PUBLIC_HOST>,ASKS_SWEEP_SERVICE_ACCOUNT=$SA,ASKS_GOOGLE_APP_CLIENT_IDS=<APP_CLIENT_ID>,ASKS_FIRESTORE_PROJECT=$PROJECT \
   --set-secrets=ASKS_GOOGLE_WEB_CLIENT=qtracker-google-web-client:latest,ASKS_ENCRYPTION_KEY=qtracker-encryption-key:latest
 
 # 7. Domain (the domain must be verified for your Google account: gcloud domains verify <your domain>)
 gcloud beta run domain-mappings create --service=qtracker --domain=<PUBLIC_HOST> --region=$REGION
 gcloud beta run domain-mappings describe --domain=<PUBLIC_HOST> --region=$REGION
+```
+
+```bash
+# 8. The hourly sweep of answer files (SPEC 7.6): Cloud Scheduler calls POST /internal/sweep with an OIDC ID token of $SA.
+# The service stays public (--allow-unauthenticated, no roles/run.invoker): the route checks the token itself
+# (audience = ASKS_PUBLIC_URL, email = ASKS_SWEEP_SERVICE_ACCOUNT).
+gcloud scheduler jobs create http askhooman-sweep --location=$REGION --schedule="0 * * * *" --time-zone=UTC \
+  --uri=https://<PUBLIC_HOST>/internal/sweep --http-method=POST --attempt-deadline=900s \
+  --oidc-service-account-email=$SA --oidc-token-audience=https://<PUBLIC_HOST>
 ```
 
 At your DNS provider: `CNAME <PUBLIC_HOST> → ghs.googlehosted.com`. If the zone is on Cloudflare, the record must be **DNS only** (not proxied), or Google cannot issue the certificate. The certificate appears within 15–60 minutes; `domain-mappings describe` shows its status.
@@ -83,6 +92,7 @@ Why these flags:
 - `--no-cpu-throttling`: webhooks to agents and their retries (5 s, 30 s, 2 min) run in the background after the response. With throttling, the background thread stalls until the next request. Cost: the instance is billed while it is alive (up to ~15 minutes after the last request).
 - `--max-instances=3`: rate limits are counted per instance, so their overall ceiling grows with the number of instances.
 - `--concurrency=1000`: agents waiting for their user hold a request for up to 50 s (`GET /api/agent/events`, `ask_wait`, the Claude Code plugin, `asks.py listen`), essentially all the time. With the default of 80 per instance, about 240 listening agents would take every slot and stall the apps; held polls use no CPU. One agent holds at most 4 polls per instance. The deploy workflow sets it on every rollout. Cost: while any agent listens, an instance stays alive (billed all the time with `--no-cpu-throttling`).
+- `--timeout=900`: a download of a file in an answer may take up to 15 minutes (`REQUEST_TIMEOUT`, SPEC 7.4), and the hourly sweep runs slices of users for up to 10 minutes in one request. The deploy workflow sets it on every rollout.
 - `--memory=512Mi`: pictures, video and voice recordings pass through memory. An instance has 4 media slots; a fetch, an upload or an agent's download of a voice answer (`GET /media/v1/…`, at most 5 MB) takes 1, an `ask_create` with fetched items takes 2 and may hold 40 MB, so at most 80 MB of media are in flight. That fits in 512 MiB with the Python runtime and the polls; raise `--memory` before raising the slot count or the media caps.
 - Agent webhooks and client metadata documents are accepted only on https port 443.
 
@@ -100,6 +110,39 @@ claude mcp add --scope user --transport http askhooman https://<PUBLIC_HOST>/mcp
 (`/healthz` works locally, but Cloud Run's frontend reserves paths ending in `z` and answers 404 there.)
 
 The browser opens Google sign-in, then the page "Claude Code wants to ask you questions…" with the agent name. After Allow, the agent sees `asks_mine`, `ask_create`, `tasks_mine` and the other tools, and its asks appear in the appDataFolder of that Google account.
+
+## Upgrading an existing deployment
+
+A deployment made before files in answers (SPEC section 7) has no `ASKS_SWEEP_SERVICE_ACCOUNT` and no Cloud Scheduler job.
+It keeps running, but `POST /internal/sweep` refuses everyone, so nothing deletes a secret file that nobody fetched (24 h),
+the files of an ask the app closed, or orphans. The bridge says so at every start with a WARNING in its log:
+`ASKS_SWEEP_SERVICE_ACCOUNT is not set`. Both steps are needed (placeholders: your project, region, host and the
+runtime service account of step 3 above):
+
+```bash
+PROJECT=<PROJECT>; REGION=<REGION>
+SA=qtracker-run@$PROJECT.iam.gserviceaccount.com   # the service's runtime service account (first deploy, step 3)
+
+# 1. Tell the bridge whose OIDC token may call the sweep (other variables and secrets are kept)
+gcloud run services update qtracker --region=$REGION --update-env-vars ASKS_SWEEP_SERVICE_ACCOUNT=$SA
+
+# 2. The hourly job that calls it
+gcloud services enable cloudscheduler.googleapis.com
+gcloud scheduler jobs create http askhooman-sweep --location=$REGION --schedule="0 * * * *" --time-zone=UTC \
+  --uri=https://<PUBLIC_HOST>/internal/sweep --http-method=POST --attempt-deadline=900s \
+  --oidc-service-account-email=$SA --oidc-token-audience=https://<PUBLIC_HOST>
+
+# 3. Done claims of secret files expire after 90 days (field `expire_time`): let Firestore delete them
+gcloud firestore fields ttls update expire_time --collection-group=fileclaims --enable-ttl --async
+
+# 4. Check: run it once, then look for the line "hosted sweep: {...}" in the log
+gcloud scheduler jobs run askhooman-sweep --location=$REGION
+gcloud run services logs read qtracker --region=$REGION --limit=50 | grep "hosted sweep"
+```
+
+The service must have been deployed with `--timeout=900` (the deploy workflow sets it). Every run leaves a note, `sweep/last_run`
+(when it ran and its counts, no ids or names), and `GET /api/admin/stats` returns it as `sweep` for the operator's Admin page;
+a `sweep` that is `null`, or old, means the job is not running.
 
 ## Continuous deploy from GitHub
 
@@ -133,6 +176,7 @@ Logs: `gcloud run services logs read qtracker --region=$REGION --limit=100`. Tok
 | `ASKS_CORS_ORIGINS` | optional, comma-separated: origins of a web app that calls the App API from the browser, e.g. `https://app.<PUBLIC_HOST>`; exact `https://` origins, or `http://localhost:<port>` for development. Empty (default): CORS stays closed. It opens CORS for the App API only; put the web app's OAuth client id into `ASKS_GOOGLE_APP_CLIENT_IDS` too |
 | `ASKS_ADMIN_EMAILS` | optional, comma-separated Google account emails that see the operator's stats in the web app (Admin page, `GET /api/admin/stats`). Empty (default): nobody |
 | `ASKS_INTERNAL_EMAILS` | optional, comma-separated emails or `@domain` entries of your own people: the stats show them apart from external users, and they get no sign-up ping |
+| `ASKS_SWEEP_SERVICE_ACCOUNT` | the email of the service account Cloud Scheduler signs `POST /internal/sweep` with (`$SA`). Empty (default): the route refuses everyone |
 | `ASKS_OPERATOR_TELEGRAM_CHAT`, `ASKS_OPERATOR_TELEGRAM_TOKEN` | optional: a Telegram chat id and a bot token (inline or a mounted secret file) for a ping on every new external user; the message carries no email |
 
 Local run without Google Cloud (in-memory store; Google sign-in works only if the Web client's redirect URI points at localhost):

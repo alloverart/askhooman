@@ -26,8 +26,9 @@ token is stored or logged; Cloud Run's request log keeps the path, and the token
 """
 
 import logging
+from collections.abc import Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from ..drive import DriveBadFile, DriveError, DriveNotFound
@@ -84,14 +85,16 @@ def _size(meta: dict) -> int | None:
 
 
 def add_voice_route(app: FastAPI, links: VoiceLinks, accounts: Accounts, pool: DrivePool, limiter: RateLimiter,
-                    slots: Slots) -> None:
-    """The route, on the hosted app (create_hosted_app): `slots` are the media slots of attachments (media_api)."""
+                    slots: Slots, files: Callable[[str, str | None], Response | None] | None = None) -> None:
+    """The route, on the hosted app (create_hosted_app): `slots` are the media slots of attachments (media_api).
+    `files` (files_api.add_file_routes) answers a token that is a file's link and gives None for any other."""
 
     @app.get(f"{MEDIA_PATH}{{token:path}}", include_in_schema=False)
-    def voice_recording(token: str):
+    def voice_recording(token: str, request: Request):
         sealed = links.open(token)
-        if sealed is None:
-            return _refuse(404, NO_SUCH)
+        if sealed is None:  # not a recording's link: a file's (SPEC 7.4, own context), else nothing we sealed
+            answer = files(token, request.headers.get("range")) if files is not None else None
+            return answer if answer is not None else _refuse(404, NO_SUCH)
         user = sealed["user"]
         if not limiter.allow("voice", f"{user}/{sealed['agent']}"):  # per agent: one link can't block the others
             return _refuse(429, "too many requests for recordings: at most 60 a minute per agent",
