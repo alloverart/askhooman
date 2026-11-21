@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "askhooman": {
+      "type": "http",
+      "url": "https://askhooman.com/mcp"
+    }
+  }
+}
