@@ -594,6 +594,16 @@ def llms_txt(settings: HostedSettings):
     return endpoint
 
 
+# Владение доменом для официального MCP Registry (HTTP-аутентификация, 21.11.2026, публикует Огилви по слову
+# Дениса): одна строка с ПУБЛИЧНЫМ ключом ed25519; закрытый — у публикующего. Смена ключа — только эта строка.
+MCP_REGISTRY_AUTH = "v=MCPv1; k=ed25519; p=w80uZINOCudZMbK8PvBAbJz+TqdGYuEMA3N64YsLWHo="
+
+
+async def mcp_registry_auth(request: Request) -> Response:
+    return PlainTextResponse(MCP_REGISTRY_AUTH + "\n", headers={"Cache-Control": "public, max-age=300",
+                                                                "X-Content-Type-Options": "nosniff"})
+
+
 def routes(settings: HostedSettings) -> list[Route]:
     return ([Route(f"/{name}", _file(name), methods=["GET", "HEAD"]) for name in FILES]
             + [Route("/", landing_page(settings), methods=["GET", "HEAD"]),
@@ -602,4 +612,5 @@ def routes(settings: HostedSettings) -> list[Route]:
                Route("/support", _doc_page(settings, "/support", "Support", support_html), methods=["GET", "HEAD"]),
                Route("/agents", _doc_page(settings, "/agents", "House rules for agents", agents_html),
                      methods=["GET", "HEAD"]),
-               Route("/llms.txt", llms_txt(settings), methods=["GET", "HEAD"])])
+               Route("/llms.txt", llms_txt(settings), methods=["GET", "HEAD"]),
+               Route("/.well-known/mcp-registry-auth", mcp_registry_auth, methods=["GET", "HEAD"])])
