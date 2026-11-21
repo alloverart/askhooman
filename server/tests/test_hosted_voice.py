@@ -44,12 +44,11 @@ AUDIO = b"\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00M4A mp42isom" + bytes(range(25
 # What the agents are told (SPEC "What the agent gets": the asks_mine sentence word for word).
 ASKS_MINE_VOICE = ("answer_voice set: your user answered by voice. With transcript_source on_device, answer is their "
                    "checked text. With none, answer is what they typed or the placeholder 'Voice answer (m:ss), not "
-                   "transcribed': download answer_voice.url (valid 1 h; read the ask again for a new one) and "
-                   "transcribe it, or ask them. The recording is deleted when you close the ask.")
+                   "transcribed', and answer_voice.url links to the recording (valid 1 h; reading the ask again gives "
+                   "a new link). The recording is deleted when the ask is closed.")
 ASK_GET_VOICE = ("On your own ask answered by voice, answer_voice.url is a new link to the recording (valid 1 h), "
                  "as in asks_mine; other agents get url null.")
-ASK_CLOSE_VOICE = ("Closing deletes the recording of a voice answer (answer_voice) from your user's Drive: download it "
-                   "first if you still need it.")
+ASK_CLOSE_VOICE = "Closing deletes the recording of a voice answer (answer_voice) from your user's Drive."
 LLMS_VOICE = ("- answer_voice on an answered ask: your human answered by voice; answer_voice.url (asks_mine, ask_get, "
               "GET /api/asks/{id}; valid 1 h) downloads the recording to listen to or transcribe. Closing or reopening "
               "the ask (ask_close, POST /api/asks/{id}/close or /reopen) deletes the recording.")

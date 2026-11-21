@@ -655,8 +655,10 @@ def llms_txt(settings: HostedSettings):
 - answer_voice on an answered ask: your human answered by voice; answer_voice.url (asks_mine, ask_get,
   GET /api/asks/{{id}}; valid 1 h) downloads the recording to listen to or transcribe. Closing or reopening the ask
   (ask_close, POST /api/asks/{{id}}/close or /reopen) deletes the recording.
-- answer_files on an answered ask: your human attached files; a normal file has a url (valid 1 h) to download, a secret
-  one is fetched once with `askhooman files <id> --secret` (GET /api/asks/{{id}}/files/<n>/content with your bearer).
+- answer_files on an answered ask: your human attached files; a normal file has a url (valid 1 h) to download (with a
+  shell: `curl -sS --fail-with-body -o <your own path> "<url>"`, never a path built from name; then check the size
+  equals bytes), a secret one is fetched once with `askhooman files <id> --secret` (GET
+  /api/asks/{{id}}/files/<n>/content with your bearer).
   A file over 31 MiB comes in parts (Range: bytes=START-END, at most 32505856 bytes each); `askhooman files <id>` does
   it for you. A secret file counts as sent once our server has handed it to its host: if your download then breaks,
   the file is gone, so ask your human to send it again. Closing the ask deletes the files.

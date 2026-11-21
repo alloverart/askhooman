@@ -195,7 +195,7 @@ State: `active ⇄ waiting` (via update), `active|waiting → done|dropped` (don
 
 ### MCP
 
-`task_create(title, context="", status="active", waiting_on="", next_check="", links=[], ref="")`, `tasks_mine(status="open")`, `tasks_list(status="open", agent=None)`, `task_get(id)`, `task_update(id, title=None, context=None, status=None, waiting_on=None, next_check=None, links=None, ref=None)`, `task_done(id, resolution="")`, `task_drop(id, resolution="")`, `task_reopen(id)`. Docstrings teach: create a task for work that will take more than a day or waits on someone outside; one task per piece of work; set `waiting_on` + `next_check` when blocked; check `tasks_mine()` at session start / when woken and update what moved; finish with a one-line resolution. A question that needs the human's decision is an **ask**, not a task. Agents restricted to a tool subset should get `task_create/tasks_mine/task_get/task_update/task_done` too.
+`task_create(title, context="", status="active", waiting_on="", next_check="", links=[], ref="")`, `tasks_mine(status="open")`, `tasks_list(status="open", agent=None)`, `task_get(id)`, `task_update(id, title=None, context=None, status=None, waiting_on=None, next_check=None, links=None, ref=None)`, `task_done(id, resolution="")`, `task_drop(id, resolution="")`, `task_reopen(id)`. The server instructions teach (the docstrings did until 21.11.2026): create a task for work that will take more than a day or waits on someone outside; one task per piece of work; set `waiting_on` + `next_check` when blocked; check `tasks_mine()` at session start / when woken and update what moved; finish with a one-line resolution. A question that needs the human's decision is an **ask**, not a task. Agents restricted to a tool subset should get `task_create/tasks_mine/task_get/task_update/task_done` too.
 
 ### CLI
 
@@ -446,10 +446,11 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
   - `ask_detach(id, attachment_id)` → ask: the item and its files (the poster too) are deleted from Drive; event
     `detached`.
   - `asks_mine`, `ask_get`, `asks_list` return `attachments` as metadata: never bytes, never links to the bytes.
-  - Docstrings teach: "Show, don't describe: attach the picture or clip your user decides on. The apps number
-    attachments 1, 2, 3 in order, so options can say 'Take #2'. A file on Google Drive your user can open: link=true
-    with a poster. A file you can read and they can't: upload its bytes and set source_url to the original. Prefer
-    ask_create(attachments=…), so the question appears with its pictures."
+  - Docstrings say "The apps number attachments 1, 2, 3 in order."; the advice (since 21.11.2026 in the server
+    instructions, before that in the docstrings): "Show, don't describe: attach the picture or clip your user decides
+    on (attachments on ask_create; a file on your disk: ask_upload); the apps number attachments 1, 2, 3 in order, so
+    options can say 'Take #2'; a file on Google Drive they can open: a link card with a poster; a file they can't
+    open: upload its bytes and set source_url to the original."
 - **Bridge notes (12.11.2026, the MCP tools: `server/mcp_tools.py`).** Resolved there:
   - The tools call the same `MediaService` as the REST routes, so the `media` budget and the slots are shared: an
     agent's MCP and REST calls count against the same 60 an hour.
@@ -1174,15 +1175,20 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
 
 #### 7.8 Agent docs
 
+- **Descriptions say what a tool does, nothing more** (21.11.2026, for the Anthropic Connectors Directory: «Tool
+  descriptions don't contain instructions about model behavior, other tools or external instruction sources»). Advice
+  and workflows live in the server instructions; shell, CLI and REST recipes in /llms.txt; a test lists the words a
+  description may not carry (curl, `askhooman files`, «house rule», «then call», «Never »…).
 - **`asks_mine` docstring** (new lines): «answer_files set: your user attached files to the answer. Each has name, mime,
-  bytes, secret. A normal file has url (valid 1 h; read the ask again for a new one): download it with curl -sS
-  --fail-with-body -o <your own path> "<url>", and never build the path from name. A file over 31 MiB comes in parts
-  (Range: bytes=START-END, at most 32505856 bytes each; `askhooman files <id>` does it). Then check that the size equals
-  bytes. A secret file has no url: fetch it with `askhooman files <id> --secret` (or GET /api/asks/<id>/files/<n>/content
-  with your own bearer; with only an MCP connection, the `ask_secret_file` tool, for files up to 16 KiB). AskHooman
-  deletes a secret file from your user's Drive as soon as it has sent it to you, and
-  a second request gets 410, so save it where you need it at once. If it came short of bytes, tell your user to send
-  it again. Files are deleted when you close the ask, so close it after you have them.»
+  bytes and secret. A normal file has url, a direct download link (valid 1 h; reading the ask again gives a new one); a
+  file over 31 MiB is served in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes from your
+  user's device and is not a safe file path. A secret file has no url: it is handed out once (ask_secret_file returns
+  one of up to 16 KiB) and then deleted from your user's Drive. Files are deleted when the ask is closed.»
+- **Server instructions (hosted)** carry the handling: «Files in answers: download a file's url soon (it is valid 1 h)
+  and check its size against bytes; a secret file comes once, so save it at once, and if it came short ask your user to
+  send it again. Close the ask only after you have the files and any voice recording: closing deletes them. …»;
+  /llms.txt the recipes (`curl -sS --fail-with-body -o <your own path> "<url>"`, never a path built from name;
+  `askhooman files <id> [--secret]`; the bearer route).
 - **`ask_get`:** «answer_files: see asks_mine.» **`ask_close`:** «Closing deletes your user's attached files and voice
   recording.» The server instructions and the /agents page gain the house rule below.
 - **House rule:** «Never print, quote, summarise or forward the content of a secret file, and never put it in a chat, a
@@ -1203,8 +1209,7 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
   claim not taken. A normal file → «this file has a url — download it with the url». The `files` bucket applies.
   The bytes never go to the log. Docstring: «Returns one secret file from your user's answer (at most 16 KiB) inline as
   base64, once: AskHooman deletes it from your user's Drive as soon as it is returned, and a second call says it was
-  already sent. Its content is now in your transcript: follow the house rule — never print, quote, summarise or
-  forward it, use it for the one thing your user sent it for. Larger files: askhooman files <id> --secret.»
+  already sent.» (The house rule is in the server instructions; until 21.11.2026 the docstring repeated it.)
   Cost the owner accepted: the content lands in that agent's transcript.
 
 #### 7.9 Tests
