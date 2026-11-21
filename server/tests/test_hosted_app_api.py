@@ -620,3 +620,14 @@ def test_event_wakes_only_the_owner(hosted, google):
     feed = hosted.app.state.feed
     assert [e["type"] for e in feed.read(agent_named(hosted, google, "Allen")["id"], "0")["events"]] == ["ask.closed"]
     assert feed.read(agent_named(hosted, google, "Ogilvy")["id"], "0")["events"] == []
+
+
+def test_mcp_registry_auth_file(hosted):
+    """Ownership proof of askhooman.com for the official MCP Registry (HTTP auth, 21.11.2026): one line, text/plain,
+    the PUBLIC ed25519 key; the private one is the publisher's (Ogilvy). HEAD answers too."""
+    r = hosted.get("/.well-known/mcp-registry-auth")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.text.strip() == "v=MCPv1; k=ed25519; p=w80uZINOCudZMbK8PvBAbJz+TqdGYuEMA3N64YsLWHo="
+    assert r.text.count("\n") <= 1
+    assert hosted.head("/.well-known/mcp-registry-auth").status_code == 200
