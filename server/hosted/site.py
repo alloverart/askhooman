@@ -31,6 +31,9 @@ DS_FONT = "ds/fonts/inter-latin-wght-normal.woff2"  # preloaded: every page is L
 FILES = ("favicon.ico", "favicon.svg", "favicon-32x32.png", "apple-touch-icon.png", "icon-192x192.png",
          "icon-512x512.png", "icon-maskable-192x192.png", "icon-maskable-512x512.png", "site.webmanifest",
          "og-image-1200x630.png", "brandmark.svg", "icon-96x96.png",
+         # the stores' official badges, unchanged (Apple Marketing Tools SVGs; Google's badge PNG with its clear space
+         # cropped so all three stand at one height): Denis via Ogilvy 21.11.2026
+         "badges/app-store.svg", "badges/mac-app-store.svg", "badges/google-play.png",
          "ds/tokens.css", "ds/components.css", "ds/fonts.css", DS_FONT, "ds/fonts/inter-latin-ext-wght-normal.woff2",
          "ds/fonts/inter-cyrillic-wght-normal.woff2", "ds/fonts/OFL.txt")
 # The pages ask for a file by `/<name>?v=<first 10 hex of its SHA-256>`: the files are cached for a day, and an
@@ -63,6 +66,17 @@ GITHUB = "https://github.com/alloverart/askhooman"
 WEB_APP = "https://app.askhooman.com"
 APP_STORE = "https://apps.apple.com/app/id6829153687"
 GOOGLE_PLAY = "https://play.google.com/store/apps/details?id=com.askhooman.app"
+
+
+def _store_badge(href: str, name: str, alt: str, width: int) -> str:
+    """A store's official badge as a link, 44 px high like the buttons (width/height keep the space while it loads)."""
+    return (f'<a class="store" href="{href}"><img src="{asset(name)}" alt="{alt}" width="{width}" height="44" '
+            f'loading="lazy" decoding="async"></a>')
+
+
+APP_STORE_BADGE = _store_badge(APP_STORE, "badges/app-store.svg", "Download on the App Store", 132)
+MAC_APP_STORE_BADGE = _store_badge(APP_STORE, "badges/mac-app-store.svg", "Download on the Mac App Store", 172)
+GOOGLE_PLAY_BADGE = _store_badge(GOOGLE_PLAY, "badges/google-play.png", "Get it on Google Play", 148)
 SUPPORT_EMAIL = "support@askhooman.com"
 PRIVACY_EMAIL = "privacy@askhooman.com"
 SECURITY_EMAIL = "security@askhooman.com"
@@ -93,6 +107,8 @@ h1,h2,h3{color:var(--ink);text-wrap:balance}
 color:var(--accent-text);margin:0 0 12px}
 .cta{display:flex;gap:10px;flex-wrap:wrap}.cta .btn{height:44px;font-weight:600;padding:0 18px}
 .hero p.note{font-size:var(--fs-md);margin:14px 0 0;opacity:.75}
+.stores{display:flex;flex-wrap:wrap;align-items:center;gap:10px 12px;margin:18px 0 0}.stores p.note{margin:0}
+a.store{display:inline-flex;line-height:0}a.store img{height:44px;width:auto}.grid .card .store{margin-top:12px}
 .ds a.btn{color:var(--ink)}.ds a.btn.primary{color:var(--accent-ink)}
 .hero .btn:not(.primary){background:var(--glass-strong)}
 section{margin:0 0 56px}h2{font-size:28px;font-weight:650;margin:0 0 8px;letter-spacing:-.02em}
@@ -183,7 +199,7 @@ def landing_page(settings: HostedSettings):
 and gives you one list to answer them all with a tap. Then everyone gets back to work.</p>
 <div class="cta"><a class="btn primary big" href="{WEB_APP}">Open the web app</a><a class="btn big" href="#connect">Connect an
 agent</a><a class="btn big" href="#agents">I'm an agent</a></div>
-<p class="note">Works in any browser today. The iPhone and Mac apps are <a href="{APP_STORE}">on the App Store</a>; the Android app is <a href="{GOOGLE_PLAY}">on Google Play</a>.</p>
+<div class="stores">{APP_STORE_BADGE}{GOOGLE_PLAY_BADGE}<p class="note">or <a href="{WEB_APP}">open the web app</a></p></div>
 </div></div>
 
 <section><h2>The great inversion</h2><p class="lead">Agents do the work and bring you only the decisions. Turns out, AI
@@ -232,11 +248,11 @@ it as <code>Authorization: Bearer &lt;agent key&gt;</code>.</p></section>
 <div class="card"><h3>Web: Linux, Windows, anything</h3><p>The same list in any browser, on a computer or a phone.</p>
 <p class="go"><a href="{WEB_APP}">app.askhooman.com</a></p><span class="badge ok">Available now</span></div>
 <div class="card"><h3>iPhone and iPad</h3><p>Native app with the waiting count on its icon.</p>
-<p class="go"><a href="{APP_STORE}">Download on the App Store</a></p><span class="badge ok">Available now</span></div>
+<p class="go">{APP_STORE_BADGE}</p><span class="badge ok">Available now</span></div>
 <div class="card"><h3>Mac</h3><p>Native app with a count in the menu bar.</p>
-<p class="go"><a href="{APP_STORE}">Download on the Mac App Store</a></p><span class="badge ok">Available now</span></div>
+<p class="go">{MAC_APP_STORE_BADGE}</p><span class="badge ok">Available now</span></div>
 <div class="card"><h3>Android</h3><p>For the rest of your phones.</p>
-<p class="go"><a href="{GOOGLE_PLAY}">Get it on Google Play</a></p><span class="badge ok">Available now</span></div>
+<p class="go">{GOOGLE_PLAY_BADGE}</p><span class="badge ok">Available now</span></div>
 <div class="card"><h3>Your agents</h3><p>Claude on the web, desktop and phone, Claude Code on macOS, Linux and Windows,
 VS Code, and any MCP client with OAuth.</p><span class="badge ok">Available now</span></div>
 </div></section>

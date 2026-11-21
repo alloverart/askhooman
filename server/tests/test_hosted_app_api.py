@@ -423,18 +423,28 @@ def test_store_pages(hosted):
     assert f"<code class=\"url\">{RESOURCE}</code>" in landing
     assert "Add custom connector" in landing and f"claude mcp add --scope user --transport http askhooman {RESOURCE}" in landing
     for words in ("Open the web app",
-                  # 19.11.2026: the Android app is public on Google Play
-                  '<a href="https://play.google.com/store/apps/details?id=com.askhooman.app">Get it on Google Play</a>',
-                  "the Android app is <a href=\"https://play.google.com/store/apps/details?id=com.askhooman.app\">on Google Play</a>",
                   '<a href="https://app.askhooman.com">app.askhooman.com</a>',
-                  # the iPhone/iPad and Mac apps are on sale (one App Store record for both): each card links to it
-                  '<a href="https://apps.apple.com/app/id6829153687">Download on the App Store</a>',
-                  '<a href="https://apps.apple.com/app/id6829153687">Download on the Mac App Store</a>',
+                  # 21.11.2026 (Denis via Ogilvy): the stores' own badges instead of text links, in the hero and on
+                  # the cards; one App Store record for iPhone/iPad and Mac, the Android app on Google Play
+                  '<a class="store" href="https://apps.apple.com/app/id6829153687"><img src="/badges/app-store.svg?v=',
+                  'alt="Download on the App Store"',
+                  '<a class="store" href="https://apps.apple.com/app/id6829153687"><img src="/badges/mac-app-store.svg?v=',
+                  'alt="Download on the Mac App Store"',
+                  '<a class="store" href="https://play.google.com/store/apps/details?id=com.askhooman.app"><img '
+                  'src="/badges/google-play.png?v=',
+                  'alt="Get it on Google Play"',
+                  'or <a href="https://app.askhooman.com">open the web app</a>',
                   "Apache-2.0", "drive.appdata",
                   "We keep only your account email, an encrypted Google token and your agents' names and keys"):
         assert words in landing, words
     assert "In review at the App Store" not in landing and "In review at Google Play" not in landing
     assert "Google Play review" not in landing and landing.count("Available now") == 5
+    assert "Works in any browser today" not in landing  # the text line under the buttons gave way to the badges
+    assert landing.count('src="/badges/app-store.svg') == 2 and landing.count('src="/badges/google-play.png') == 2
+    for name, ctype in (("badges/app-store.svg", "image/svg+xml"), ("badges/mac-app-store.svg", "image/svg+xml"),
+                        ("badges/google-play.png", "image/png")):
+        r = hosted.get(f"/{name}")
+        assert r.status_code == 200 and r.headers["content-type"].startswith(ctype), name
     for words in ("Effective 20 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
                   # 18.11.2026: pictures, videos and voice answers; what connected agents read
                   "the app saves the recording there with your answer",
