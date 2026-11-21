@@ -430,8 +430,8 @@ def test_store_pages(hosted):
                   'alt="Download on the App Store"',
                   '<a class="store" href="https://apps.apple.com/app/id6829153687"><img src="/badges/mac-app-store.svg?v=',
                   'alt="Download on the Mac App Store"',
-                  '<a class="store" href="https://play.google.com/store/apps/details?id=com.askhooman.app"><img '
-                  'src="/badges/google-play.png?v=',
+                  ('<a class="store" href="https://play.google.com/store/apps/details?id=com.askhooman.app"><img '
+                   'src="/badges/google-play.png?v='),
                   'alt="Get it on Google Play"',
                   'or <a href="https://app.askhooman.com">open the web app</a>',
                   "Apache-2.0", "drive.appdata",
@@ -641,3 +641,22 @@ def test_mcp_registry_auth_file(hosted):
     assert r.text.strip() == "v=MCPv1; k=ed25519; p=w80uZINOCudZMbK8PvBAbJz+TqdGYuEMA3N64YsLWHo="
     assert r.text.count("\n") <= 1
     assert hosted.head("/.well-known/mcp-registry-auth").status_code == 200
+
+
+def test_terms_page(hosted):
+    """/terms (Denis, ask 1406, 21.11.2026: «Пиши и публикуй сразу»; OpenAI's app directory needs Terms of Service):
+    linked from every public page and /llms.txt; names the provider, the governing law and the contacts."""
+    for path in ("/", "/privacy", "/support", "/agents", "/terms"):
+        page = hosted.get(path)
+        assert page.status_code == 200 and 'href="/terms"' in page.text, path
+    page = hosted.get("/terms")
+    assert page.headers["content-type"].startswith("text/html") and "<script" not in page.text
+    assert "default-src 'none'" in page.headers["content-security-policy"]
+    assert f'<link rel="canonical" href="{PUBLIC}/terms">' in page.text
+    text = " ".join(page.text.split())
+    for words in ("<h1>Terms of Service</h1>", "Effective 21 November 2026",
+                  "Allover Studio, LLC, 131 Continental Dr, Suite 305, Newark, DE 19713, United States",
+                  "laws of the State of Delaware", "mailto:support@askhooman.com", 'href="/privacy"',
+                  "AskHooman is free", "Delete account", "Apache-2.0"):
+        assert words in text, words
+    assert f"{PUBLIC}/terms" in hosted.get("/llms.txt").text

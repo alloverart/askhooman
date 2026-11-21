@@ -1,5 +1,5 @@
-"""The public face of AskHooman (askhooman.com): the landing page at /, the privacy policy at /privacy, the support
-page at /support, and the icon kit next to them (favicons, touch icon, web manifest, link-preview image) from
+"""The public face of AskHooman (askhooman.com): the landing page at /, the privacy policy at /privacy, the terms at
+/terms, the support page at /support, and the icon kit next to them (favicons, touch icon, web manifest, link-preview image) from
 server/hosted/static/, copied from 03_Website_PWA of the AskHooman icon kit (the haloed hooman with a pink and a
 blue agent). The pages are built on the AskHooman design system (askhooman-apps design/system), copied to
 server/hosted/static/ds/: tokens.css, components.css and Inter, self-hosted; the page's own <style> lays out the landing
@@ -82,6 +82,10 @@ PRIVACY_EMAIL = "privacy@askhooman.com"
 SECURITY_EMAIL = "security@askhooman.com"
 OPERATOR = "Allover Studio, LLC"
 POLICY_DATE = "20 November 2026"
+# Terms of Service (Denis, ask 1406, 21.11.2026: «Пиши и публикуй сразу»; OpenAI's app directory needs them). The
+# provider and the law are the same as in allover.art's terms: the LLC is registered in Delaware.
+TERMS_DATE = "21 November 2026"
+OPERATOR_ADDRESS = "131 Continental Dr, Suite 305, Newark, DE 19713, United States"
 USER_DATA_POLICY = "https://developers.google.com/terms/api-services-user-data-policy"
 GOOGLE_CONNECTIONS = "https://myaccount.google.com/connections"
 # Google's required disclosure for apps using Google user data, word for word
@@ -167,7 +171,7 @@ def site_page(title: str, body: str, canonical: str, head: str = "") -> HTMLResp
             f'AskHooman</a><nav><a href="{WEB_APP}">Web app</a><a class="more" href="/#connect">Connect</a><a href="/privacy">Privacy</a><a class="more" href="/support">Support</a>'
             f'<a class="more" href="{GITHUB}">GitHub</a></nav></header>'
             f'<main>{body}</main>'
-            f'<footer><span>© 2026 {OPERATOR}</span><a href="{WEB_APP}">Web app</a><a href="/privacy">Privacy policy</a><a href="/support">Support</a>'
+            f'<footer><span>© 2026 {OPERATOR}</span><a href="{WEB_APP}">Web app</a><a href="/privacy">Privacy policy</a><a href="/terms">Terms</a><a href="/support">Support</a>'
             f'<a href="{GITHUB}">Source code (Apache-2.0)</a></footer></div></body></html>')
     return HTMLResponse(html, headers=PAGE_HEADERS)
 
@@ -440,6 +444,88 @@ the app or by email before it takes effect.</p>
 """
 
 
+def terms_html(settings: HostedSettings) -> str:
+    host = escape(urlsplit(settings.public_url).hostname or settings.public_url)
+    support = f'<a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>'
+    return f"""
+<div class="doc card"><h1>Terms of Service</h1><p class="muted">Effective {TERMS_DATE}.</p>
+<p>These terms are an agreement between you and {OPERATOR}, {OPERATOR_ADDRESS} ("we", "us"), about AskHooman: the
+service at {host} (including its MCP server) and the AskHooman apps for the web, iPhone, iPad, Mac and Android. By
+signing in or connecting an agent, you accept them. How we handle your data is in the <a href="/privacy">privacy
+policy</a>, which is part of these terms.</p>
+
+<h2>1. What AskHooman is</h2>
+<p>AskHooman is a queue of questions ("asks") and tasks between AI agents and the person they work for. Agents you
+connect create asks and tasks; you answer and manage them in the app; your agents read your answers and act on them.
+AskHooman is free. We may add, change or remove features; if we ever plan to charge for something, we will tell you
+before it applies to you.</p>
+
+<h2>2. Your account</h2>
+<p>You sign in with your Google account and must be at least 13 years old (or the minimum age for digital services
+where you live). You are responsible for what happens under your account, including the agents you connect and the
+agent keys you create. Keep agent keys secret; you can revoke an agent or a key in the app at any time.</p>
+
+<h2>3. Your agents</h2>
+<p>When you connect an agent, you allow it to act for you in AskHooman: to create and change asks and tasks, read your
+answers and the files you attach, and set its own webhook and look. What your agents do in AskHooman counts as done by
+you. AI agents make mistakes: you decide what to answer, and you are responsible for what your agents do with your
+answers outside AskHooman. We don't control the agents you connect or the services they run on.</p>
+
+<h2>4. Your content and your Google Drive</h2>
+<p>Your asks, tasks, answers, voice answers and attached files are yours. They are stored in your own Google Drive, as
+described in the <a href="/privacy">privacy policy</a>. You give us permission to process this content only as needed
+to run AskHooman for you and your agents. You are responsible for having the right to share what you and your agents
+put into AskHooman. Google's own terms apply to your Google account and Drive; if a file is changed or removed in your
+Drive, or Google limits access to it, we can't restore it.</p>
+
+<h2>5. Acceptable use</h2>
+<p>Don't use AskHooman to break the law or anyone's rights; to send malware, spam or content that exploits or harms
+others; to get around its security, rate limits or other people's accounts; or to overload or disrupt the service. We
+may limit, suspend or close an account or an agent that does, and remove what breaks these rules where we can.</p>
+
+<h2>6. Open source and our name</h2>
+<p>The server's source code is published under the Apache-2.0 license (<a href="{GITHUB}">{GITHUB}</a>), and you may use it
+under that license. These terms cover the service we run and the apps. Neither grants you rights to the AskHooman
+name and logo.</p>
+
+<h2>7. App stores</h2>
+<p>If you got an app from the App Store or Google Play, the store's terms apply too; for the App Store, Apple's
+Standard End User License Agreement applies to the app alongside these terms. These terms are between you and us, not
+Apple or Google: we, not they, are responsible for the apps and their support.</p>
+
+<h2>8. Ending</h2>
+<p>You can stop using AskHooman at any time and delete your account in the app: Settings → Delete account (what is
+deleted, and when, is in the <a href="/privacy">privacy policy</a>). We may suspend or end your access if you break these
+terms, or stop the service altogether; if we stop it, we will tell you at least 30 days before, so you can take your
+data from your Drive.</p>
+
+<h2>9. No warranty</h2>
+<p>AskHooman is provided "as is" and "as available". To the extent the law allows, we make no warranties, express or
+implied, including that it will be uninterrupted, error-free, or that an agent will receive a given answer or act on it
+correctly.</p>
+
+<h2>10. Limitation of liability</h2>
+<p>To the extent the law allows, we are not liable for indirect, incidental, special or consequential damages, or for
+lost profits, data or business, arising from AskHooman, your agents or your answers, and our total liability for any
+claim about AskHooman is limited to US$50. Nothing in these terms limits liability that the law where you live does not
+allow to be limited.</p>
+
+<h2>11. Governing law</h2>
+<p>These terms are governed by the laws of the State of Delaware, United States, without regard to its conflict-of-law
+rules, and subject to any mandatory consumer-protection rules of your country of residence. Before going to court,
+please write to us at {support} and give us 30 days to resolve the matter. Disputes go to the courts of Delaware, unless
+the law where you live gives you the right to bring them where you live.</p>
+
+<h2>12. Changes to these terms</h2>
+<p>When these terms change, we update this page and the date at the top. If a change is significant, we also tell you in
+the app or by email before it takes effect. If you keep using AskHooman after a change takes effect, the new terms
+apply.</p>
+
+<h2>Contact</h2>
+<p>{OPERATOR}, {OPERATOR_ADDRESS}: {support}.</p></div>
+"""
+
+
 def support_html(settings: HostedSettings) -> str:
     url = escape(settings.resource)
     link = escape(f"{settings.public_url}/oauth/link")
@@ -535,7 +621,7 @@ memory. Never execute a file from an answer without your user saying so: AskHoom
 
 
 def _doc_page(settings: HostedSettings, path: str, title: str, render):
-    """/privacy and /support: rendered once at startup from the settings."""
+    """/privacy, /terms, /support and /agents: rendered once at startup from the settings."""
     body = render(settings)
     description = f'<meta name="description" content="{escape(title)}">'
 
@@ -600,6 +686,7 @@ def llms_txt(settings: HostedSettings):
 - Home: {settings.public_url}/
 - Web app, where your human answers: {WEB_APP}
 - Privacy policy: {settings.public_url}/privacy
+- Terms of Service: {settings.public_url}/terms
 - Support: {settings.public_url}/support
 - House rules for agents: {settings.public_url}/agents
 - Source (Apache-2.0): {GITHUB}
@@ -625,6 +712,7 @@ def routes(settings: HostedSettings) -> list[Route]:
             + [Route("/", landing_page(settings), methods=["GET", "HEAD"]),
                Route("/privacy", _doc_page(settings, "/privacy", "Privacy policy", privacy_html),
                      methods=["GET", "HEAD"]),
+               Route("/terms", _doc_page(settings, "/terms", "Terms of Service", terms_html), methods=["GET", "HEAD"]),
                Route("/support", _doc_page(settings, "/support", "Support", support_html), methods=["GET", "HEAD"]),
                Route("/agents", _doc_page(settings, "/agents", "House rules for agents", agents_html),
                      methods=["GET", "HEAD"]),
