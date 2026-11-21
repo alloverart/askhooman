@@ -51,7 +51,11 @@ def test_mcp_round_trip(live_server, sender, notifier, mode):
             tools = await allen.list_tools()
             assert {t.name for t in tools.tools} == TOOLS
             create_doc = next(t for t in tools.tools if t.name == "ask_create").description
-            assert "One decision per ask" in create_doc and "duplicate" in create_doc
+            # 21.11.2026 (Connectors Directory): the description says what the tool does; the style guide is in the
+            # server instructions
+            assert "one question" in create_doc and "decision" in create_doc and "One decision per ask" not in create_doc
+            from server.mcp_tools import INSTRUCTIONS
+            assert "one decision per ask" in INSTRUCTIONS and "duplicate" in INSTRUCTIONS
 
             ask = payload(await allen.call_tool("ask_create", {
                 "title": "Отдать ТЗ?",
@@ -140,7 +144,7 @@ def test_single_tenant_has_no_attachment_tools(live_server):
             assert set(create.input_schema["properties"]) == {"title", "context", "options", "links", "priority", "ref"}
             assert "attachment" not in json.dumps(create.input_schema) and "Show, don't describe" not in \
                 create.description
-            assert create.description.rstrip().endswith("act on it, then ask_close.")
+            assert create.description.rstrip().endswith("Returns the created ask.")
             assert payload(await allen.call_tool("ask_create", {"title": "Plain?"}))["attachments"] == []
 
     asyncio.run(scenario())
@@ -241,9 +245,10 @@ def test_mcp_task_round_trip(live_server, sender, notifier):
         async with connect(live_server, ALLEN) as allen:
             tools = {t.name: t for t in (await allen.list_tools()).tools}
             create_doc = tools["task_create"].description
-            assert "more than a day" in create_doc and "ask_create" in create_doc and "decision" in create_doc
-            assert "tasks_mine" in create_doc and "waiting_on" in create_doc
-            assert "session start" in tools["tasks_mine"].description
+            assert "more than a day" in create_doc and "a decision for your human is an ask" in create_doc
+            from server.mcp_tools import INSTRUCTIONS
+            assert "checked in tasks_mine first" in INSTRUCTIONS and "waiting_on" in INSTRUCTIONS
+            assert "start of a session" in tools["tasks_mine"].description
             schema = tools["task_create"].input_schema["properties"]
             assert schema["status"]["enum"] == ["active", "waiting"] and schema["status"]["default"] == "active"
             assert tools["tasks_mine"].annotations.read_only_hint is True
@@ -343,7 +348,7 @@ def test_mcp_task_ask_and_unask(live_server):
         async with connect(live_server, ALLEN) as allen, connect(live_server, HAMILTON) as hamilton:
             tools = {t.name: t for t in (await allen.list_tools()).tools}
             assert tools["task_ask"].title == "Ask my human inside my task"
-            assert "waiting_on" in tools["task_ask"].description and "ask_create" in tools["task_ask"].description
+            assert "waiting_on" in tools["task_ask"].description and "reply_pending" in tools["task_ask"].description
             assert tools["task_unask"].title == "Take my task question back"
             assert "question_open" in tools["tasks_mine"].description
             assert "asked" in tools["task_get"].description and "unasked" in tools["task_get"].description
@@ -389,7 +394,7 @@ def test_hosted_instructions_teach_waking(hosted, google, live_server):
     assert waking <= set(hosted_tools)
     assert hosted_tools["ask_wait"]["annotations"]["readOnlyHint"] is True
     assert hosted_tools["ask_wait"]["description"].startswith(
-        "Wait for your user: returns as soon as they answer, close or reopen one of your asks or reply on one of")
+        "Wait up to timeout seconds for your user to answer, close or reopen one of your asks or reply on one of")
     single = httpx.post(f"{live_server}/mcp", headers={**auth(ALLEN), "MCP-Protocol-Version": "2025-06-18",
                                                        "Accept": "application/json, text/event-stream"},
                         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
@@ -403,15 +408,17 @@ def test_hosted_instructions_teach_waking(hosted, google, live_server):
 # ---------- files in answers: what the agents are told (SPEC 7.8, word for word) ----------
 
 ASKS_MINE_FILES = (
-    "answer_files set: your user attached files to the answer. Each has name, mime, bytes, secret. A normal file has "
-    "url (valid 1 h; read the ask again for a new one): download it with curl -sS --fail-with-body -o <your own path> "
-    "\"<url>\", and never build the path from name. A file over 31 MiB comes in parts (Range: bytes=START-END, at "
-    "most 32505856 bytes each; `askhooman files <id>` does it). Then check that the size equals bytes. A secret file "
-    "has no url: fetch it with `askhooman files <id> --secret` (or GET /api/asks/<id>/files/<n>/content with your "
-    "own bearer; with only an MCP connection, the `ask_secret_file` tool, for files up to 16 KiB). AskHooman deletes "
-    "a secret file from your user's Drive as soon as it has sent it to you, and a second request gets 410, so save it "
-    "where you need it at once. If it came short of bytes, tell your user to send it again. "
-    "Files are deleted when you close the ask, so close it after you have them.")
+    "answer_files set: your user attached files to the answer. Each has name, mime, bytes and secret. A normal file "
+    "has url, a direct download link (valid 1 h; reading the ask again gives a new one); a file over 31 MiB is served "
+    "in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes from your user's device and is not a "
+    "safe file path. A secret file has no url: it is handed out once (ask_secret_file returns one of up to 16 KiB) "
+    "and then deleted from your user's Drive. Files are deleted when the ask is closed.")
+# what left the description (21.11.2026, Connectors Directory) and where it lives now
+FILES_INSTRUCTIONS = (
+    "Files in answers: download a file's url soon (it is valid 1 h) and check its size against bytes; a secret file "
+    "comes once, so save it at once, and if it came short ask your user to send it again. Close the ask only after "
+    "you have the files and any voice recording: closing deletes them.")
+FILES_LLMS = '`curl -sS --fail-with-body -o <your own path> "<url>"`, never a path built from name'
 ASK_GET_FILES = "answer_files: see asks_mine."
 ASK_CLOSE_FILES = "Closing deletes your user's attached files and voice recording."
 HOUSE_RULE_FILES = (
@@ -425,6 +432,9 @@ def test_files_docstrings_and_house_rule(hosted, google, client):
     from .test_hosted_voice import agent, tools_list
     tools = tools_list(hosted, agent(hosted, google))
     assert ASKS_MINE_FILES in tools["asks_mine"]
+    from server.mcp_tools import HOSTED_INSTRUCTIONS as INSTR
+    assert FILES_INSTRUCTIONS in " ".join(INSTR.split())
+    assert FILES_LLMS in " ".join(hosted.get("/llms.txt").text.split())
     assert ASK_GET_FILES in tools["ask_get"]
     assert ASK_CLOSE_FILES in tools["ask_close"]
     from server.mcp_tools import HOSTED_INSTRUCTIONS
@@ -438,9 +448,7 @@ def test_files_docstrings_and_house_rule(hosted, google, client):
 
 ASK_SECRET_FILE = (
     "Returns one secret file from your user's answer (at most 16 KiB) inline as base64, once: AskHooman deletes it "
-    "from your user's Drive as soon as it is returned, and a second call says it was already sent. Its content is "
-    "now in your transcript: follow the house rule \u2014 never print, quote, summarise or forward it, use it for the "
-    "one thing your user sent it for. Larger files: askhooman files <id> --secret.")
+    "from your user's Drive as soon as it is returned, and a second call says it was already sent.")
 
 
 def test_ask_secret_file_docstring_and_hosted_only(hosted, google, client):
@@ -451,3 +459,22 @@ def test_ask_secret_file_docstring_and_hosted_only(hosted, google, client):
     single = tools_list(client, ALLEN)
     assert "ask_secret_file" not in single
     assert not any("ask_secret_file" in d for d in single.values())
+
+
+# ---------- the Connectors Directory rule (21.11.2026, Ogilvy for the Anthropic Connectors Directory) ----------
+
+# «Tool descriptions don't contain instructions about model behavior, other tools or external instruction sources»
+# (support.claude.com/en/articles/13145358): a description says what the tool does and when to call it. Advice and
+# workflows live in the server instructions, shell / CLI / REST recipes in /llms.txt.
+FORBIDDEN_IN_DESCRIPTIONS = ("curl", "askhooman files", "in your shell", "house rule", "GET /api", "Write good",
+                             "Show, don't describe", "then call", "Then call", "then ask_close", "then task_",
+                             "Prefer ask_create", "Never ")
+
+
+def test_tool_descriptions_say_what_not_how(hosted, google, client):
+    from .test_hosted_voice import agent, tools_list
+    for label, tools in (("hosted", tools_list(hosted, agent(hosted, google))), ("single", tools_list(client, ALLEN))):
+        for name, description in tools.items():
+            text = description if isinstance(description, str) else description["description"]
+            found = [w for w in FORBIDDEN_IN_DESCRIPTIONS if w in text]
+            assert not found, (label, name, found)

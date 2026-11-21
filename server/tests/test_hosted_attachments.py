@@ -622,10 +622,10 @@ def test_plan_attach_and_detach_rules():
 
 # ---------- MCP: ask_create(attachments=…), ask_attach, ask_upload, ask_detach ----------
 
-SHOW = ("Show, don't describe: attach the picture or clip your user decides on. The apps number attachments 1, 2, 3 in "
-        "order, so options can say 'Take #2'. A file on Google Drive your user can open: link=true with a poster. A "
-        "file you can read and they can't: upload its bytes and set source_url to the original. Prefer "
-        "ask_create(attachments=…), so the question appears with its pictures.")
+SHOW = "The apps number attachments 1, 2, 3 in order."
+# 21.11.2026 (Connectors Directory): «Show, don't describe» left the tool descriptions for the server instructions
+SHOW_INSTRUCTIONS = ("Show, don't describe: attach the picture or clip your user decides on (attachments on ask_create; "
+                     "a file on your disk: ask_upload)")
 IMAGE_KEYS = ["id", "kind", "mime", "width", "height", "bytes", "caption", "source_url", "file_id", "added_at"]
 VIDEO_KEYS = ["id", "kind", "mime", "width", "height", "duration_ms", "bytes", "caption", "source_url", "file_id",
               "poster", "added_at"]
@@ -855,7 +855,9 @@ def test_docstring_sentence(hosted, google):
     for name in ("ask_create", "ask_attach", "ask_upload"):
         assert SHOW in tools[name]["description"], name
     assert "attachments[2]: …" in tools["ask_create"]["description"]
-    assert "ask_update options" in tools["ask_detach"]["description"]
+    assert "may need ask_update" in " ".join(tools["ask_detach"]["description"].split())
+    from server.mcp_tools import HOSTED_INSTRUCTIONS
+    assert SHOW_INSTRUCTIONS in " ".join(HOSTED_INSTRUCTIONS.split())
     schema = tools["ask_create"]["inputSchema"]
     attachments = schema["properties"]["attachments"]
     assert attachments["type"] == "array" and attachments["default"] == []
