@@ -874,8 +874,13 @@ def test_docstring_sentence(hosted, google):
     for name in ("ask_attach", "ask_upload", "ask_detach"):
         hints = tools[name]["annotations"]
         assert tools[name]["title"] == hints["title"] and hints["readOnlyHint"] is False, name
-    # detach deletes the item's files from Drive: the one destructive tool
-    assert [name for name, t in tools.items() if t["annotations"]["destructiveHint"]] == ["ask_detach"]
+    # detach deletes the item's files from Drive; attach and upload can replace a poster, whose file goes (23.11.2026:
+    # hinted too, with the other hints in test_hosted_chatgpt.py)
+    for name in ("ask_attach", "ask_upload", "ask_detach"):
+        assert tools[name]["annotations"]["destructiveHint"] is True, name
+    # the agent gives the url that create and attach fetch; upload takes bytes from the agent itself
+    assert [tools[name]["annotations"]["openWorldHint"] for name in ("ask_create", "ask_attach", "ask_upload")] == [
+        True, True, False]
     # the house rules and /llms.txt say it too
     assert "<b>Show, don't describe.</b>" in hosted.get("/agents").text
     assert "ask_attach, ask_upload, ask_detach" in hosted.get("/llms.txt").text

@@ -111,21 +111,36 @@ class ResourceAuth:
             raise HTTPException(429, "too many requests", headers={"Retry-After": "60"})
         return identity
 
+    def chatgpt(self, identity: HostedIdentity) -> bool:
+        """The token was issued to ChatGPT's OAuth client (Accounts.is_chatgpt_client)."""
+        try:
+            return self.accounts.is_chatgpt_client(identity.client_id)
+        except Exception as exc:  # the metadata store is down
+            log.exception("client check failed: %s", type(exc).__name__)
+            raise HTTPException(503, "temporarily unavailable, try again", headers={"Retry-After": "5"}) from None
+
 
 class HostedMCPEndpoint:
-    """/mcp: bearer check (in a worker thread: it reads the metadata store), then the MCP session manager."""
+    """/mcp: bearer check (in a worker thread: it reads the metadata store), then the MCP session manager of the
+    caller's server: ChatGPT's OAuth client gets the one without secret files (build_mcp(chatgpt=True), SPEC 7.8
+    «ChatGPT: no secret files»), every other client and agent key the full one."""
 
-    def __init__(self, auth: ResourceAuth, mcp, trust_forwarded: bool):
+    def __init__(self, auth: ResourceAuth, mcp, chatgpt_mcp, trust_forwarded: bool):
         self.auth = auth
         self.mcp = mcp
+        self.chatgpt_mcp = chatgpt_mcp
         self.trust_forwarded = trust_forwarded
+
+    def caller(self, authorization: str | None, ip: str, host: str | None) -> tuple[HostedIdentity, object]:
+        identity = self.auth.identify(authorization, ip, host)
+        return identity, self.chatgpt_mcp if self.auth.chatgpt(identity) else self.mcp
 
     async def __call__(self, scope, receive, send):
         headers = Headers(scope=scope)
         ip = client_ip(headers, (scope.get("client") or (None,))[0], self.trust_forwarded)
         try:
-            identity = await anyio.to_thread.run_sync(self.auth.identify, headers.get("authorization"), ip,
-                                                      headers.get("host"))
+            identity, mcp = await anyio.to_thread.run_sync(self.caller, headers.get("authorization"), ip,
+                                                           headers.get("host"))
         except HTTPException as exc:
             await JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)(
                 scope, receive, send)
@@ -135,7 +150,7 @@ class HostedMCPEndpoint:
                                headers={"Allow": "POST"})(scope, receive, send)
             return
         scope[IDENTITY_SCOPE_KEY] = identity
-        await self.mcp.session_manager.handle_request(scope, receive, send)
+        await mcp.session_manager.handle_request(scope, receive, send)
 
 
 def make_store(settings: HostedSettings):
@@ -203,15 +218,22 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     own_webhook = WebhookTool(
         lambda who, url, rotate: set_own_webhook(accounts, limiter, who, url, rotate),
         lambda who: ping_own_webhook(accounts, webhooks, limiter, who))
-    mcp = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user), webhook=own_webhook,
-                    media=MediaTool(media.create, media.attach, media.upload, media.detach),
-                    secret_file=SecretFileTool(lambda who, ask_id, n: secret_fetch(who, ask_id, n)))
-    mcp.streamable_http_app(
-        stateless_http=True,
-        json_response=True,
-        # Every request needs a bearer token, and Cloud Run answers on its own hostnames too.
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-    )
+    def hosted_mcp(chatgpt: bool):
+        """The MCP server for every client but ChatGPT, or ChatGPT's: the same tools on the same services, without
+        secret files (SPEC 7.8 «ChatGPT: no secret files»)."""
+        secret_file = None if chatgpt else SecretFileTool(lambda who, ask_id, n: secret_fetch(who, ask_id, n))
+        server = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user),
+                           webhook=own_webhook, media=MediaTool(media.create, media.attach, media.upload, media.detach),
+                           secret_file=secret_file, chatgpt=chatgpt)
+        server.streamable_http_app(
+            stateless_http=True,
+            json_response=True,
+            # Every request needs a bearer token, and Cloud Run answers on its own hostnames too.
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+        return server
+
+    mcp, chatgpt_mcp = hosted_mcp(chatgpt=False), hosted_mcp(chatgpt=True)
 
     def upload_grant(token: str | None, ip: str) -> UploadGrant:
         """PUT /api/uploads: an upload token only, claimed here (used up, whatever the outcome of the PUT)."""
@@ -342,7 +364,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
                         "answer file is ever swept (a secret file nobody fetched is not deleted after 24 h, the files "
                         "of a closed ask stay): set it and create the Cloud Scheduler job, deploy/hosted/README.md, "
                         "Upgrading an existing deployment")
-        async with mcp.session_manager.run():
+        async with mcp.session_manager.run(), chatgpt_mcp.session_manager.run():
             yield
         await anyio.to_thread.run_sync(webhooks.flush, 5.0)
         pool.close()
@@ -364,6 +386,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.state.file_claims = file_claims
     app.state.auth_server = auth_server
     app.state.mcp = mcp
+    app.state.chatgpt_mcp = chatgpt_mcp
     add_error_handlers(app)
 
     @app.get("/healthz")
@@ -381,7 +404,8 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.router.routes.extend(site.routes(settings))
     app.router.routes.append(Route("/internal/sweep", endpoint=sweep_endpoint, methods=["POST"],
                                    include_in_schema=False))  # no CORS: AppCors answers its own paths only
-    app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, settings.trust_forwarded),
+    app.router.routes.append(Route("/mcp", endpoint=HostedMCPEndpoint(resource_auth, mcp, chatgpt_mcp,
+                                                                      settings.trust_forwarded),
                                    include_in_schema=False))
     app.add_middleware(RequestGuard, authenticate=authenticate)
     if settings.cors_origins:  # added last = outermost: preflights are answered before RequestGuard's token check

@@ -241,6 +241,7 @@ Migrating single-tenant users, the Google verification / External consent switch
 Resolved where the contract above was silent; the app (build 4) and agents may rely on these. Code: `server/hosted/`; deploy: `deploy/hosted/README.md`. Updated the same day after an independent security review (points marked *review*).
 - **Shared rules.** Validation, permissions and both state machines live in `server/rules.py` and `server/task_rules.py` as pure functions; `core.py`/`tasks.py` (SQLite) and `hosted/records.py` (Drive files) both apply them, so errors (401/403/404/409/422) are identical. Hosted only adds 503 `unavailable` (Drive unreachable, or the user's Google grant missing/revoked, with the link below) and 429.
 - **Hosted endpoints for agents**: `/mcp` and the same REST as v1/v3 (`/api/me`, `/api/asks…`, `/api/tasks…`) with the same tokens. MCP server name `askhooman`; no `ask_answer` (agents never answer), plus `set_my_look` (an agent's own colour and icon in the app, see "Agent look" below); tool texts say "your user" instead of "your human"; the server instructions tell agents to call `asks_mine` and `tasks_mine` at session start. An unexpected server error reaches the agent as `server error (<ExceptionType>); try again later` without its message (*review*). The PWA (`web/`) is not served in hosted mode.
+- **Tool hints** (`ToolAnnotations`; the Anthropic Connectors Directory and OpenAI's apps directory check them, and MCP clients use them to decide what runs without asking). Every tool has a `title` and all four hints, the same for every client. `readOnlyHint` (and `idempotentHint`, equal to it): `asks_mine`, `asks_list`, `ask_get`, `tasks_mine`, `tasks_list`, `task_get`, `ask_wait`. `destructiveHint` (23.11.2026, after OpenAI's scan), the tools that delete or replace something reopen doesn't bring back: `ask_close` (the answer's files and voice recording), `ask_detach` (the item's files), `ask_attach` and `ask_upload` (with `poster_for`, an earlier poster), `set_my_webhook` (the webhook, and its secret when rotated), `ask_secret_file` (the file, once returned); every other change stays in the record's history. `openWorldHint` (23.11.2026), the tools that reach a URL the agent gives: `ask_create` and `ask_attach` (the pictures they fetch), `set_my_look` (`image_url`), `test_my_webhook` (the POST to the webhook). The single-tenant bridge has no attachments and deletes nothing on close: there nothing is destructive or open world.
 - **Scope and audience.** One scope, `qtracker` (the name from before the rename, kept so existing clients and tokens stay valid; unknown requested scopes are ignored; the token response always says `qtracker`). `resource` is required at `/authorize` (scheme/host case, a default port and a trailing slash are normalised); at `/token` it may be omitted (the code / refresh token is already bound), but if sent it must match (`invalid_target`). `ASKS_PUBLIC_URL` is canonicalised at startup (lower-case scheme/host, no default port, no trailing slash), since issuer and audience are compared as exact strings (*review*).
 - **Aliases (after the rename, 01.11.2026).** `ASKS_PUBLIC_URL_ALIASES` lists more origins of the same server (comma-separated, canonicalised the same way), e.g. `https://qtracker.allover.art` once `ASKS_PUBLIC_URL` is `https://askhooman.com`. A request whose `Host` is an alias gets that origin everywhere: the protected resource and authorization server metadata, the `resource` accepted at `/authorize`, the `iss` of the authorization response, Google's callback (`<origin>/oauth/google/callback`, so the browser cookie is found; every origin's callback must be an authorized redirect URI of the Web client) and the audience its tokens are checked against. So agents connected on the old domain keep working, and a token is valid only on the origin it was issued for. Any other `Host` is answered as `ASKS_PUBLIC_URL`. `connect-info` always offers `ASKS_PUBLIC_URL`.
 - **401** from `/mcp` and the agents' REST: `WWW-Authenticate: Bearer resource_metadata="<ASKS_PUBLIC_URL>/.well-known/oauth-protected-resource/mcp", scope="qtracker"`, plus `error="invalid_token"` when a token was sent. The protected resource metadata is served at that path and at the root path (same document). CORS is closed on `/mcp`, the agents' REST and the OAuth endpoints whatever `ASKS_CORS_ORIGINS` says (no `Access-Control-*`; a preflight fails with 401 or 405).
@@ -459,7 +460,9 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
     again in a few seconds`.
   - An `attachments` item is an object with exactly the fields above (`additionalProperties: false` in the schema;
     another field is refused by the schema, naming `attachments.<i>.<field>`); `""` means absent, as in `ask_attach`.
-  - `ask_detach` is the one tool with `destructiveHint: true`: it deletes the item's files from Drive.
+  - `ask_detach` has `destructiveHint: true`: it deletes the item's files from Drive; so do `ask_attach` and
+    `ask_upload` (23.11.2026): with `poster_for` they replace an earlier poster, whose file goes. The other hints:
+    «Tool hints» in the v4 notes.
   - On the single-tenant bridge `ask_create` has no `attachments` parameter, and the SDK ignores arguments a tool
     doesn't have, so an agent that sends some there gets a plain ask (REST says 422).
 - **REST** (agents' tokens, hosted): `POST /api/asks` takes `attachments` as above; `POST /api/asks/{id}/attachments
@@ -1211,6 +1214,26 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
   base64, once: AskHooman deletes it from your user's Drive as soon as it is returned, and a second call says it was
   already sent.» (The house rule is in the server instructions; until 21.11.2026 the docstring repeated it.)
   Cost the owner accepted: the content lands in that agent's transcript.
+- **ChatGPT: no secret files** (23.11.2026, for OpenAI's apps directory, whose policy forbids collecting access
+  credentials and authentication secrets; the owner's decision: hide the feature there). The bridge tells ChatGPT
+  by its OAuth client: a dynamic registration (DCR) with a redirect URI on the host `chatgpt.com` (ChatGPT
+  registers `https://chatgpt.com/connector_platform_oauth_redirect` and gets a new client_id each time, so the
+  redirect URI is what tells it apart; an exact host match, so `chatgpt.com.example.com` or a path containing it
+  is not ChatGPT). Each `/mcp` request is served by the server of the client its access token was issued to (read
+  from the registration on the client's first request, then remembered by the instance). ChatGPT's server:
+  `tools/list` has no `ask_secret_file`, and a call to it is refused with the tool error «forbidden:
+  ask_secret_file is not available in ChatGPT» before anything is read, claimed or deleted; the server instructions
+  (`initialize` and `server/discover`) end with «Files in answers: download a file's url soon (it is valid 1 h) and
+  check its size against bytes. Close the ask only after you have the files and any voice recording: closing
+  deletes them. Never execute a file from an answer without your user saying so: AskHooman does not scan files.»
+  instead of the paragraph and house rule above; `asks_mine` says «answer_files set: your user attached files to the
+  answer. Each has name, mime, bytes and url, a direct download link (valid 1 h; reading the ask again gives a new
+  one); a file over 31 MiB is served in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes
+  from your user's device and is not a safe file path. Files are deleted when the ask is closed.» Everything else is
+  the same: the other tools, their texts and hints, and the data (`answer_files` still carries `secret`). Every
+  other client — Claude, metadata-document (CIMD) clients, agent keys — gets exactly what it got before. Hiding only
+  narrows: a client that registers a `chatgpt.com` redirect URI without being ChatGPT just loses secret files. The
+  REST routes, `/llms.txt` and `/agents` are the same for everyone.
 
 #### 7.9 Tests
 

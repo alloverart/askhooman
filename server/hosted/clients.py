@@ -107,6 +107,23 @@ def is_loopback_uri(uri: str) -> bool:
         return False
 
 
+CHATGPT_HOST = "chatgpt.com"
+
+
+def is_chatgpt(client: dict | None) -> bool:
+    """ChatGPT's connector: a client registered with a redirect URI on chatgpt.com (it registers by DCR, with
+    https://chatgpt.com/connector_platform_oauth_redirect, and gets a new client_id each time, so the redirect URI
+    is what tells it apart). Its sessions get the server without secret files (SPEC 7.8 «ChatGPT: no secret files»).
+    A client that only pretends to be ChatGPT this way just loses that feature."""
+    for uri in (client or {}).get("redirect_uris") or ():
+        try:
+            if urlsplit(uri).hostname == CHATGPT_HOST:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 # ---------- shared metadata checks ----------
 
 def clean_label(value: str) -> str:
