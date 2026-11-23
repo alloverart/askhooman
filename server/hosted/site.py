@@ -709,6 +709,16 @@ async def mcp_registry_auth(request: Request) -> Response:
                                                                 "X-Content-Type-Options": "nosniff"})
 
 
+# Владение доменом для каталога приложений OpenAI (ChatGPT, 23.11.2026, задача 1081: подаёт Огилви после бизнес-верификации
+# Дениса). Публичный токен-вызов: ровно строка, text/plain, без перевода строки. Новый токен — только эта строка.
+OPENAI_APPS_CHALLENGE = "Lj9tOiYz_q3vZ_Ss4Io_A7PSDQlNWNQ3hnze8Yfk4q8"
+
+
+async def openai_apps_challenge(request: Request) -> Response:
+    return PlainTextResponse(OPENAI_APPS_CHALLENGE, headers={"Cache-Control": "public, max-age=300",
+                                                            "X-Content-Type-Options": "nosniff"})
+
+
 def routes(settings: HostedSettings) -> list[Route]:
     return ([Route(f"/{name}", _file(name), methods=["GET", "HEAD"]) for name in FILES]
             + [Route("/", landing_page(settings), methods=["GET", "HEAD"]),
@@ -719,4 +729,5 @@ def routes(settings: HostedSettings) -> list[Route]:
                Route("/agents", _doc_page(settings, "/agents", "House rules for agents", agents_html),
                      methods=["GET", "HEAD"]),
                Route("/llms.txt", llms_txt(settings), methods=["GET", "HEAD"]),
-               Route("/.well-known/mcp-registry-auth", mcp_registry_auth, methods=["GET", "HEAD"])])
+               Route("/.well-known/mcp-registry-auth", mcp_registry_auth, methods=["GET", "HEAD"]),
+               Route("/.well-known/openai-apps-challenge", openai_apps_challenge, methods=["GET", "HEAD"])])

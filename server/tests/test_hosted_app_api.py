@@ -643,6 +643,16 @@ def test_mcp_registry_auth_file(hosted):
     assert hosted.head("/.well-known/mcp-registry-auth").status_code == 200
 
 
+def test_openai_apps_challenge_file(hosted):
+    """Domain proof of askhooman.com for the OpenAI apps directory (23.11.2026, task 1081, Ogilvy submits the ChatGPT
+    app after Denis's business verification): exactly the token, text/plain, no JSON and no trailing newline."""
+    r = hosted.get("/.well-known/openai-apps-challenge")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.text == "Lj9tOiYz_q3vZ_Ss4Io_A7PSDQlNWNQ3hnze8Yfk4q8"
+    assert hosted.head("/.well-known/openai-apps-challenge").status_code == 200
+
+
 def test_terms_page(hosted):
     """/terms (Denis, ask 1406, 21.11.2026: «Пиши и публикуй сразу»; OpenAI's app directory needs Terms of Service):
     linked from every public page and /llms.txt; names the provider, the governing law and the contacts."""
