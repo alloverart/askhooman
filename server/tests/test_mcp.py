@@ -119,13 +119,16 @@ def test_mcp_identity_comes_from_token(live_server):
 
 def test_every_tool_has_a_title_and_explicit_hints(live_server):
     """The Connectors Directory checks every tool for a title and readOnlyHint / destructiveHint; Claude runs the
-    read-only ones without asking. Nothing is destructive: every change stays in history and reopens."""
+    read-only ones without asking. Nothing is destructive on the single-tenant bridge: every change stays in history
+    and reopens (its ask_close deletes no files), and nothing reaches the open world (no attachments to fetch); the
+    hosted bridge's hints: test_hosted_chatgpt.py."""
     async def scenario():
         async with connect(live_server, ALLEN) as allen:
             tools = (await allen.list_tools()).tools
         for t in tools:
             assert t.title and t.annotations and t.annotations.title == t.title, t.name
             assert t.annotations.read_only_hint is not None and t.annotations.destructive_hint is False, t.name
+            assert t.annotations.open_world_hint is False, t.name
         assert {t.name for t in tools if t.annotations.read_only_hint} == {
             "asks_mine", "asks_list", "ask_get", "tasks_mine", "tasks_list", "task_get"}
         assert len(tools) == 18  # single-tenant: ask_answer too; v5: task_answer, task_ask, task_unask

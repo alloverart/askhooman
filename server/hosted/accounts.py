@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from ..db import utc_now
 from ..rules import _text
 from ..tokens import AGENT_SLUG, Identity
-from .clients import DCR_ID, clean_label
+from .clients import DCR_ID, clean_label, is_chatgpt
 from .config import HostedSettings
 from .crypto import Keyring, digest, new_secret, same
 from .looks import avatar_json, color_key, least_used
@@ -50,6 +50,7 @@ RESERVED_SLUGS = ("denis",)  # "denis" is the human's actor name in Drive files 
 CLIENTS_PER_AGENT = 20
 UNUSED_CLIENT_TTL = 86400  # a dynamic registration nobody signs in with is forgotten after a day
 CLIENT_TTL = 180 * 86400  # one that is used lives this long after its last sign-in/refresh
+CHATGPT_CACHE_MAX = 1000  # clients remembered as ChatGPT's or not, per instance
 
 _CYRILLIC = dict(zip(  # noqa: B905 (both 38 long)
     "абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґў",
@@ -131,6 +132,7 @@ class Accounts:
         self._seen: dict[str, float] = {}
         self._listened: dict[str, float] = {}
         self._seen_lock = threading.Lock()
+        self._chatgpt: dict[str, bool] = {}  # client_id -> is_chatgpt (a registration's redirect URIs never change)
 
     # ---------- users ----------
 
@@ -440,6 +442,21 @@ class Accounts:
         client = self.dcr_client(client_id)
         if client is not None and client.get("expires_at", 0) < self.clock() + CLIENT_TTL / 2:
             self.store.update("clients", client_id, {"expires_at": self.clock() + CLIENT_TTL})
+
+    def is_chatgpt_client(self, client_id: str | None) -> bool:
+        """The session's OAuth client is ChatGPT's (clients.is_chatgpt: a DCR registration with a redirect URI on
+        chatgpt.com). Agent keys (no client) and metadata-document clients are not. Remembered per instance, so an
+        MCP request costs no store read after the first: a registration's redirect URIs never change and client ids
+        are never reused."""
+        if not client_id:
+            return False
+        known = self._chatgpt.get(client_id)
+        if known is None:
+            known = is_chatgpt(self.dcr_client(client_id))
+            if len(self._chatgpt) >= CHATGPT_CACHE_MAX:
+                self._chatgpt.clear()
+            self._chatgpt[client_id] = known
+        return known
 
     @staticmethod
     def client_secret_ok(client: dict, secret: str | None) -> bool:

@@ -41,8 +41,9 @@ Good asks: one decision per ask; a title your human can answer in one tap; 2–5
 instead of creating a duplicate. Good tasks: one per piece of work, checked in tasks_mine first; blocked →
 status waiting with waiting_on (who or what) and next_check (when you look again); finish with task_done."""
 
-# Hosted mode (SPEC "Hosted bridge … (v4)"): many users, each connects their own agents.
-HOSTED_INSTRUCTIONS = """\
+# Hosted mode (SPEC "Hosted bridge … (v4)"): many users, each connects their own agents. ChatGPT gets the same text
+# with its own files paragraph (CHATGPT_INSTRUCTIONS below); every other client gets HOSTED_INSTRUCTIONS.
+_HOSTED_INSTRUCTIONS_HEAD = """\
 AskHooman is the queue of decisions waiting for the person who connected you; they answer from the AskHooman
 app on their phone or Mac. At the start of every session, and whenever you are woken, call asks_mine and
 tasks_mine first: asks_mine returns your questions with their answers, tasks_mine your long-running work.
@@ -68,6 +69,8 @@ on ask_create; a file on your disk: ask_upload); the apps number attachments 1, 
 and set source_url to the original. Good tasks: one per piece of work, checked in tasks_mine first; blocked →
 status waiting with waiting_on and next_check; finish with task_done. A task with reply_pending waits for you;
 one that waits for your user without a question never reaches them: task_ask it.
+"""
+HOSTED_INSTRUCTIONS = _HOSTED_INSTRUCTIONS_HEAD + """\
 Files in answers: download a file's url soon (it is valid 1 h) and check its size against bytes; a secret file comes
 once, so save it at once, and if it came short ask your user to send it again. Close the ask only after you have
 the files and any voice recording: closing deletes them. With only an MCP connection, ask_secret_file fetches a
@@ -76,6 +79,14 @@ Never print, quote, summarise or forward the content of a secret file, and never
 a ticket or a message to another agent. Use it for the one thing your user sent it for, then forget it: don't keep a
 copy, don't echo it back, and don't write its name or contents into your memory. Never execute a file from an
 answer without your user saying so: AskHooman does not scan files."""
+
+# ChatGPT (OpenAI's apps directory, 23.11.2026): no secret files, as OpenAI's policy forbids collecting access
+# credentials and authentication secrets (SPEC 7.8 «ChatGPT: no secret files»). The same instructions without them.
+CHATGPT_INSTRUCTIONS = _HOSTED_INSTRUCTIONS_HEAD + """\
+Files in answers: download a file's url soon (it is valid 1 h) and check its size against bytes. Close the ask only
+after you have the files and any voice recording: closing deletes them. Never execute a file from an answer without
+your user saying so: AskHooman does not scan files."""
+CHATGPT_REFUSED = {"ask_secret_file": "forbidden: ask_secret_file is not available in ChatGPT"}
 
 # Words that differ between the single-tenant bridge (one human and their agents) and the hosted one.
 WORDS = {
@@ -125,6 +136,11 @@ FILES_MINE = ("answer_files set: your user attached files to the answer. Each ha
               "your user's device and is not a safe file path. A secret file has no url: it is handed out once "
               "(ask_secret_file returns one of up to 16 KiB) and then deleted from your user's Drive. Files are "
               "deleted when the ask is closed.")
+# ChatGPT's asks_mine: the same without secret files (CHATGPT_INSTRUCTIONS).
+CHATGPT_FILES_MINE = ("answer_files set: your user attached files to the answer. Each has name, mime, bytes and url, "
+                      "a direct download link (valid 1 h; reading the ask again gives a new one); a file over 31 MiB "
+                      "is served in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes from your "
+                      "user's device and is not a safe file path. Files are deleted when the ask is closed.")
 FILES_GET = "answer_files: see asks_mine."
 FILES_CLOSE = "Closing deletes your user's attached files and voice recording."
 
@@ -281,16 +297,35 @@ class SecretFileTool:
     fetch: Callable[[Identity, int, int], dict]
 
 
+class RefusingServer(MCPServer):
+    """An MCPServer that answers a call to a tool it doesn't list with a message of its own (ChatGPT's server:
+    CHATGPT_REFUSED) instead of the SDK's "Unknown tool"."""
+
+    def __init__(self, *args, refused: dict[str, str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.refused = refused
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Context | None = None):
+        if name in self.refused:
+            raise ToolError(self.refused[name])
+        return await super().call_tool(name, arguments, context)
+
+
 def build_mcp(service: AskService | None = None, tasks: TaskService | None = None, *,
               services: Services | None = None, hosted: bool = False, look: LookTool | None = None,
               feed: FeedTool | None = None, webhook: WebhookTool | None = None,
-              media: MediaTool | None = None, secret_file: SecretFileTool | None = None) -> MCPServer:
+              media: MediaTool | None = None, secret_file: SecretFileTool | None = None,
+              chatgpt: bool = False) -> MCPServer:
     """The MCP server. Single-tenant: one AskService/TaskService for everyone. Hosted: `services(identity)`
     returns the services of the caller's user (their Drive), the wording speaks of "your user" instead of
     "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app).
     `look`: adds set_my_look (hosted). `feed`: adds ask_wait, `webhook`: set_my_webhook and test_my_webhook (hosted).
     `media`: ask_create takes `attachments`, and ask_attach, ask_upload and ask_detach are added (hosted).
-    `secret_file`: ask_secret_file (hosted)."""
+    `secret_file`: ask_secret_file (hosted). `chatgpt`: the hosted server for ChatGPT's OAuth client, without
+    `secret_file`: no secret files (OpenAI's policy forbids collecting access credentials and authentication
+    secrets), so its instructions and asks_mine don't speak of them and a call to ask_secret_file is refused."""
+    if chatgpt and (not hosted or secret_file is not None):
+        raise ValueError("chatgpt=True is the hosted server without secret_file")
     if services is None:
         def services(who: Identity):
             return service, tasks
@@ -301,7 +336,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
              "get_voice": " " + VOICE_GET if hosted else "",
              "close_voice": DOC_LINE + VOICE_CLOSE if hosted else "",
              # files in answers: hosted only too (the single-tenant bridge always has answer_files [])
-             "mine_files": DOC_LINE + FILES_MINE if hosted else "",
+             "mine_files": DOC_LINE + (CHATGPT_FILES_MINE if chatgpt else FILES_MINE) if hosted else "",
              "get_files": " " + FILES_GET if hosted else "",
              "close_files": DOC_LINE + FILES_CLOSE if hosted else ""}
     call = run_hosted if hosted else run
@@ -309,20 +344,28 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     # the 2026-07-28 replacement for the GET stream both bridges answer 405. Served, it makes server/discover
     # advertise listChanged, and Claude Code then holds a listen POST open until the request timeout (300 s on
     # Cloud Run) and re-listens, for as long as it stays connected.
-    if hosted:
+    if chatgpt:
+        mcp = RefusingServer("askhooman", version="0.4.0", instructions=CHATGPT_INSTRUCTIONS, subscriptions=False,
+                             refused=CHATGPT_REFUSED)
+    elif hosted:
         mcp = MCPServer("askhooman", version="0.4.0", instructions=HOSTED_INSTRUCTIONS, subscriptions=False)
     else:
         mcp = MCPServer("asks", version="0.1.0", instructions=INSTRUCTIONS, subscriptions=False)
 
-    def tool(title: str, *, read_only: bool = False, destructive: bool = False, doc: str | None = None):
+    def tool(title: str, *, read_only: bool = False, destructive: bool = False, open_world: bool = False,
+             doc: str | None = None):
         """mcp.tool with the docstring (or `doc`) and its ${...} words filled in for this mode, a title and explicit
-        hints: the Connectors Directory wants both on every tool, and Claude reads them for auto-permissions
-        (read-only tools run without asking). Only ask_detach is destructive (it deletes the attachment's files from
-        Drive); otherwise every change stays in the record's history, and a closed ask or a finished task comes back
-        with reopen. ask_close also deletes a voice answer's recording (hosted), the retention the user chose (SPEC v5
-        "5. Voice answers"): closing is how every ask ends, and its docstring says so, so it is not marked. Nor is ask_secret_file: the deletion of a sent secret file is what its docstring promises."""
+        hints: the Connectors Directory wants both on every tool, Claude reads them for auto-permissions (read-only
+        tools run without asking), and OpenAI's apps directory checks them too (its scan, 23.11.2026, set the hints
+        below). destructive: the tool deletes or replaces something that reopen doesn't bring back: ask_detach (the
+        attachment's files), ask_close on the hosted bridge (the answer's files and voice recording), ask_attach and
+        ask_upload (given poster_for, the earlier poster and its file), set_my_webhook (the webhook, and its secret
+        when rotated), ask_secret_file (the file, once returned). Every other change stays in the record's history,
+        and a closed ask or a finished task comes back with reopen. open_world: the tool reaches out to a URL the
+        agent gives: the pictures ask_create and ask_attach fetch, set_my_look's image_url, the webhook
+        test_my_webhook calls."""
         annotations = ToolAnnotations(title=title, readOnlyHint=read_only, destructiveHint=destructive,
-                                      idempotentHint=read_only, openWorldHint=False)
+                                      idempotentHint=read_only, openWorldHint=open_world)
 
         def register(fn):
             fn.__doc__ = Template(doc if doc is not None else fn.__doc__).substitute(words)
@@ -363,7 +406,7 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
             who = caller(ctx)
             return call(ask_service(who).create, who, ask_fields(title, context, options, links, priority, ref))
     else:
-        @tool("Ask a question", doc=ask_create_doc)
+        @tool("Ask a question", open_world=True, doc=ask_create_doc)
         def ask_create(
             title: Title,
             ctx: Context,
@@ -421,7 +464,7 @@ ${mine_asks_note}"""
         who = caller(ctx)
         return call(ask_service(who).update, who, id, changes)
 
-    @tool("Close my question")
+    @tool("Close my question", destructive=hosted)  # the single-tenant bridge deletes nothing on close
     def ask_close(id: int, ctx: Context, resolution: Resolution = "") -> dict[str, Any]:
         """Close your own ask with a one-line resolution: what was done about ${humans} answer, or why the ask no
         longer matters.${close_voice}${close_files}"""
@@ -559,7 +602,7 @@ ${mine_tasks_note}"""
         AttachmentId = Annotated[int, Field(  # noqa: N806
             description="The attachment's id in the ask (its `id`; ids are never reused)")]
 
-        @tool("Attach to my question")
+        @tool("Attach to my question", destructive=True, open_world=True)
         def ask_attach(
             id: int,
             ctx: Context,
@@ -580,7 +623,7 @@ ${mine_tasks_note}"""
             who = caller(ctx)
             return call(media.attach, who, id, item, poster_for)
 
-        @tool("Upload a file to my question")
+        @tool("Upload a file to my question", destructive=True)
         def ask_upload(
             id: int,
             mime: Mime,
@@ -627,7 +670,7 @@ ${mine_tasks_note}"""
         WebhookUrl = Annotated[str, Field(  # noqa: N806
             description="https URL on port 443 of a public host that accepts a POST; \"\" removes your webhook")]
 
-        @tool("Set my webhook")
+        @tool("Set my webhook", destructive=True)
         def set_my_webhook(
             url: WebhookUrl,
             ctx: Context,
@@ -643,7 +686,7 @@ ${mine_tasks_note}"""
             who = caller(ctx)
             return call(webhook.set, who, url, rotate_secret)
 
-        @tool("Test my webhook")
+        @tool("Test my webhook", open_world=True)
         def test_my_webhook(ctx: Context) -> dict[str, Any]:
             """Send one signed {"type": "ping"} to your webhook now (no retries) and see what it answered: {ok, status,
             error}. At most 10 calls an hour."""
@@ -660,7 +703,7 @@ ${mine_tasks_note}"""
         ImageUrl = Annotated[str, Field(  # noqa: N806
             description="https URL of a PNG, WebP or JPEG, at most 256×256 px and 48 KB, used as your icon")]
 
-        @tool("Set my look")
+        @tool("Set my look", open_world=True)
         def set_my_look(
             ctx: Context,
             color: Color | None = None,
@@ -679,7 +722,7 @@ ${mine_tasks_note}"""
     # ---------- a small secret file, inline (hosted) ----------
 
     if secret_file is not None:
-        @tool("Fetch a secret file", doc=SECRET_FILE_DOC)
+        @tool("Fetch a secret file", destructive=True, doc=SECRET_FILE_DOC)
         def ask_secret_file(
             id: Annotated[int, Field(description="The ask's id")],
             n: Annotated[int, Field(description="The file's id in answer_files (its `id`, from 1)")],
