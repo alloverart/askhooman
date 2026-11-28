@@ -81,7 +81,7 @@ SUPPORT_EMAIL = "support@askhooman.com"
 PRIVACY_EMAIL = "privacy@askhooman.com"
 SECURITY_EMAIL = "security@askhooman.com"
 OPERATOR = "Allover Studio, LLC"
-POLICY_DATE = "20 November 2026"
+POLICY_DATE = "28 November 2026"
 # Terms of Service (Denis, ask 1406, 21.11.2026: «Пиши и публикуй сразу»; OpenAI's app directory needs them). The
 # provider and the law are the same as in allover.art's terms: the LLC is registered in Delaware.
 TERMS_DATE = "21 November 2026"

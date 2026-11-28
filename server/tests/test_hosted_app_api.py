@@ -445,7 +445,7 @@ def test_store_pages(hosted):
                         ("badges/google-play.png", "image/png")):
         r = hosted.get(f"/{name}")
         assert r.status_code == 200 and r.headers["content-type"].startswith(ctype), name
-    for words in ("Effective 20 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
+    for words in ("Effective 28 November 2026", "Allover Studio, LLC", "mailto:privacy@askhooman.com", "qtracker.test",
                   # 18.11.2026: pictures, videos and voice answers; what connected agents read
                   "the app saves the recording there with your answer",
                   "A voice recording is kept until the ask is closed, and 30 days at most",
