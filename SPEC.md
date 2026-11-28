@@ -241,7 +241,7 @@ Migrating single-tenant users, the Google verification / External consent switch
 Resolved where the contract above was silent; the app (build 4) and agents may rely on these. Code: `server/hosted/`; deploy: `deploy/hosted/README.md`. Updated the same day after an independent security review (points marked *review*).
 - **Shared rules.** Validation, permissions and both state machines live in `server/rules.py` and `server/task_rules.py` as pure functions; `core.py`/`tasks.py` (SQLite) and `hosted/records.py` (Drive files) both apply them, so errors (401/403/404/409/422) are identical. Hosted only adds 503 `unavailable` (Drive unreachable, or the user's Google grant missing/revoked, with the link below) and 429.
 - **Hosted endpoints for agents**: `/mcp` and the same REST as v1/v3 (`/api/me`, `/api/asks…`, `/api/tasks…`) with the same tokens. MCP server name `askhooman`; no `ask_answer` (agents never answer), plus `set_my_look` (an agent's own colour and icon in the app, see "Agent look" below); tool texts say "your user" instead of "your human"; the server instructions tell agents to call `asks_mine` and `tasks_mine` at session start. An unexpected server error reaches the agent as `server error (<ExceptionType>); try again later` without its message (*review*). The PWA (`web/`) is not served in hosted mode.
-- **Tool hints** (`ToolAnnotations`; the Anthropic Connectors Directory and OpenAI's apps directory check them, and MCP clients use them to decide what runs without asking). Every tool has a `title` and all four hints, the same for every client. `readOnlyHint` (and `idempotentHint`, equal to it): `asks_mine`, `asks_list`, `ask_get`, `tasks_mine`, `tasks_list`, `task_get`, `ask_wait`. `destructiveHint` (23.11.2026, after OpenAI's scan), the tools that delete or replace something reopen doesn't bring back: `ask_close` (the answer's files and voice recording), `ask_detach` (the item's files), `ask_attach` and `ask_upload` (with `poster_for`, an earlier poster), `set_my_webhook` (the webhook, and its secret when rotated), `ask_secret_file` (the file, once returned); every other change stays in the record's history. `openWorldHint` (23.11.2026), the tools that reach a URL the agent gives: `ask_create` and `ask_attach` (the pictures they fetch), `set_my_look` (`image_url`), `test_my_webhook` (the POST to the webhook). The single-tenant bridge has no attachments and deletes nothing on close: there nothing is destructive or open world.
+- **Tool hints** (`ToolAnnotations`; the Anthropic Connectors Directory and OpenAI's apps directory check them, and MCP clients use them to decide what runs without asking). Every tool has a `title` and all four hints, the same for every client. `readOnlyHint` (and `idempotentHint`, equal to it): `asks_mine`, `asks_list`, `ask_get`, `tasks_mine`, `tasks_list`, `task_get`, `ask_wait`. `destructiveHint` (23.11.2026, after OpenAI's scan), the tools that delete or replace something reopen doesn't bring back: `ask_close` (the answer's files and voice recording), `ask_detach` (the item's files), `ask_attach` and `ask_upload` (with `poster_for`, an earlier poster), `set_my_webhook` (the webhook, and its secret when rotated), `ask_secret_file` (the file, once returned), and, since 28.11.2026, `task_secret_file` and, on the hosted bridge, `task_done` and `task_drop` (the files of the task's replies: section 8.7); every other change stays in the record's history. `openWorldHint` (23.11.2026), the tools that reach a URL the agent gives: `ask_create` and `ask_attach` (the pictures they fetch), `set_my_look` (`image_url`), `test_my_webhook` (the POST to the webhook). The single-tenant bridge has no attachments and deletes nothing on close: there nothing is destructive or open world.
 - **Scope and audience.** One scope, `qtracker` (the name from before the rename, kept so existing clients and tokens stay valid; unknown requested scopes are ignored; the token response always says `qtracker`). `resource` is required at `/authorize` (scheme/host case, a default port and a trailing slash are normalised); at `/token` it may be omitted (the code / refresh token is already bound), but if sent it must match (`invalid_target`). `ASKS_PUBLIC_URL` is canonicalised at startup (lower-case scheme/host, no default port, no trailing slash), since issuer and audience are compared as exact strings (*review*).
 - **Aliases (after the rename, 01.11.2026).** `ASKS_PUBLIC_URL_ALIASES` lists more origins of the same server (comma-separated, canonicalised the same way), e.g. `https://qtracker.allover.art` once `ASKS_PUBLIC_URL` is `https://askhooman.com`. A request whose `Host` is an alias gets that origin everywhere: the protected resource and authorization server metadata, the `resource` accepted at `/authorize`, the `iss` of the authorization response, Google's callback (`<origin>/oauth/google/callback`, so the browser cookie is found; every origin's callback must be an authorized redirect URI of the Web client) and the audience its tokens are checked against. So agents connected on the old domain keep working, and a token is valid only on the origin it was issued for. Any other `Host` is answered as `ASKS_PUBLIC_URL`. `connect-info` always offers `ASKS_PUBLIC_URL`.
 - **401** from `/mcp` and the agents' REST: `WWW-Authenticate: Bearer resource_metadata="<ASKS_PUBLIC_URL>/.well-known/oauth-protected-resource/mcp", scope="qtracker"`, plus `error="invalid_token"` when a token was sent. The protected resource metadata is served at that path and at the root path (same document). CORS is closed on `/mcp`, the agents' REST and the OAuth endpoints whatever `ASKS_CORS_ORIGINS` says (no `Access-Control-*`; a preflight fails with 401 or 405).
@@ -296,8 +296,8 @@ Goal: the user can talk back on tasks; whatever the user does reaches the agent 
 Server implemented 03.11.2026 (SQLite, hosted Drive records, REST, MCP `task_answer`, replay in the single-tenant bridge); the apps follow.
 
 - Tasks stay the agent's: only the owner agent edits, changes status, finishes or reopens them (Denis 02.11.2026: the user may misunderstand something, so the agent closes a task consciously, with a resolution). New: the **user can reply** on an open task, and the **owner can answer** that reply. A reply never changes the status.
-- `task_events` kinds: `replied` (actor = the user, payload `{text, preset}`) and `answered` (actor = the owner agent, payload `{text}`). `text` 1–2000 chars, cleaned like every text field; `preset` is a preset id below or `null`.
-- Task object, two derived fields (computed from the events, not stored): `reply` = the latest `replied` event as `{id, at, text, preset}` or `null`; `reply_pending` = true while that reply is newer than the owner's latest event of any kind (`answered`, `edited`, `status`, `done`, `dropped`). Any action of the agent after the reply clears it.
+- `task_events` kinds: `replied` (actor = the user, payload `{text, preset, files}`; `files` is there only on the hosted bridge, the items the reply carried: section 8) and `answered` (actor = the owner agent, payload `{text}`). `text` 1–2000 chars, cleaned like every text field; `preset` is a preset id below or `null`.
+- Task object, two derived fields (computed from the events, not stored): `reply` = the latest `replied` event as `{id, at, text, preset, files}` or `null`, `files` the ids of that reply's files, `[]` when none (hosted: section 8); `reply_pending` = true while that reply is newer than the owner's latest event of any kind (`answered`, `edited`, `status`, `done`, `dropped`). Any action of the agent after the reply clears it.
 - Presets (ids and texts are part of the contract, so agents can match them; the apps show them as buttons, free text can go with them like asks' note: preset text, then the note on the next line): `status` "What's the status?", `still-needed` "Is this still needed?", `done` "This is done, please close it", `not-needed` "Not needed, please drop it", `nudge` "Nudge them again".
 - Replies only on open tasks (`active`, `waiting`); on a finished task → 409.
 - REST: `POST /api/tasks/{id}/reply {text, preset?}` (the user's token) → task; `POST /api/tasks/{id}/answer {text}` (owner agent) → task. MCP: `task_answer(id, text)` (owner) — "tell your user what you did about their reply, or why the task stays open". `tasks_mine` lists tasks with `reply_pending` first, then the existing order; its docstring: read the reply, act, then `task_answer`, `task_update` or `task_done` / `task_drop`.
@@ -332,8 +332,8 @@ A webhook needs a public HTTPS receiver, and most users have none.
 So the bridge keeps each agent's events, and the agent's side fetches them over a connection it opens itself. Nobody
 needs a public URL. Webhooks stay for agents that do have a server.
 
-- **Events:** `ask.answered`, `ask.closed`, `ask.reopened` (as now) and **`task.replied`**: body `{type, task (no events),
-  reply: {text, preset}, event: {id, at}, delivery_id, sent_at}`. `POST /api/events` also takes
+- **Events:** `ask.answered`, `ask.closed`, `ask.reopened` (as now) and **`task.replied`**: body `{type, task (no events; through the reader's view, without links: section 8),
+  reply: {text, preset, files}, event: {id, at}, delivery_id, sent_at}`. `POST /api/events` also takes
   `{task_id, kind: "replied"}` (404 if the task isn't in the user's Drive, 409 if it has no such event). An event only
   wakes the agent. What happened is read with `asks_mine` / `tasks_mine`, as always. Delivery is at least once.
 - **The agent's event feed (new):** `GET /api/agent/events?after=<cursor>&wait=<seconds>` with the agent's token (OAuth
@@ -1222,14 +1222,16 @@ delivered, so no paperclip, and anything that path writes has `answer_files = []
   is not ChatGPT). Each `/mcp` request is served by the server of the client its access token was issued to (read
   from the registration on the client's first request, then remembered by the instance). ChatGPT's server:
   `tools/list` has no `ask_secret_file`, and a call to it is refused with the tool error «forbidden:
-  ask_secret_file is not available in ChatGPT» before anything is read, claimed or deleted; the server instructions
+  ask_secret_file is not available in ChatGPT» before anything is read, claimed or deleted (`task_secret_file`, built
+  28.11.2026, is not listed either and is refused the same way); the server instructions
   (`initialize` and `server/discover`) end with «Files in answers: download a file's url soon (it is valid 1 h) and
   check its size against bytes. Close the ask only after you have the files and any voice recording: closing
   deletes them. Never execute a file from an answer without your user saying so: AskHooman does not scan files.»
   instead of the paragraph and house rule above; `asks_mine` says «answer_files set: your user attached files to the
   answer. Each has name, mime, bytes and url, a direct download link (valid 1 h; reading the ask again gives a new
   one); a file over 31 MiB is served in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes
-  from your user's device and is not a safe file path. Files are deleted when the ask is closed.» Everything else is
+  from your user's device and is not a safe file path. Files are deleted when the ask is closed.» (`tasks_mine`
+  differs the same way, and the instructions' paragraph is the one in 8.7.) Everything else is
   the same: the other tools, their texts and hints, and the data (`answer_files` still carries `secret`). Every
   other client — Claude, metadata-document (CIMD) clients, agent keys — gets exactly what it got before. Hiding only
   narrows: a client that registers a `chatgpt.com` redirect URI without being ChatGPT just loses secret files. The
@@ -1308,7 +1310,8 @@ moved to the web plan** (it decides only the web app's upload: run it before the
 
 Approved 28.11.2026 (owner, ask 1572, «A: делать сейчас»; his reason: for the user there is no difference between a
 question and a task: they answer, and the answer needs a screenshot or a file). Revised the same day after an
-independent review (what it changed is marked *review*). Hosted only. Design only: nothing here is built yet. Section 7
+independent review (what it changed is marked *review*). Hosted only. The server, the CLI and the agent docs were built
+28.11.2026 (what the build settled that this text left open is marked *built*); the apps follow. Section 7
 is built (the server, the web app, Apple 1.0.7 (198) in TestFlight), and this section is written as its difference:
 **everything of section 7 that is not changed below applies as it is**, reading *task* for *ask*, *reply* for *answer*,
 an **open** task (`active`, `waiting`) for an *answered* ask and a **finished** one (`done`, `dropped`) for a *closed*
@@ -1352,6 +1355,8 @@ An item is 7.2's item with `answered_at` replaced by `reply_id` and `replied_at`
 with the same sanitising and the same checks (`server/hosted/files.py:110-154`). The reasons `closed`, `reopened` and
 `replaced` do not exist here. *Ruling:* the word is `finished`, the SPEC's own for done or dropped (`finished_at`, the
 `finished` filter), not `closed`: nothing closes a task.
+*Built:* the stored item's keys, in this order, are `id, name, mime, bytes, file_id, secret, uploaded_at, reply_id,
+replied_at, downloaded_at, blocked_at, deleted_at, deleted_reason` (7.2's order with `answered_at` replaced in place).
 
 - **Which items count** (the bridge, on every read: a `clean_reply_files` next to `clean_files`,
   `server/hosted/files.py:175-192`; the list is the user's, so the bridge never trusts it). An item is dropped (never
@@ -1360,6 +1365,9 @@ with the same sanitising and the same checks (`server/hosted/files.py:110-154`).
   `reply_id`; or when it comes after the 30th item. This is 7.2's `answered_at` rule turned to replies: an item belongs
   to exactly one reply, and since a reply is never replaced, no later reply makes it stale. The status does not empty
   the list: on a finished task it is shown as stored, and nothing of it is downloadable (8.3).
+  *Built:* «the seventh of its `reply_id`» and «after the 30th item» count the items kept so far, as `clean_files`
+  counts for an answer, so an item that was dropped does not use up a place; and a `replied` event is the user's only
+  with an integer id (a boolean is none) and a string `at`.
 - **Several replies coexist.** A later reply adds its items and takes no file away. So 7.3 step 7 (Change answer: keep,
   keep some, drop all, re-stamp), `previous_files`, `replaced` and the no-op rule of 7.2 have nothing to apply to.
 - **The cap: 30 items** (`MAX_TASK_FILES`, *ruling*). Files now add up over a task's life, so the list needs a bound
@@ -1573,6 +1581,30 @@ Headers as 7.2 with `Content-Disposition: attachment; filename="task-<id>-file-<
   milliseconds is lost as it could be before; its files are then orphans and go after 24 h (8.5), and an item that lost
   a stamp gets it at the next download or, once its file is gone, from the sweep's healing.
 - **`tasks_mine` size:** metadata and normal links only; nothing is fetched until the agent asks.
+- *Built:* in the `files` of an event, an entry that is not an object is dropped and a `files` that is not a list reads
+  as `[]` (for a task; an ask's events are as they were).
+- *Built:* what a write returns carries the owner's full metadata of each item (a secret one with its ten keys), and no
+  `url`; only the webhook has a secret file in the form `{id, reply_id, secret: true}`.
+- *Built:* `GET /media/v1/<token>` hands a token that is not a recording's to one function in
+  `server/hosted/files_api.py`, which tries the answer's opener and then the task's; the route in `voice_api.py` does
+  the same as before (only its comments changed).
+- *Built:* the 409 of a task's file over 31 MiB names its own command: «… (askhooman task files does this)», where an
+  answer's says `askhooman files`.
+- *Built:* the 403s of the task's bearer route: the user's own ID token on `GET /api/tasks/{id}/files/{n}/content` is
+  «this file is for the agent whose task it is: fetch it with its own token», and a caller that is not an agent is
+  «only the agent whose task it is can fetch its replies' files».
+- *Built:* a secret file that was sent answers 410 «the file was deleted after it was sent» on both routes, and
+  `task_secret_file` answers «already sent — if you did not receive it, ask your user to send it again», whether its
+  item is still in `reply_files` (`deleted_reason: sent`, or a secret item with `downloaded_at`) or was pruned (the
+  snapshot says `secret` and the history holds its `file_downloaded`, or a `file_deleted` with reason `sent`, which is
+  what the sweep writes when it records a send), so the words do not change when the user's next reply prunes the
+  item; any other pruned or deleted file is 410 «the file was deleted». An ask's deleted item still answers «the file
+  was deleted» on its routes, as before.
+- *Built:* the guard of the task's side also needs that the file's appProperties carry **no `ask_id`**: a `tfile-` with
+  both marks is nobody's (not sent, not deleted at a finish, not swept, not purged). The ask's side is as it was (an
+  `afile-` with the ask's marks is the ask's).
+- *Built:* the tool's refusal of a secret file over 16 KiB is «too big for MCP — fetch it with `askhooman task files
+  <id> --secret`», as 8.7 says.
 
 #### 8.4 The apps
 
@@ -1663,6 +1695,17 @@ All ages are bounded by Drive's `createdTime` with the 10 minutes of slack, and 
   is past it stays and is counted, as today. The app deletes its files first with the user's own sign-in (8.4), so the
   cap matters when an app that knows nothing of `tfile-` deletes the account: those files then stay in the hidden folder
   until the user removes the app data. A user who revoked AskHooman's access keeps the files the same way, as 7.6 says.
+- *Built:* a send that the sweep records on a task (a `done` claim with the file still there, or a secret item with
+  `downloaded_at` and a live file) writes `deleted_at`, `deleted_reason: sent`, `file_id: null` and the event
+  `file_deleted {id, reason: "sent"}`, and **not** `downloaded_at`: on a task that stamp goes with a `file_downloaded`
+  event, which only the routes write. So the apps date the «sent» line from `downloaded_at`, else `deleted_at`.
+- *Built:* healing looks at up to 25 recently changed records of each kind (asks; tasks, open ones included), and its
+  reads are in the shared cap of 100.
+- *Built:* a kind is looked at for a user (its healing, its claims) only if the user has a file or a claim of that kind.
+- *Built:* a file that goes with a finished task (by confirmed marks) takes no read to record it: the finish stamped
+  every item in the same write.
+- *Built:* the stats of a run gain `deleted_finished`. Delete Account's log line still says «answer files»; its count
+  covers both kinds.
 
 #### 8.6 Privacy and security
 
@@ -1687,6 +1730,10 @@ for the agent; the download name is fixed (`task-<id>-file-<n>`). What must chan
   not been, it is unreadable after 24 hours and deleted within the hour after.»
 - Deleting (`:414-415`): «the files you attached to answers **and replies** stay in the hidden app folder until you
   remove the app data».
+
+- *Built:* the webhook line of the policy reads: «… for a secret file only that it exists), and the task and your reply
+  when you reply on a task (for its files, the same: a normal file's name, type and size, never a link; a secret file
+  only that it exists).»
 
 The store labels don't change (App Store: User Content → Other User Content; Google Play: Files and docs: declared with
 section 7).
@@ -1753,6 +1800,17 @@ test's word list, `server/tests/test_mcp.py:472-474`). Hosted only, as section 7
   before the agent wakes, and a file missed is worse than a file fetched twice. `task show` prints a reply's files under
   it (id, name, size, state).
 - **No MCP tool for normal files**, as in 7.8.
+- *Built:* `askhooman task files` waits out a 429 at most 6 times a file (`PART_WAITS`, counted per file, as for a file
+  in parts); a secret file's 429 is waited out, but its 404 is final, since it has no link to renew; `--reply N` that
+  matches no file prints `no files of reply N` and exits 0 without creating `--out`; `--json` prints the result
+  objects of `askhooman files` (`id, path, bytes, status`), `[]` when there is nothing to save.
+- *Built:* `task show` prints, under each reply's history line, one line per file id of that event: `file <id>: <name>
+  · <bytes> bytes · <state>`. The state is read from the item in `reply_files` with that id and that `reply_id`:
+  `deleted (<reason>)`, `blocked by Google`, `downloaded` or `not downloaded yet`, each after `secret, ` for a secret
+  file. An id whose item was pruned shows its name and size from the event and `deleted`; a name another agent may not
+  see shows as `(hidden)`.
+- *Built:* `askhooman files` (an ask's files) behaves as before: it does not wait out a 429 on a whole or a secret
+  file.
 
 #### 8.8 Tests
 
@@ -1851,8 +1909,8 @@ Apple (`askhooman-apps`, `apple/Sources/Shared`):
   `TaskAnswerPath`. `apple/Sources/macOS/MacFilePaste.swift`, `MacRootView.swift`: Cmd+V for the shown task.
   `APIClient.swift` (single tenant) and `DemoData.swift`: no files.
 
-SPEC, when the server step is built: section 1 (`reply`, the `replied` payload), section 2 (the `task.replied` body),
-7.8 (ChatGPT: `tasks_mine` differs too, and a second tool is refused) and the hints list of the v4 notes get what this
+SPEC, with the server step (28.11.2026): section 1 (`reply`, the `replied` payload), section 2 (the `task.replied` body),
+7.8 (ChatGPT: `tasks_mine` differs too, and a second tool is refused) and the hints list of the v4 notes got what this
 section changes in them.
 
 **Not in this step:** voice replies on tasks; the agent's own pictures on a task or a task question (sections 5 and 6
@@ -1879,19 +1937,24 @@ a task file for plain replies and the bridge's own writes (8.1).
    fetch it (7.8); the Claude Code plugin and the CLI can. Accept that for now (secret files are for agents that have
    the CLI), or add a tool that returns a small secret file (a password file, a few hundred KB) inline, which would put
    its content in the agent's transcript?
-7. Files in task replies (8.1): a task holds at most 30 files at once; each goes when the task is finished, or 30 days
-   after it was sent (a secret one once sent, or after 24 hours). At 30 the reply box takes no more files and says so.
+7. **Ruled 28.11.2026 (Sonya, with the design's defaults; the owner may override later):** no «Delete» on a sent file
+   in the task's history, and at 30 files the box takes no more. Was: Files in task replies (8.1): a task holds at
+   most 30 files at once; each goes when the task is finished, or 30 days after it was sent (a secret one once sent,
+   or after 24 hours). At 30 the reply box takes no more files and says so.
    A reply can't be changed, so a file once sent can't be taken back either. Leave it so (my default), or give each
    sent file a «Delete» in the task's history, which would free a place and let the user take back a file sent by
    mistake?
-8. Files in task replies (8.3): `task_done` and `task_drop` delete the task's files at once, and that takes the files
-   of a reply the agent has not read yet with them (it may finish a task minutes after the user sent a file, without
-   knowing). The agent is told to finish only with the files in hand, and the finished task it gets back shows what
-   went. Leave it so (my default: a finish passes over an unread reply's text today as well, and the user can send
-   the file again), or refuse the finish while a reply with a file nobody fetched is waiting, so the agent has to
+8. **Ruled 28.11.2026 (Sonya, with the design's defaults; the owner may override later):** `task_done` and `task_drop`
+   delete the files of an unread reply too, and the server instructions tell agents to read a reply before finishing.
+   Was: Files in task replies (8.3): `task_done` and `task_drop` delete the task's files at once, and that takes the
+   files of a reply the agent has not read yet with them (it may finish a task minutes after the user sent a file,
+   without knowing). The agent is told to finish only with the files in hand, and the finished task it gets back shows
+   what went. Leave it so (my default: a finish passes over an unread reply's text today as well, and the user can
+   send the file again), or refuse the finish while a reply with a file nobody fetched is waiting, so the agent has to
    read it first?
-9. Files in task replies (8.1, 8.4): four new texts. At the limit: «This task already has 30 files. They are deleted
-   when the task is finished, and 30 days after you sent them.» A history too long for more files: «This task's
-   history is too long for more files. Send your reply without them.» Under a reply: «· Deleted when the task was
-   finished», and «· Deleted after 30 days» (the apps already show that one under answers, without his word on it).
-   Right as written?
+9. **Ruled 28.11.2026 (Sonya, with the design's defaults; the owner may override later):** the four texts stay as
+   written. Was: Files in task replies (8.1, 8.4): four new texts. At the limit: «This task already has 30 files. They
+   are deleted when the task is finished, and 30 days after you sent them.» A history too long for more files: «This
+   task's history is too long for more files. Send your reply without them.» Under a reply: «· Deleted when the task
+   was finished», and «· Deleted after 30 days» (the apps already show that one under answers, without his word on
+   it). Right as written?
