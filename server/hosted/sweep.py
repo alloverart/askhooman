@@ -170,8 +170,7 @@ def purge_answer_files(pool: DrivePool, user: str, limit: int | None = None) -> 
             else:
                 failed += 1
     except Exception as exc:  # Drive down, no grant: the user can delete the app data in Google's settings
-        log.warning("hosted: answer and reply files of user %s not deleted with the account: %s", user,
-                    type(exc).__name__)
+        log.warning("hosted: answer files of user %s not deleted with the account: %s", user, type(exc).__name__)
         failed += 1
     return deleted, failed, left, cut
 
