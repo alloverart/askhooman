@@ -28,7 +28,8 @@ else gets url null, and transcript null too, in answer_voice and in the history 
 answer_voice of event payloads): the user edits the heard text before sending, so only the agent that asked sees it.
 
 A task's reply files (SPEC 8.3) go through the same kind of view (for_task_reader): no Drive file id for anyone, in
-reply_files and in the files of the history; a link (files.TaskFileLinks) only for the agent that owns the task.
+reply_files and in the files of the history (whose names are cleaned again and whose junk is dropped); a link
+(files.TaskFileLinks) only for the agent that owns the task.
 
 Nothing here touches Drive or logs anything of a voice answer.
 """
@@ -248,14 +249,36 @@ def _task_items(items: list, named: bool) -> list:
     return _agent_items([item for item in items if isinstance(item, dict)], named, AGENT_TASK_FILE_KEYS)
 
 
+def _event_files(files: list) -> list:
+    """The `files` of a task event's payload read again, as reply_files is on every read (SPEC 7.2, 8.3): for a pruned
+    file this snapshot is the only source of its name. An entry that is not an object, or whose id is not an int (a
+    bool is none: task_rules.reply_file_ids), is dropped; a name is cleaned (files.clean_name), and one that is not a
+    string reads as null."""
+    from .files import clean_name  # files.py imports this module, so not at the top
+
+    kept = []
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), int) or isinstance(item.get("id"), bool):
+            continue
+        if "name" in item:
+            item = {**item, "name": clean_name(item["name"]) if isinstance(item["name"], str) else None}
+        kept.append(item)
+    return kept
+
+
 def _task_event(event, owner: bool):
-    """An event of a task as an agent sees it: the `files` of its payload, whatever its kind, as _task_items (a
-    `files` that is not a list as []); the rest as stored."""
-    payload = event.get("payload") if isinstance(event, dict) else None
-    if not isinstance(payload, dict) or "files" not in payload:
+    """An event of a task as an agent sees it: a payload that is not an object as null; the `files` of one that is,
+    whatever the event's kind, as _event_files then _task_items (a `files` that is not a list as []); the rest as
+    stored."""
+    if not isinstance(event, dict):
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return {**event, "payload": None} if "payload" in event else event
+    if "files" not in payload:
         return event
     files = payload["files"] if isinstance(payload["files"], list) else []
-    return {**event, "payload": {**payload, "files": _task_items(files, owner)}}
+    return {**event, "payload": {**payload, "files": _task_items(_event_files(files), owner)}}
 
 
 def _reply_file_view(task: dict, reader, owner: bool, file_urls: bool, file_links) -> list:
@@ -281,11 +304,11 @@ def _reply_file_view(task: dict, reader, owner: bool, file_urls: bool, file_link
 
 def for_task_reader(task: dict, reader, file_urls: bool = True, file_links=None) -> dict:
     """The task as `reader` gets it (SPEC 8.3). reply_files and the `files` of every event go through the view for
-    everyone (AGENT_TASK_FILE_KEYS), so a Drive file id never leaves the bridge. The agent that owns the task (decided
-    as in for_reader) sees name and mime, and a link on each normal file of an open task (files.TaskFileLinks, only
-    when `file_links` is given and `file_urls` is true; the webhook passes file_urls=False and gets no url and a
-    secret file as {id, reply_id, secret: true}). Everyone else: name and mime null, no url. `reply` is ids only,
-    the same for every reader, and stays as it is."""
+    everyone (AGENT_TASK_FILE_KEYS; an event's also as _task_event reads them), so a Drive file id never leaves the
+    bridge. The agent that owns the task (decided as in for_reader) sees name and mime, and a link on each normal file
+    of an open task (files.TaskFileLinks, only when `file_links` is given and `file_urls` is true; the webhook passes
+    file_urls=False and gets no url and a secret file as {id, reply_id, secret: true}). Everyone else: name and mime
+    null, no url. `reply` is ids only, the same for every reader, and stays as it is."""
     owner = _owns(reader, task)
     shown = task
     if isinstance(task.get(REPLY_FILES), list):

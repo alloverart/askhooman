@@ -546,26 +546,33 @@ def test_for_task_reader_webhook_shape():
 
 def test_events_files_go_through_the_view_for_everyone():
     one, other = task_item(1), task_item(2, file_id="fid-9")
+    climbing, unnamed = task_item(7, name="../../etc/report.PDF"), task_item(8, name=5)
     events = [created(),
-              replied(2, files=[one, "fid-1", 5, None, ["fid-1"]]),
+              replied(2, files=[one, "fid-1", 5, None, ["fid-1"], {"id": True}, {"id": "3"}, climbing, unnamed]),
               {"id": 3, "task_id": 1, "at": BY_ALLEN, "actor": "allen", "kind": "updated",
                "payload": {"title": "x", "files": [other]}},
               {"id": 4, "task_id": 1, "at": BY_ALLEN, "actor": "allen", "kind": "answered", "payload": {"text": "ok"}},
               {"id": 5, "task_id": 1, "at": BY_ALLEN, "actor": "denis", "kind": "replied", "payload": "junk"},
               {"id": 6, "task_id": 1, "at": BY_ALLEN, "actor": "denis", "kind": "replied",
-               "payload": {"text": "t", "files": "fid-1"}}]
+               "payload": {"text": "t", "files": "fid-1"}},
+              {"id": 7, "task_id": 1, "at": BY_ALLEN, "actor": "denis", "kind": "replied", "payload": ["fid-1"]}]
     task = stored_task([], events=events)
     before = json.dumps(task)
     for reader, named in ((owner_reader(), True), (HostedIdentity("agent", "feynman", user="u1", agent_id="ag_2"),
                                                     False)):
         shown = for_task_reader(task, reader, file_links=task_file_links())["events"]
-        assert [f["id"] for f in shown[1]["payload"]["files"]] == [1]  # what is not an object is dropped
+        # what is not an object, or has no integer id (a boolean is none), is dropped
+        assert [f["id"] for f in shown[1]["payload"]["files"]] == [1, 7, 8]
         assert [f["id"] for f in shown[2]["payload"]["files"]] == [2]  # another kind's files: viewed too
         for f in (*shown[1]["payload"]["files"], *shown[2]["payload"]["files"]):
-            assert list(f) == TEN and (f["name"] is not None) is named, f
+            assert list(f) == TEN and (f["name"] is not None) is (named and f["id"] != 8), f
+        if named:  # the names are read again, as reply_files' are (SPEC 7.2); one that is not a string is none
+            assert [f["name"] for f in shown[1]["payload"]["files"]] == ["report1.pdf", "etc_report.PDF", None]
         assert shown[2]["payload"]["title"] == "x" and shown[1]["payload"]["text"] == "x"
         assert shown[5]["payload"] == {"text": "t", "files": []}  # files that are not a list are none
-        assert (shown[0], shown[3], shown[4]) == (events[0], events[3], events[4])
+        assert (shown[0], shown[3]) == (events[0], events[3])
+        assert shown[4] == {**events[4], "payload": None} and shown[6] == {**events[6], "payload": None}
+        assert "../" not in json.dumps(shown)
         no_stored_keys(shown)
     assert json.dumps(task) == before  # the stored events are left as they were
 
@@ -712,6 +719,76 @@ def test_no_file_id_in_any_agents_view(hosted, google):
         assert file_id not in text, file_id
     for key in ("file_id", "uploaded_at", "replied_at"):
         assert f'"{key}"' not in text, key
+
+
+def edit_history(drive, task_id: int, files=None, more: tuple = ()) -> list:
+    """The task file's history as a hand edit of the user's Drive could leave it: the latest event's payload `files`
+    replaced by `files(stored)` (given the files it carried), and `more` events added. Returns the events written."""
+    doc = json.loads(drive.file(f"task-{task_id}.json")["content"])
+    if files is not None:
+        payload = doc["events"][-1]["payload"]
+        payload["files"] = files(payload["files"])
+    events = [*doc["events"], *more]
+    rewrite_task(drive, task_id, events=events)
+    return events
+
+
+def test_the_history_is_read_again_for_every_agent(hosted, google):
+    """SPEC 8.3 (M-2 of the final review): in the `files` of an event's payload a name is cleaned as reply_files' are
+    and an entry without an integer id is dropped; a payload that is not an object reads as null. The bridge's own
+    read keeps the history as stored."""
+    allen = agent(hosted, google)
+    feynman = agent(hosted, google, "Feynman")
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, allen, "task_create", {"title": "Chase the supplier"}))
+    app_task_reply_files(drive, 1, [sent_item(drive, 1, name="../../etc/report.PDF")])
+    at = now_iso()
+    events = edit_history(drive, 1, lambda stored: [*stored, {"id": True}, {"id": "3"}],
+                          ({"id": 3, "task_id": 1, "at": at, "actor": "denis", "kind": "replied", "payload": "junk"},
+                           {"id": 4, "task_id": 1, "at": at, "actor": "denis", "kind": "replied", "payload": ["x"]}))
+    for token, name in ((allen, "etc_report.PDF"), (feynman, None)):
+        for task in (tool_result(mcp(hosted, token, "task_get", {"id": 1})),
+                     hosted.get("/api/tasks/1", headers=bearer(token)).json()):
+            assert [f["name"] for f in task[REPLY_FILES]] == [name]
+            first, *junk = [e for e in task["events"] if e["kind"] == "replied"]
+            assert [(f["id"], f.get("name")) for f in first["payload"]["files"]] == [(1, name)]
+            assert [e["payload"] for e in junk] == [None, None] and task["reply"]["files"] == []
+            assert "../" not in json.dumps(task) and '"file_id"' not in json.dumps(task)
+    assert tasks_of(hosted).get(1)["events"] == events  # the bridge's own read: as stored
+    assert events[1]["payload"]["files"][0]["name"] == "../../etc/report.PDF"
+
+
+@pytest.mark.parametrize("listed", [False, True], ids=["files-not-a-list", "files-with-junk"])
+def test_junk_in_a_replys_files_fails_no_read(hosted, google, listed):
+    """Review Focus 1 through the hosted app (M-11 of the final review): junk in the `files` of a `replied` event
+    fails no read, of that task or of a healthy one beside it; `reply.files` keeps only integer ids, and no Drive
+    file id reaches the agent."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "task_create", {"title": "Chase the supplier"}))
+    tool_result(mcp(hosted, token, "task_create", {"title": "Book the venue"}))
+    app_task_reply_files(drive, 1, [sent_item(drive, 4)])
+    app_task_reply_files(drive, 2, [sent_item(drive, 1, task_id=2), sent_item(drive, 2, task_id=2, secret=True)])
+    edit_history(drive, 1, lambda stored: [1, "a", None, {"id": "3"}, {"id": True}, *stored] if listed else "x")
+    expected = {1: [4] if listed else [], 2: [1, 2]}
+    reads = []
+    for path in ("/api/tasks", "/api/tasks/1", "/api/tasks/2"):
+        response = hosted.get(path, headers=bearer(token))
+        assert response.status_code == 200, (path, response.text)
+        reads.append(response.json())
+    reads += [tool_result(mcp(hosted, token, "tasks_mine")), tool_result(mcp(hosted, token, "tasks_list")),
+              tool_result(mcp(hosted, token, "task_get", {"id": 1})),
+              tool_result(mcp(hosted, token, "task_get", {"id": 2}))]
+    tasks = [task for read in reads for task in read.get("tasks", [read])]
+    assert sorted(task["id"] for task in tasks) == [1] * 5 + [2] * 5
+    for task in tasks:
+        assert task["reply"]["files"] == expected[task["id"]], task
+    text = json.dumps(reads)
+    drive_ids = [f["id"] for f in drive.files.values() if f["name"].startswith("tfile-")]
+    assert len(drive_ids) == 3
+    for file_id in drive_ids:
+        assert file_id not in text, file_id
+    assert '"file_id"' not in text
 
 
 def test_task_webhook_body_has_no_file_urls_or_file_ids(hosted, google):
