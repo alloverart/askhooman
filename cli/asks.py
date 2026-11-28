@@ -368,6 +368,13 @@ def task_event_summary(event: dict) -> str:
     if kind in ("replied", "answered", "unasked"):
         text = first_line(payload.get("note" if kind == "unasked" else "text"))
         return f"{kind}: {text}" if text else kind
+    if kind in ("file_downloaded", "file_blocked", "file_deleted"):  # the bridge's records of a reply's file
+        n = payload.get("id") if isinstance(payload, dict) else None
+        if not isinstance(n, int) or isinstance(n, bool):
+            return kind
+        reason = payload.get("reason") if kind == "file_deleted" else None
+        reason = first_line(reason) if isinstance(reason, str) else ""
+        return f"{kind}: file {n}" + (f" ({reason})" if reason else "")
     return kind
 
 
@@ -422,8 +429,8 @@ def reply_file_lines(event: dict, items) -> list:
                if isinstance(i, dict) and i.get("reply_id") == event.get("id")}
     lines = []
     for snap in payload["files"]:
-        if not isinstance(snap, dict) or not isinstance(snap.get("id"), int):
-            continue
+        if not isinstance(snap, dict) or not isinstance(snap.get("id"), int) or isinstance(snap.get("id"), bool):
+            continue  # a boolean is no id (task_rules.reply_file_ids)
         item = current.get(snap["id"])
         if item is None:
             item, state = snap, "deleted"

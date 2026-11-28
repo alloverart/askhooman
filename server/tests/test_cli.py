@@ -1203,3 +1203,88 @@ def test_cli_task_show_prints_a_replys_files(capsys, monkeypatch):
         "file 8: [31mred.txt · 6 bytes · not downloaded yet"]
     assert lines[at + 1].startswith(" " * 10)  # under the history line, indented
     assert "\x1b" not in out and "\x07" not in out
+
+
+def test_cli_task_show_names_the_file_of_a_bridge_event(capsys, monkeypatch):
+    """The bridge's records of a reply's file in the history (SPEC 8.7): `file_downloaded: file <id>`, `file_blocked:
+    file <id>`, `file_deleted: file <id> (<reason>)`, the reason left out when there is none, and the bare kind for an
+    id that is not an integer. A boolean id in a reply's files is no file (as task_rules.reply_file_ids says)."""
+    items = [task_item(1, 4, name="a.txt", downloaded_at=GONE_AT), task_item(2, 5, name="b.png", blocked_at=GONE_AT),
+             task_item(3, 6, name="c.txt", secret=True, downloaded_at=GONE_AT, deleted_at=GONE_AT,
+                       deleted_reason="sent")]
+    at = "2026-11-20T10:00:00.000Z"
+    bridge = [("file_downloaded", {"id": 1}), ("file_blocked", {"id": 2}),
+              ("file_deleted", {"id": 3, "reason": "sent"}), ("file_deleted", {"id": 3}),
+              ("file_downloaded", {"id": True}), ("file_blocked", None),
+              ("file_deleted", {"id": "3", "reason": "expired"}), ("file_downloaded", "junk")]
+    events = [{"id": 5, "at": at, "actor": "human", "kind": "replied",
+               "payload": {"text": "Here they are", "preset": None,
+                           "files": [*(snapshot(i) for i in items), {**snapshot(items[0]), "id": True}]}},
+              *({"id": 6 + n, "at": at, "actor": "Allen", "kind": kind, "payload": payload}
+                for n, (kind, payload) in enumerate(bridge))]
+    extra = {"title": "Sew the sample", "agent": "Allen", "created_at": at, "updated_at": at, "events": events,
+             "reply": {"id": 5, "at": at, "text": "Here they are", "preset": None, "files": [1, 2, 3]}}
+    with holder_stub(items, {}, extra=extra) as (base, _):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "show", "7")
+    assert code == 0, err
+    lines = out.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.endswith("replied: Here they are"))
+    assert [line.strip() for line in lines[at + 1:at + 4]] == [
+        "file 1: a.txt · 4 bytes · downloaded",
+        "file 2: b.png · 5 bytes · blocked by Google",
+        "file 3: c.txt · 6 bytes · secret, deleted (sent)"]
+    assert "file True" not in out
+    assert [line.split("Allen", 1)[1].strip() for line in lines[at + 4:]] == [
+        "file_downloaded: file 1", "file_blocked: file 2", "file_deleted: file 3 (sent)", "file_deleted: file 3",
+        "file_downloaded", "file_blocked", "file_deleted", "file_downloaded"]
+
+
+# ---------- askhooman task files against the real bridge (SPEC 8.7; the final review's end-to-end check) ----------
+
+from .fake_drive import app_task_reply_files  # noqa: E402
+from .test_hosted_task_files import BODY, sent_item  # noqa: E402
+
+
+def test_cli_task_files_against_the_hosted_bridge(live_hosted, tmp_path, capsys, monkeypatch):
+    """`askhooman task files` and `task show` over the hosted app (uvicorn, the fake Drive), no stub of the task under
+    test: a reply with a normal and a secret file as the apps write it; the normal one saved, the secret one only
+    with --secret, once; the history names both; a finish deletes the Drive files and the CLI says so."""
+    base, key, drive = live_hosted
+    created = httpx.post(f"{base}/api/tasks", json={"title": "Chase the supplier"},
+                         headers={"Authorization": f"Bearer {key}"})
+    assert created.status_code == 201 and created.json()["id"] == 1, created.text
+    normal, secret = sent_item(drive, 1), sent_item(drive, 2, secret=True, name="keys.txt")
+    reply = app_task_reply_files(drive, 1, [normal, secret])["events"][-1]["id"]
+    out_dir = tmp_path / "in"
+
+    code, out, err = run(capsys, monkeypatch, base, key, "task", "files", "1", "--out", str(out_dir))
+    assert code == 0, err
+    assert os.listdir(out_dir) == ["task-1-file-1.pdf"] and (out_dir / "task-1-file-1.pdf").read_bytes() == BODY
+    assert "skipped file 2 (secret): it can be fetched once; add --secret to fetch it" in out
+    assert secret["file_id"] in drive.files  # not asked for: still there
+
+    code, out, err = run(capsys, monkeypatch, base, key, "task", "files", "1", "--out", str(out_dir), "--secret",
+                         "--reply", str(reply))
+    assert code == 0, err
+    assert (out_dir / "task-1-file-2.txt").read_bytes() == BODY
+    assert secret["file_id"] not in drive.files and normal["file_id"] in drive.files  # sent once, then deleted
+
+    code, out, err = run(capsys, monkeypatch, base, key, "task", "files", "1", "--out", str(out_dir), "--secret")
+    assert code == 0, err  # a deleted file is skipped, not a failure
+    assert "skipped file 2: already deleted" in out and (out_dir / "task-1-file-2.txt").read_bytes() == BODY
+
+    code, out, err = run(capsys, monkeypatch, base, key, "task", "show", "1")
+    assert code == 0, err
+    lines = [line.strip() for line in out.splitlines()]
+    assert f"file 1: report1.pdf · {len(BODY)} bytes · downloaded" in lines
+    assert f"file 2: keys.txt · {len(BODY)} bytes · secret, deleted (sent)" in lines
+    for n in (1, 2):  # the bridge's record of each download, once
+        assert sum(line.endswith(f"file_downloaded: file {n}") for line in lines) == 1, out
+
+    code, _, err = run(capsys, monkeypatch, base, key, "task", "done", "1")
+    assert code == 0, err
+    assert normal["file_id"] not in drive.files
+    code, out, err = run(capsys, monkeypatch, base, key, "task", "files", "1", "--out", str(out_dir))
+    assert code == 0, err
+    assert "skipped file 1: already deleted" in out and "skipped file 2: already deleted" in out
+    assert sorted(os.listdir(out_dir)) == ["task-1-file-1.pdf", "task-1-file-2.txt"]
