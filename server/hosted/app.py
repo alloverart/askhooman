@@ -56,7 +56,7 @@ from .stats import internal_check
 from .store import MemoryStore
 from .sweep import sweep
 from .uploads import UPLOAD_PATH, UPLOAD_PREFIX, UploadGrant, UploadGrants
-from .files import FileClaims, FileLinks
+from .files import FileClaims, FileLinks, TaskFileLinks
 from .voice import VoiceLinks
 from .voice_api import add_voice_route
 from .webhooks import WebhookSender
@@ -194,10 +194,13 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     # Files in answers (SPEC 7.4): the same for a normal file, sealed under its own context.
     file_links = FileLinks(keyring, settings.public_url)
     file_claims = FileClaims(store)
+    # Files in task replies (SPEC 8.3): the owner agent's links, under a context of their own.
+    task_file_links = TaskFileLinks(keyring, settings.public_url)
 
     def services(who: HostedIdentity):
         records = pool.records(who.user)
-        return HostedAsks(records, voice_links, who, file_links, file_claims), HostedTasks(records)
+        return (HostedAsks(records, voice_links, who, file_links, file_claims),
+                HostedTasks(records, who, task_file_links, file_claims))
 
     # Pictures and video in asks (SPEC v5 step 4): one service and one guard (the `media` bucket, the slots) for
     # the REST routes and the MCP tools alike.
@@ -384,6 +387,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.state.voice_links = voice_links
     app.state.file_links = file_links
     app.state.file_claims = file_claims
+    app.state.task_file_links = task_file_links
     app.state.auth_server = auth_server
     app.state.mcp = mcp
     app.state.chatgpt_mcp = chatgpt_mcp

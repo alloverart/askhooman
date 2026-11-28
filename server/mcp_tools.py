@@ -508,7 +508,7 @@ ${mine_asks_note}"""
         when woken.\
 ${mine_tasks_note}"""
         who = caller(ctx)
-        return call(task_service(who).list, status, None if who.is_denis else who.agent)
+        return call(partial(task_service(who).list, file_urls=True), status, None if who.is_denis else who.agent)
 
     @tool("All agents' tasks", read_only=True)
     def tasks_list(

@@ -594,7 +594,7 @@ def test_task_reply_event_feed_and_webhook(hosted, google):
     body = json.loads(call.content)
     assert body["type"] == "task.replied" and call.headers["askhooman-event"] == "task.replied"
     assert body["task"]["id"] == task["id"] and "events" not in body["task"]
-    assert body["reply"] == {"text": "What's the status?", "preset": "status"}
+    assert body["reply"] == {"text": "What's the status?", "preset": "status", "files": []}
     assert body["event"] == {"id": replied["id"], "at": replied["at"]}
     assert body["delivery_id"] == call.headers["askhooman-delivery"] and body["sent_at"]
     fed = hosted.app.state.feed.read(agent["id"], "0")["events"]

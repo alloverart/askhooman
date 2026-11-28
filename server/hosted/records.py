@@ -26,7 +26,8 @@ written (HostedAsks). HOSTED_ASK is the ask Kind with both fields.
 Hosted tasks carry one more field than single-tenant ones: `reply_files` (SPEC 8.1 "Files in task replies"), written
 by the user's apps with their `replied` event. Every read checks it against the file's own events
 (files.clean_reply_files), every write of the bridge drops what that check drops, and a new task is written with [].
-HOSTED_TASK is the task Kind with it.
+HOSTED_TASK is the task Kind with it. An agent gets every task through the reader's view (voice.for_task_reader,
+SPEC 8.3): no Drive file id, and a link to a normal file only for the agent that owns the task (HostedTasks).
 """
 
 import copy
@@ -82,8 +83,8 @@ from ..task_rules import (
 )
 from ..task_rules import STATUS_FILTERS as TASK_FILTERS
 from ..tokens import Identity
-from .files import FileClaims, FileLinks, clean_files, clean_reply_files
-from .voice import VoiceLinks, clean_voice, for_reader
+from .files import FileClaims, FileLinks, TaskFileLinks, clean_files, clean_reply_files
+from .voice import VoiceLinks, clean_voice, for_reader, for_task_reader
 
 log = logging.getLogger("asks.hosted.records")
 
@@ -661,44 +662,64 @@ class HostedAsks:
 
 
 class HostedTasks:
-    """TaskService's interface over one user's Drive. A task carries `reply_files`, as checked on read (SPEC 8.1)."""
+    """TaskService's interface over one user's Drive. A task carries `reply_files`, as checked on read (SPEC 8.1).
+    With a `reader` (an agent's calls) every task returned is as that agent gets it (voice.for_task_reader, SPEC 8.3):
+    no Drive file id, and the owner's normal files with a link (`file_links`) only from get and from list with
+    file_urls (task_get, REST GET /api/tasks/{id}, tasks_mine). Without one (the bridge's own reads: the webhook, the
+    file routes, the sweep) the task is as checked. `claims` holds the claims of secret files (files.FileClaims)."""
 
-    def __init__(self, records: UserRecords):
+    def __init__(self, records: UserRecords, reader: Identity | None = None, file_links: TaskFileLinks | None = None,
+                 claims: FileClaims | None = None):
         self.items = DriveCollection(records, HOSTED_TASK, TASK_FILTERS, TASK_STATUSES, task_order, ("links",),
                                      {"active": 0, "waiting": 0, "done": 1, "dropped": 1},
                                      decorate=lambda record, events: {**record, **task_state(events)})
+        self.reader = reader
+        self.file_links = file_links
+        self.claims = claims
+
+    def _out(self, task: dict, file_urls: bool = False) -> dict:
+        """The task as the reader gets it; its normal files carry links only with `file_urls` (task_get, tasks_mine):
+        not in the everyone's view and not in what a write returns (SPEC 8.3)."""
+        if self.reader is None:
+            return task
+        return for_task_reader(task, self.reader, file_links=self.file_links if file_urls else None)
 
     def get(self, task_id: int, with_events: bool = True) -> dict:
-        return self.items.get(task_id, with_events)
+        return self._out(self.items.get(task_id, with_events), True)
 
-    def list(self, status: str = "open", agent: str | None = None, limit: int | None = None) -> dict:
-        return self.items.list(status, agent, default_limit(status, limit))
+    def list(self, status: str = "open", agent: str | None = None, limit: int | None = None,
+             file_urls: bool = False) -> dict:
+        """The tasks; a file link only with `file_urls` (tasks_mine), not in the everyone's view (SPEC 8.3)."""
+        found = self.items.list(status, agent, default_limit(status, limit))
+        return {**found, "tasks": [self._out(task, file_urls) for task in found["tasks"]]}
 
     def create(self, who: Identity, data: dict) -> dict:
-        return self.items.create(who, plan_task_create(who, data), new_hosted_task_record)
+        return self._out(self.items.create(who, plan_task_create(who, data), new_hosted_task_record))
 
     def update(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_update(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_update(who, data, load, utc_now())))
 
     def done(self, who: Identity, task_id: int, resolution=None) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_finish(who, "done", resolution, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id,
+                                           lambda load: plan_finish(who, "done", resolution, load, utc_now())))
 
     def drop(self, who: Identity, task_id: int, resolution=None) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_finish(who, "dropped", resolution, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id,
+                                           lambda load: plan_finish(who, "dropped", resolution, load, utc_now())))
 
     def reopen(self, who: Identity, task_id: int) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_reopen(who, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_reopen(who, load, utc_now())))
 
     def reply(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_reply(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_reply(who, data, load, utc_now())))
 
     def answer(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_answer(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_answer(who, data, load, utc_now())))
 
     def ask(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_ask(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_ask(who, data, load, utc_now())))
 
     def unask(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_unask(who, data, load, utc_now()),
-                                 with_events=True)
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_unask(who, data, load, utc_now()),
+                                           with_events=True))
 

@@ -23,7 +23,8 @@ in place of answered_at, and deleted_reason null, sent, finished or expired (REP
 tfile-<task id>-<n>-<unix ms> (appProperties task_id and kind "file") and add it to `reply_files` in the write of their
 reply; clean_reply_files reads the list back against the task file's own events. A reply is a new message, not a
 changed answer: the files of several replies coexist (at most MAX_FILES a reply, MAX_TASK_FILES a task), none goes
-stale, and the task's status never empties the list.
+stale, and the task's status never empties the list. The owner agent's links to them are TaskFileLinks (SPEC 8.3),
+sealed under a context of their own.
 
 Nothing here touches Drive or logs anything of a file.
 """
@@ -74,6 +75,10 @@ DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"L
 FIELD = "answer_files"
 LINK_CONTEXT = "file"  # the AEAD context of a file link's token: a voice token (context "media") never opens as one
 CLAIMS = {"user": str, "agent": str, "ask_id": int, "answered_at": str, "file_id": str, "n": int, "exp": int}
+# A reply's file (SPEC 8.3): a third context, so an answer's file token or a voice token never opens as one (nor
+# the reverse)
+TASK_LINK_CONTEXT = "taskfile"
+TASK_CLAIMS = {"user": str, "agent": str, "task_id": int, "reply_id": int, "file_id": str, "n": int, "exp": int}
 
 
 # ---------- names ----------
@@ -295,43 +300,69 @@ def lifetime_end(since: float, created: float | None, ttl: float) -> float:
 
 # ---------- the owner agent's link ----------
 
-class FileLinks:
-    """Links to the normal files of an answer for the agent that asked (SPEC 7.4): made on each read, opened by
-    GET /media/v1/<token>. A separate context and claim set from the voice links (voice.VoiceLinks), so a voice token
-    and a file token open nothing of each other's. `sealer` is the bridge's Keyring (encrypt/decrypt with a context)."""
+class _SealedLinks:
+    """What the links to an answer's files and to a reply's files share: a token sealing the subclass's `claims` under
+    its own AEAD `context`, made on each read with an exp LINK_TTL on, opened strictly. `sealer` is the bridge's
+    Keyring (encrypt/decrypt with a context)."""
+
+    context: str
+    claims: dict
 
     def __init__(self, sealer, base_url: str, clock=time.time):
         self.sealer = sealer
         self.base_url = base_url
         self.clock = clock
 
-    def url_for(self, user: str, agent: str, ask_id: int, answered_at: str, file_id: str, n: int) -> tuple[str, str]:
-        """(url, url_expires_at) of a new link to file `n` of the answer made at `answered_at`, valid LINK_TTL."""
+    def _url(self, claims: dict) -> tuple[str, str]:
+        """(url, url_expires_at) of a new link to the file `claims` name, valid LINK_TTL."""
         exp = int(self.clock()) + LINK_TTL
-        claims = {"user": user, "agent": agent, "ask_id": ask_id, "answered_at": answered_at, "file_id": file_id,
-                  "n": n, "exp": exp}
-        token = self.sealer.encrypt(json.dumps(claims, separators=(",", ":")), LINK_CONTEXT)
+        token = self.sealer.encrypt(json.dumps({**claims, "exp": exp}, separators=(",", ":")), self.context)
         return f"{self.base_url}{MEDIA_PATH}{token}", _iso(exp)
 
     def open(self, token) -> dict | None:
-        """The seven claims of a token this bridge sealed as a file link and that has not expired; None for anything
-        else (not a token, tampered, a voice or other token, a key no longer configured, expired, a claim missing,
-        extra or of the wrong type)."""
+        """The seven claims of a token this bridge sealed as this kind of link and that has not expired; None for
+        anything else (not a token, tampered, a voice token or another kind's, a key no longer configured, expired, a
+        claim missing, extra or of the wrong type, n below 1)."""
         if not isinstance(token, str) or len(token) > TOKEN_MAX:
             return None
         try:
-            claims = json.loads(self.sealer.decrypt(token, LINK_CONTEXT))
+            claims = json.loads(self.sealer.decrypt(token, self.context))
         except (CryptoError, ValueError):
             return None
-        if not isinstance(claims, dict) or set(claims) != set(CLAIMS):
+        if not isinstance(claims, dict) or set(claims) != set(self.claims):
             return None
-        for key, kind in CLAIMS.items():
+        for key, kind in self.claims.items():
             value = claims[key]
             if not isinstance(value, kind) or isinstance(value, bool) or value in ("", 0):
                 return None
         if claims["n"] < 1 or claims["exp"] <= self.clock():
             return None
         return claims
+
+
+class FileLinks(_SealedLinks):
+    """Links to the normal files of an answer for the agent that asked (SPEC 7.4): made on each read, opened by
+    GET /media/v1/<token>. A separate context and claim set from the voice links (voice.VoiceLinks), so a voice token
+    and a file token open nothing of each other's."""
+
+    context, claims = LINK_CONTEXT, CLAIMS
+
+    def url_for(self, user: str, agent: str, ask_id: int, answered_at: str, file_id: str, n: int) -> tuple[str, str]:
+        """(url, url_expires_at) of a new link to file `n` of the answer made at `answered_at`, valid LINK_TTL."""
+        return self._url({"user": user, "agent": agent, "ask_id": ask_id, "answered_at": answered_at,
+                          "file_id": file_id, "n": n})
+
+
+class TaskFileLinks(_SealedLinks):
+    """Links to the normal files of a task's replies for the agent that owns the task (SPEC 8.3), as FileLinks are for
+    an answer's: context `taskfile` and its own claim set, so an ask's link opens nothing of a task and the reverse."""
+
+    context, claims = TASK_LINK_CONTEXT, TASK_CLAIMS
+
+    def url_for(self, user: str, agent: str, task_id: int, reply_id: int, file_id: str, n: int) -> tuple[str, str]:
+        """(url, url_expires_at) of a new link to file `n` of the reply `reply_id` on task `task_id`, valid LINK_TTL."""
+        return self._url({"user": user, "agent": agent, "task_id": task_id, "reply_id": reply_id, "file_id": file_id,
+                          "n": n})
 
 
 # ---------- the claim of a secret file (SPEC 7.4 «Secret file») ----------
