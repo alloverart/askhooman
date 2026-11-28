@@ -538,6 +538,15 @@ Google Drive, where the user is signed in. The bridge never fetches a Drive link
     shown (ImageIO thumbnails on Apple; `<img decoding="async">` from a blob URL on the web, revoked on leaving). A
     video is downloaded whole (≤ 20 MB, with progress) and played from the local file or blob; if the player fails:
     "Can't play this video here" + Download.
+  - Saving (28.11.2026): in the viewer every app can save the item shown. The file is the one the app already
+    downloaded, never re-encoded, named `askhooman-<ask id>-<n>.<png|jpg|webp|mp4>` (n = the tile number); the
+    control is disabled until the item has loaded, and nothing else is fetched. Web and Android: «Download» in the top
+    bar, and the browser's own image menu works too. iPhone: «Share» (the system sheet: Save Image / Save Video, Copy,
+    AirDrop; `NSPhotoLibraryAddUsageDescription` is set, the app has no Photos code). Mac: «Copy» ⌘C, «Save…» ⌘S (a
+    save panel in Downloads; the sandbox has `files.user-selected.read-write`) and «Share», the same three in the
+    picture's context menu. Apple tiles: a context menu on a picture or video tile (iPhone long press: Copy, Share;
+    Mac: Copy, Save…, Share), and on the Mac a tile dragged to Finder drops the file. A video tile never downloads the
+    clip, so its actions stay disabled until the clip has been played in the viewer. Link cards are unchanged.
   - Unknown kinds are skipped; nothing from an attachment is ever inserted as HTML. The web app's Content-Security-Policy
     (`web/vite.config.ts` in the `askhooman-apps` repo) needs `blob:` added to `img-src` and a `media-src blob:`
     (without one, `media-src` falls back to `default-src 'self'`).
