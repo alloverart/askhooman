@@ -830,3 +830,376 @@ def test_a_part_answered_410_fails_at_once(tmp_path, capsys, monkeypatch, small_
     line = next(line for line in err.splitlines() if "ask-5-file-1.mp4" in line)
     assert "HTTP 410" in line and "the file was deleted" in line
     assert os.listdir(tmp_path) == []
+
+
+# ---------- askhooman task files, and task show with a reply's files (SPEC 8.7) ----------
+
+GONE_AT = "2026-11-22T10:00:00.000Z"
+TASK_EXPIRED = b'{"detail": "no such file, or the link has expired: read the task again for a new link"}'
+
+
+def task_item(n, size, reply_id=5, name="../../etc/passwd.PDF", secret=False, **over):
+    """An item of reply_files as the owner agent gets it from GET /api/tasks/7: the ten keys, and `url` with
+    `url_expires_at` on a normal file that exists and is not blocked (an explicit url wins; url=None drops both)."""
+    item = {"id": n, "reply_id": reply_id, "name": name, "mime": "application/pdf", "bytes": size, "secret": secret,
+            "downloaded_at": None, "deleted_at": None, "deleted_reason": None, "blocked_at": None}
+    item.update(over)
+    if "url" not in over and not (secret or item["deleted_at"] or item["blocked_at"]):
+        item["url"] = f"BASE/dl/{n}?t=sealed-{n}"
+    if item.get("url") is None:
+        item.pop("url", None)
+    else:
+        item["url_expires_at"] = "2026-11-28T11:00:00.000Z"
+    return item
+
+
+@contextmanager
+def holder_stub(items, bodies, secret_bodies=None, ranges=None, dl=None, content=None, extra=None, raw=None,
+                holder="/api/tasks/7", key="reply_files"):
+    """A bridge, as files_stub is, for task 7 by default (`holder`, the list `key`): GET `holder` (the list `items`,
+    read at each request, and the fields of `extra`; BASE in a url becomes this server; a body put in the list `raw`
+    is sent once instead), the normal files at /dl/<n> and the bearer route `holder`/files/<n>/content (410 when
+    `secret_bodies` has no such file). `dl(handler, body, range_header)` answers a /dl/ request first when it returns
+    True, `content(handler, n)` a request of the bearer route; otherwise a /dl/ request with a Range gets serve_part.
+    `ranges` collects the Range header (or None) of every /dl/ request."""
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def reply(self, status, body):
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            path = urllib.parse.urlsplit(self.path).path
+            seen.append((path, self.headers.get("Authorization")))
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            if path == holder and raw:
+                self.reply(200, raw.pop(0))
+            elif path == holder:
+                shown = [{**i, "url": i["url"].replace("BASE", base)} if i.get("url") else i for i in items]
+                self.reply(200, json.dumps({"id": int(holder.rsplit("/", 1)[1]), "status": "active", **(extra or {}),
+                                            key: shown}).encode())
+            elif path.startswith("/dl/"):
+                n, header = int(path[4:]), self.headers.get("Range")
+                if ranges is not None:
+                    ranges.append(header)
+                if dl and dl(self, bodies.get(n), header):
+                    pass
+                elif header is None:
+                    self.reply(200, bodies[n])
+                else:
+                    serve_part(self, bodies[n], header)
+            elif path.startswith(holder + "/files/") and path.endswith("/content"):
+                n = int(path.split("/")[5])
+                if content and content(self, n):
+                    return
+                body = (secret_bodies or {}).get(n)
+                self.reply(410, b'{"detail": "gone"}') if body is None else self.reply(200, body)
+            else:
+                self.reply(404, b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", seen
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def pauses(monkeypatch):
+    waited = []
+    monkeypatch.setattr(cli, "SLEEP", waited.append)
+    return waited
+
+
+def test_cli_task_files_saves_all_with_fixed_names(tmp_path, capsys, monkeypatch):
+    items = [task_item(1, len(FILE_A), name="my report.pdf"), task_item(2, 4, name="noext"),
+             task_item(3, 3, reply_id=9),
+             task_item(4, 50, reply_id=9, name="old.png", deleted_at=GONE_AT, deleted_reason="expired"),
+             task_item(5, len(FILE_B), reply_id=9, name="key.txt", secret=True),
+             task_item(6, 9999, reply_id=9, name="short.bin")]
+    out_dir = tmp_path / "out"
+    with holder_stub(items, {1: FILE_A, 2: b"data", 3: b"etc", 6: b"short"}) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(out_dir))
+    assert code == 1  # file 6 is the wrong size
+    assert sorted(os.listdir(out_dir)) == ["task-7-file-1.pdf", "task-7-file-2", "task-7-file-3.PDF"]
+    assert (out_dir / "task-7-file-1.pdf").read_bytes() == FILE_A
+    assert (out_dir / "task-7-file-2").read_bytes() == b"data"
+    assert (out_dir / "task-7-file-3.PDF").read_bytes() == b"etc"
+    assert os.listdir(tmp_path) == ["out"]  # ../../etc/passwd.PDF is never a path
+    assert f"saved {out_dir / 'task-7-file-1.pdf'} ({len(FILE_A)} bytes)" in out
+    assert "skipped file 4: already deleted" in out
+    assert "skipped file 5 (secret): it can be fetched once; add --secret to fetch it" in out
+    line = next(line for line in err.splitlines() if "task-7-file-6.bin" in line)
+    assert "got 5 of 9999 bytes" in line and "1 of 6 files not saved" in err
+    assert "my report" not in out + err and "sealed" not in out + err and "tok" not in out + err
+    # the task is read once; a normal file's url is the credential: no bearer goes to it
+    assert [p for p, _ in seen].count("/api/tasks/7") == 1
+    assert [a for p, a in seen if p.startswith("/dl/")] == [None] * 4
+    assert not any(p.endswith("/content") for p, _ in seen)
+
+
+def test_cli_task_files_reply_only(tmp_path, capsys, monkeypatch):
+    items = [task_item(1, 4, name="a.txt"), task_item(2, 3, reply_id=9, name="b.txt"), task_item(3, 4, name="c.txt")]
+    with holder_stub(items, {1: b"data", 2: b"etc", 3: b"more"}) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path),
+                             "--reply", "5")
+    assert code == 0, err
+    assert sorted(os.listdir(tmp_path)) == ["task-7-file-1.txt", "task-7-file-3.txt"]
+    assert [p for p, _ in seen if p.startswith("/dl/")] == ["/dl/1", "/dl/3"]
+    assert "file 2" not in out
+
+
+def test_cli_task_files_no_such_reply_and_nothing_left(tmp_path, capsys, monkeypatch):
+    out_dir = tmp_path / "in"
+    with holder_stub([task_item(1, 4, name="a.txt")], {1: b"data"}) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(out_dir),
+                             "--reply", "99")
+        assert (code, out, err) == (0, "no files of reply 99\n", "")
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(out_dir),
+                             "--reply", "99", "--json")
+        assert code == 0 and json.loads(out) == []
+    assert not out_dir.exists() and not any(p.startswith("/dl/") for p, _ in seen)
+
+    gone = [task_item(1, 4, name="a.txt", deleted_at=GONE_AT, deleted_reason="finished"),
+            task_item(2, 4, reply_id=9, name="k.txt", secret=True, deleted_at=GONE_AT, deleted_reason="sent")]
+    with holder_stub(gone, {}) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(out_dir), "--secret")
+    assert code == 0, err
+    assert "skipped file 1: already deleted" in out and "skipped file 2: already deleted" in out
+    assert os.listdir(out_dir) == [] and not any(p.startswith("/dl/") or p.endswith("/content") for p, _ in seen)
+
+    with holder_stub([], {}) as (base, _):
+        code, out, _ = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path / "none"))
+    assert (code, out) == (0, "no files\n") and not (tmp_path / "none").exists()
+
+
+def test_cli_task_files_json_prints_the_results_of_askhooman_files(tmp_path, capsys, monkeypatch):
+    items = [task_item(1, 4, name="a.txt"), task_item(2, 4, deleted_at=GONE_AT, deleted_reason="expired"),
+             task_item(3, 4, reply_id=9, name="k.txt", secret=True)]
+    with holder_stub(items, {1: b"data"}) as (base, _):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path), "--json")
+    assert code == 0, err
+    assert json.loads(out) == [
+        {"id": 1, "path": str(tmp_path / "task-7-file-1.txt"), "bytes": 4, "status": "saved"},
+        {"id": 2, "path": str(tmp_path / "task-7-file-2.PDF"), "bytes": 4, "status": "deleted"},
+        {"id": 3, "path": str(tmp_path / "task-7-file-3.txt"), "bytes": 4, "status": "skipped"}]
+
+
+def test_cli_task_files_secret_uses_the_bearer_route(tmp_path, capsys, monkeypatch):
+    items = [task_item(1, 4, name="a.txt"), task_item(2, len(FILE_B), name="key.txt", secret=True),
+             task_item(3, 100, reply_id=9, name="token.txt", secret=True)]
+    with holder_stub(items, {1: b"data"}, {2: FILE_B, 3: b"s" * 10}) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path),
+                             "--secret")
+    assert code == 1  # file 3 came short
+    assert (tmp_path / "task-7-file-2.txt").read_bytes() == FILE_B
+    assert [(p, a) for p, a in seen if p.endswith("/content")] == [
+        ("/api/tasks/7/files/2/content", "Bearer tok"), ("/api/tasks/7/files/3/content", "Bearer tok")]
+    line = next(line for line in err.splitlines() if "task-7-file-3.txt" in line)
+    assert "10 of 100" in line and "ask your user to send it again" in line
+    assert sorted(os.listdir(tmp_path)) == ["task-7-file-1.txt", "task-7-file-2.txt"]
+    assert FILE_B.decode() not in out + err and "tok" not in out + err
+
+
+def test_cli_task_files_big_file_in_parts(tmp_path, capsys, monkeypatch, small_parts):
+    items = [task_item(1, len(SOURCE), name="clip.mp4")]
+    tokens = []
+
+    def expiring(handler, body, header):
+        tokens.append(link_token(handler))
+        if tokens[-1] == "sealed-1" and header == PARTS[2]:  # the hour ran out after two parts
+            items[0]["url"] = "BASE/dl/1?t=fresh-1"  # what the next read of the task carries
+            reply_raw(handler, 404, {"Content-Length": str(len(TASK_EXPIRED))}, TASK_EXPIRED)
+            return True
+        return False
+
+    ranges = []
+    with holder_stub(items, {1: SOURCE}, ranges=ranges, dl=expiring) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path))
+    assert code == 0, err
+    assert (tmp_path / "task-7-file-1.mp4").read_bytes() == SOURCE
+    assert os.listdir(tmp_path) == ["task-7-file-1.mp4"]
+    assert ranges == [PARTS[0], PARTS[1], PARTS[2], PARTS[2], PARTS[3]]  # closed parts, on from the one that failed
+    assert tokens == ["sealed-1"] * 3 + ["fresh-1"] * 2
+    assert [p for p, _ in seen].count("/api/tasks/7") == 2  # the task read again, once
+    assert [a for p, a in seen if p.startswith("/dl/")] == [None] * 5
+    assert "fresh-1" not in out + err and "sealed" not in out + err and small_parts == []
+
+
+def test_the_21st_small_file_of_a_minute_waits_and_is_saved(tmp_path, capsys, monkeypatch, pauses):
+    """SPEC 8.3: a task holds up to 30 files and the `files` bucket is 20 requests a minute, so a whole file's 429 is
+    waited out as a part's is: its Retry-After, 10 s when it names none, a failure at once over 60 s, and at most
+    PART_WAITS waits a file."""
+    script = {1: [lambda h: too_many(h, "7")], 2: [too_many], 3: [lambda h: too_many(h, "61")]}
+
+    def limited(handler, body, header):
+        n = int(urllib.parse.urlsplit(handler.path).path[4:])
+        if n == 4:  # always limited: the file's six waits, then it fails
+            return too_many(handler, "1")
+        return bool(script[n]) and script[n].pop(0)(handler)
+
+    items = [task_item(n, 4, name=f"{n}.txt") for n in (1, 2, 3, 4)]
+    with holder_stub(items, {n: b"data" for n in (1, 2, 3, 4)}, dl=limited) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path))
+    assert code == 1
+    assert sorted(os.listdir(tmp_path)) == ["task-7-file-1.txt", "task-7-file-2.txt"]
+    assert (tmp_path / "task-7-file-1.txt").read_bytes() == b"data"
+    assert pauses == [7, 10] + [1] * cli.PART_WAITS  # file 3 asked for 61 s: no wait; file 4's waits are its own
+    asked = [p for p, _ in seen if p.startswith("/dl/")]
+    assert asked == ["/dl/1"] * 2 + ["/dl/2"] * 2 + ["/dl/3"] + ["/dl/4"] * (cli.PART_WAITS + 1)
+    for n in (3, 4):
+        line = next(line for line in err.splitlines() if f"task-7-file-{n}.txt" in line)
+        assert "HTTP 429" in line and "at most 20 a minute per agent" in line
+    assert "2 of 4 files not saved" in err
+
+
+@pytest.mark.parametrize("change", [None, "expires again", "other reply", "other bytes", "now secret", "deleted",
+                                    "no link", "not https", "not a task"])
+def test_a_link_expired_before_a_whole_file_is_asked_for(tmp_path, capsys, monkeypatch, pauses, change):
+    (tmp_path / "other.txt").write_text("keep")
+    items, raw, tokens = [task_item(1, 4, name="a.txt")], [], []
+    fresh = "BASE/dl/1?t=fresh-1"  # every changed item still carries a link: the check named by the case refuses it
+
+    def expiring(handler, body, header):
+        tokens.append(link_token(handler))
+        if tokens[-1] == "fresh-1" and change is None:
+            return False  # the new link works
+        if change in (None, "expires again"):
+            items[0]["url"] = fresh
+        elif change == "other reply":  # another reply's file under the same n: not the same file
+            items[0] = task_item(1, 4, reply_id=9, name="a.txt", url=fresh)
+        elif change == "other bytes":
+            items[0] = task_item(1, 5, name="a.txt", url=fresh)
+        elif change == "now secret":
+            items[0] = task_item(1, 4, name="a.txt", secret=True, url=fresh)
+        elif change == "deleted":
+            items[0] = task_item(1, 4, name="a.txt", url=fresh, deleted_at=GONE_AT, deleted_reason="finished")
+        elif change == "no link":  # finished meanwhile: the task gives no links
+            items[0] = task_item(1, 4, name="a.txt", url=None)
+        elif change == "not https":
+            items[0] = task_item(1, 4, name="a.txt", url="http://files.example.com/dl/1?t=fresh-1")
+        elif change == "not a task":
+            raw.append(b'["not", "a", "task"]')
+        reply_raw(handler, 404, {"Content-Length": str(len(TASK_EXPIRED))}, TASK_EXPIRED)
+        return True
+
+    with holder_stub(items, {1: b"data"}, dl=expiring, raw=raw) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path))
+    assert [p for p, _ in seen].count("/api/tasks/7") == 2  # read again once, never more
+    assert pauses == []
+    if change is None:
+        assert code == 0, err
+        assert tokens == ["sealed-1", "fresh-1"]
+        assert (tmp_path / "task-7-file-1.txt").read_bytes() == b"data"
+        assert sorted(os.listdir(tmp_path)) == ["other.txt", "task-7-file-1.txt"]
+        return
+    assert code == 1
+    assert tokens == (["sealed-1", "fresh-1"] if change == "expires again" else ["sealed-1"])
+    line = next(line for line in err.splitlines() if "task-7-file-1.txt" in line)
+    expected = {"expires again": "HTTP 404: no such file, or the link has expired: read the task again",
+                "not https": "not https", "not a task": "not a task"}.get(change, "not the same any more")
+    assert expected in line and "Traceback" not in err and "fresh-1" not in err
+    assert sorted(os.listdir(tmp_path)) == ["other.txt"]  # nothing saved, no .part left
+
+
+def test_a_secret_files_429_is_waited_out_and_it_is_fetched_once(tmp_path, capsys, monkeypatch, pauses):
+    """The `files` bucket's 429 comes before the claim is taken, so asking again is safe (SPEC 8.3). A 404 of the
+    bearer route is not an expired link: the task is not read again."""
+    asked = []
+
+    def content(handler, n):
+        asked.append(n)
+        if n == 2 and asked.count(2) == 1:
+            return too_many(handler)
+        if n == 3:
+            reply_raw(handler, 404, {"Content-Length": str(len(TASK_EXPIRED))}, TASK_EXPIRED)
+            return True
+        return False
+
+    items = [task_item(2, len(FILE_B), name="key.txt", secret=True), task_item(3, 4, name="k.txt", secret=True)]
+    with holder_stub(items, {}, {2: FILE_B}, content=content) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path),
+                             "--secret")
+    assert code == 1  # file 3
+    assert asked == [2, 2, 3] and pauses == [10]
+    assert (tmp_path / "task-7-file-2.txt").read_bytes() == FILE_B
+    assert all(a == "Bearer tok" for p, a in seen if p.endswith("/content"))
+    assert [p for p, _ in seen].count("/api/tasks/7") == 1
+    line = next(line for line in err.splitlines() if "task-7-file-3.txt" in line)
+    assert "HTTP 404" in line and "send it again" not in line
+    assert os.listdir(tmp_path) == ["task-7-file-2.txt"] and FILE_B.decode() not in out + err
+
+
+def test_askhooman_files_still_fails_a_whole_file_on_a_429(tmp_path, capsys, monkeypatch, pauses):
+    """The ask's command keeps its behaviour (SPEC 8.3 changes `askhooman task files` only)."""
+    items = [file_item(1, 4, name="a.txt"), file_item(2, 4, name="k.txt", secret=True)]
+    with holder_stub(items, {1: b"data"}, {2: b"sec!"}, dl=lambda h, b, r: too_many(h, "1"),
+                     content=lambda h, n: too_many(h, "1"), holder="/api/asks/5", key="answer_files") as (base, seen):
+        code, _, err = run(capsys, monkeypatch, base, "tok", "files", "5", "--out", str(tmp_path), "--secret")
+    assert code == 1 and pauses == [] and os.listdir(tmp_path) == []
+    assert [p for p, _ in seen] == ["/api/asks/5", "/dl/1", "/api/asks/5/files/2/content"]
+    assert err.count("HTTP 429") == 2
+
+
+def test_cli_task_files_refuses_a_non_https_url_for_a_remote_server(tmp_path, capsys, monkeypatch):
+    items = [task_item(1, 4, name="a.txt", url="http://files.example.com/dl/1?t=sealed-1")]
+    with holder_stub(items, {1: b"data"}) as (base, seen):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "files", "7", "--out", str(tmp_path))
+    assert code == 1 and "task-7-file-1.txt: the download link is not https; refusing it" in err
+    assert "sealed" not in out + err
+    assert os.listdir(tmp_path) == [] and not any(p.startswith("/dl/") for p, _ in seen)
+
+
+def snapshot(item):
+    """An item as the `files` of its replied event hold it: the ten keys, never a url."""
+    return {k: v for k, v in item.items() if k not in ("url", "url_expires_at")}
+
+
+def test_cli_task_show_prints_a_replys_files(capsys, monkeypatch):
+    first = [task_item(1, 4404019, name="report.pdf"), task_item(2, 10, name="b.png", downloaded_at=GONE_AT),
+             task_item(3, 3, name="c.txt", deleted_at=GONE_AT, deleted_reason="finished")]
+    second = [task_item(4, 5, reply_id=9, name="d.jpg", blocked_at=GONE_AT),
+              task_item(5, 12, reply_id=9, name="key.txt", secret=True),
+              task_item(6, 777, reply_id=9, name="gone.zip", deleted_at=GONE_AT, deleted_reason="expired"),
+              task_item(7, 4, reply_id=9, name=None, mime=None),
+              task_item(8, 6, reply_id=9, name="\x1b[31mred\x07.txt")]
+    events = [
+        {"id": 1, "at": "2026-11-20T09:00:00.000Z", "actor": "Allen", "kind": "created", "payload": {}},
+        {"id": 5, "at": "2026-11-20T10:00:00.000Z", "actor": "human", "kind": "replied",
+         "payload": {"text": "Here they are", "preset": None, "files": [snapshot(i) for i in first]}},
+        {"id": 6, "at": "2026-11-20T10:30:00.000Z", "actor": "human", "kind": "replied",
+         "payload": {"text": "And no file"}},  # an older event: no files
+        {"id": 9, "at": "2026-11-21T10:00:00.000Z", "actor": "human", "kind": "replied",
+         "payload": {"text": "5 files attached", "preset": None, "files": [snapshot(i) for i in second]}},
+    ]
+    shown = first + [i for i in second if i["id"] != 6]  # the next reply pruned the deleted item 6
+    extra = {"title": "Sew the sample", "agent": "Allen", "created_at": "2026-11-20T09:00:00.000Z",
+             "updated_at": "2026-11-21T10:00:00.000Z", "events": events,
+             "reply": {"id": 9, "at": "2026-11-21T10:00:00.000Z", "text": "5 files attached", "preset": None,
+                       "files": [4, 5, 6, 7, 8]}}
+    with holder_stub(shown, {}, extra=extra) as (base, _):
+        code, out, err = run(capsys, monkeypatch, base, "tok", "task", "show", "7")
+    assert code == 0, err
+    lines = out.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.endswith("replied: Here they are"))
+    assert [line.strip() for line in lines[at + 1:at + 4]] == [
+        "file 1: report.pdf · 4404019 bytes · not downloaded yet",
+        "file 2: b.png · 10 bytes · downloaded",
+        "file 3: c.txt · 3 bytes · deleted (finished)"]
+    assert lines[at + 4].endswith("replied: And no file")
+    at = next(i for i, line in enumerate(lines) if line.endswith("replied: 5 files attached"))
+    assert [line.strip() for line in lines[at + 1:]] == [
+        "file 4: d.jpg · 5 bytes · blocked by Google",
+        "file 5: key.txt · 12 bytes · secret, not downloaded yet",
+        "file 6: gone.zip · 777 bytes · deleted",  # no item any more: the event's name and size
+        "file 7: (hidden) · 4 bytes · not downloaded yet",  # what another agent sees
+        "file 8: [31mred.txt · 6 bytes · not downloaded yet"]
+    assert lines[at + 1].startswith(" " * 10)  # under the history line, indented
+    assert "\x1b" not in out and "\x07" not in out

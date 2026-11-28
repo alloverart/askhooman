@@ -42,6 +42,14 @@ current directory), never under the user's name for them; the size is checked ag
 link that expires mid-file is renewed once by reading the ask again).
   asks.py files 12 --out ./in           the normal files
   asks.py files 12 --secret             also the secret ones: each can be fetched once, then it is deleted
+
+Files your user attached to their replies on your task (the hosted bridge): the same, saved as task-<id>-file-<n>[.ext],
+every file of the task that still exists (not only the latest reply's). A task holds up to 30 files and the bridge
+serves 20 file requests a minute, so here every fetch waits out a 429 and a normal file whose link expired takes a new
+one by reading the task again, not only a file in parts. `task show` lists each reply's files under it.
+  asks.py task files 7 --out ./in       the normal files of all the replies
+  asks.py task files 7 --reply 12       only those of the reply with event id 12 (the items' reply_id)
+  asks.py task files 7 --secret         also the secret ones: each can be fetched once, then it is deleted
 """
 
 from __future__ import annotations  # keeps it runnable on macOS /usr/bin/python3 (3.9)
@@ -397,7 +405,42 @@ def print_task(t: dict) -> None:
     if t.get("events"):
         print("\nHistory:")
         for event in t["events"]:
-            print(f"  {local_time(event.get('at'))}  {event.get('actor', '?'):<9} {task_event_summary(event)}")
+            head = f"  {local_time(event.get('at'))}  {event.get('actor', '?'):<9} "
+            print(head + task_event_summary(event))
+            for line in reply_file_lines(event, t.get("reply_files")):
+                print(" " * len(head) + line)
+
+
+def reply_file_lines(event: dict, items) -> list:
+    """The files of a `replied` event, one line each (SPEC 8.7): `file <n>: <name> · <bytes> bytes · <state>`, read
+    from the item of reply_files with that id and this reply; an id with no such item any more (the user's next reply
+    pruned it) is a file that is gone: the event's name and size, `deleted`. Another agent sees no names."""
+    payload = event.get("payload")
+    if event.get("kind") != "replied" or not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+        return []
+    current = {i.get("id"): i for i in (items if isinstance(items, list) else [])
+               if isinstance(i, dict) and i.get("reply_id") == event.get("id")}
+    lines = []
+    for snap in payload["files"]:
+        if not isinstance(snap, dict) or not isinstance(snap.get("id"), int):
+            continue
+        item = current.get(snap["id"])
+        if item is None:
+            item, state = snap, "deleted"
+        elif item.get("deleted_at"):
+            state = f"deleted ({item['deleted_reason']})" if item.get("deleted_reason") else "deleted"
+        elif item.get("blocked_at"):
+            state = "blocked by Google"
+        else:
+            state = "downloaded" if item.get("downloaded_at") else "not downloaded yet"
+        if item.get("secret") is True:
+            state = "secret, " + state
+        name = item.get("name")
+        name = re.sub(r"\s", " ", name) if isinstance(name, str) and name else "(hidden)"  # one line per file
+        size = item.get("bytes")
+        size = f"{size} bytes" if isinstance(size, int) and not isinstance(size, bool) else "size unknown"
+        lines.append(f"file {snap['id']}: {name} · {size} · {state}")
+    return lines
 
 
 def print_task_one_line(t: dict, verb: str = "") -> None:
@@ -675,7 +718,7 @@ def cmd_detach(client, args):
         print(f"detached #{args.n} from ask #{args.id}")
 
 
-# ---------- files in answers (SPEC 7.8) ----------
+# ---------- files in answers (SPEC 7.8) and in replies on tasks (SPEC 8.7) ----------
 
 FILE_CHUNK = 1 << 20
 EXT = re.compile(r"[A-Za-z0-9]{1,10}")
@@ -697,10 +740,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # the bearer goes to the configured server only
 
 
-def file_save_name(ask_id: int, item: dict) -> str:
-    """ask-<id>-file-<n>[.<ext>]: the user's name is data, never a path; only its last extension (1-10 ASCII letters
-    or digits) is kept, as the bridge's Content-Disposition does."""
-    name = f"ask-{ask_id}-file-{int(item['id'])}"
+def file_save_name(holder_id: int, item: dict, kind: str = "ask") -> str:
+    """<kind>-<id>-file-<n>[.<ext>] (kind: ask or task): the user's name is data, never a path; only its last extension
+    (1-10 ASCII letters or digits) is kept, as the bridge's Content-Disposition does."""
+    name = f"{kind}-{holder_id}-file-{int(item['id'])}"
     stem, dot, ext = (item.get("name") or "").rpartition(".")
     if dot and stem and EXT.fullmatch(ext):
         name += "." + ext
@@ -719,10 +762,11 @@ def _open_part_file(part: str, label: str) -> int:
         raise CliError(f"{label}: cannot write {part}: {exc.strerror}")
 
 
-def save_stream(resp, path: str, size: int, label: str, lost: str = "") -> None:
-    """Write the open response to `path`.part (no symlinks), check it came to exactly `size` bytes, then rename it onto
-    `path`. On any failure only the .part file this call wrote is removed, by its exact path. `lost` is added to the
-    message of a body that came short, long or broke off (a secret file can't be fetched again)."""
+def save_stream(resp, path: str, size: int, label: str, lost: str = "", kind: str = "ask") -> None:
+    """Write the open response to `path`.part (no symlinks), check it came to exactly `size` bytes (what the `kind`,
+    ask or task, says), then rename it onto `path`. On any failure only the .part file this call wrote is removed, by
+    its exact path. `lost` is added to the message of a body that came short, long or broke off (a secret file can't
+    be fetched again)."""
     part = path + ".part"
     fd = _open_part_file(part, label)
     total = 0
@@ -734,7 +778,7 @@ def save_stream(resp, path: str, size: int, label: str, lost: str = "") -> None:
                     break
                 total += len(chunk)
                 if total > size:
-                    raise CliError(f"{label}: more than the {size} bytes the ask says{lost}")
+                    raise CliError(f"{label}: more than the {size} bytes the {kind} says{lost}")
                 out.write(chunk)
         if total != size:
             raise CliError(f"{label}: got {total} of {size} bytes{lost}")
@@ -767,21 +811,32 @@ def url_allowed(url: str, base_url: str) -> bool:
             and urllib.parse.urlsplit(url).hostname in local)
 
 
-def fetch_file(url: str, path: str, size: int, label: str, token: str | None = None, lost: str = "") -> None:
+def fetch_file(url: str, path: str, size: int, label: str, token: str | None = None, lost: str = "",
+               kind: str = "ask", patience: _Patience | None = None) -> None:
+    """One whole file in one GET (save_stream). Without `patience` (askhooman files) any refusal fails; with it
+    (askhooman task files, SPEC 8.3) a 429 is waited out and a 404 takes a new link, as for a part (_Patience)."""
     headers = {"User-Agent": "asks-cli/0.1"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers, method="GET")
     opener = urllib.request.build_opener(_NoRedirect) if token else urllib.request.build_opener()
-    try:
-        with opener.open(req, timeout=60) as resp:
-            save_stream(resp, path, size, label, lost)
-    except urllib.error.HTTPError as exc:
-        raise CliError(f"{label}: HTTP {exc.code}: {error_detail(exc)}", status=exc.code)
-    except urllib.error.URLError as exc:
-        raise CliError(f"{label}: cannot reach the server: {exc.reason}")
-    except (TimeoutError, socket.timeout):
-        raise CliError(f"{label}: the download stalled{lost}")
+    while True:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with opener.open(req, timeout=60) as resp:
+                save_stream(resp, path, size, label, lost, kind)
+            return
+        except urllib.error.HTTPError as exc:
+            message = f"{label}: HTTP {exc.code}: {error_detail(exc)}"
+            if patience is not None and exc.code == 429:
+                patience.wait(message, _rate_wait(exc, message))
+            elif patience is not None and exc.code == 404:
+                url = patience.new_link(message)
+            else:
+                raise CliError(message, status=exc.code)
+        except urllib.error.URLError as exc:
+            raise CliError(f"{label}: cannot reach the server: {exc.reason}")
+        except (TimeoutError, socket.timeout):
+            raise CliError(f"{label}: the download stalled{lost}")
 
 
 class _PartFailed(Exception):
@@ -808,6 +863,37 @@ def _retry_after(exc: urllib.error.HTTPError, default: float = 0.0) -> float:
         return max(float(value), 0.0) if value else default
     except (TypeError, ValueError):
         return default
+
+
+def _rate_wait(exc: urllib.error.HTTPError, message: str) -> float:
+    """The seconds to wait out a 429 (Retry-After; none given: RATE_PAUSE). One asking for more than RATE_PAUSE_MAX
+    is not a busy minute (the byte budget says 3600): CliError at once, waiting would not help."""
+    wait = _retry_after(exc, RATE_PAUSE)
+    if wait > RATE_PAUSE_MAX:
+        raise CliError(message, status=429)
+    return wait
+
+
+class _Patience:
+    """What the requests of one file may wait for (SPEC 7.4 «Parts», 8.3): 429s waited out, at most PART_WAITS times
+    a file, and one 404 (the link's hour ran out) answered by `refresh()`, which returns a new link or raises CliError
+    when the file is not the same any more. Without `refresh` (a secret file has no link) a 404 fails."""
+
+    def __init__(self, refresh=None):
+        self.refresh = refresh
+        self.waits = 0
+
+    def wait(self, message: str, seconds: float) -> None:
+        if self.waits == PART_WAITS:
+            raise CliError(message, status=429)
+        self.waits += 1
+        SLEEP(seconds)
+
+    def new_link(self, message: str) -> str:
+        refresh, self.refresh = self.refresh, None  # a second 404 fails
+        if refresh is None:
+            raise CliError(message, status=404)
+        return refresh()
 
 
 def _fetch_part(opener, url: str, out, start: int, end: int, size: int, label: str) -> None:
@@ -842,10 +928,7 @@ def _fetch_part(opener, url: str, out, start: int, end: int, size: int, label: s
         if exc.code >= 500:
             raise _PartFailed(message, min(_retry_after(exc), PART_PAUSE_MAX))
         if exc.code == 429:
-            wait = _retry_after(exc, RATE_PAUSE)
-            if wait > RATE_PAUSE_MAX:  # not a busy minute (the byte budget): waiting would not help
-                raise CliError(message, status=429)
-            raise _PartLimited(message, wait)
+            raise _PartLimited(message, _rate_wait(exc, message))
         if exc.code == 404:
             raise _LinkExpired(message)
         raise CliError(message, status=exc.code)
@@ -863,13 +946,13 @@ def fetch_in_parts(url: str, path: str, size: int, label: str, refresh=None) -> 
     fetched again from its start, the .part cut back to it, up to PART_TRIES times in all. A 429 is waited out
     (Retry-After; none given: RATE_PAUSE; one over RATE_PAUSE_MAX fails at once) and the same part asked again, at
     most PART_WAITS times a file, without using up its tries. A 404 (the link expired) calls `refresh()` once for a
-    new link (it raises CliError when the file in the ask is not the same any more) and goes on from that part; a
-    second 404 fails. The total must be `size`, then the .part is renamed onto `path`; on any failure only that .part
-    file is removed, by its exact path."""
+    new link (it raises CliError when the file in the ask or task is not the same any more) and goes on from that
+    part; a second 404 fails (_Patience). The total must be `size`, then the .part is renamed onto `path`; on any
+    failure only that .part file is removed, by its exact path."""
     part = path + ".part"
     fd = _open_part_file(part, label)
     opener = urllib.request.build_opener()
-    waits, refreshed = 0, False
+    patience = _Patience(refresh)
     try:
         with os.fdopen(fd, "wb") as out:
             for start in range(0, size, PART_BYTES):
@@ -882,15 +965,9 @@ def fetch_in_parts(url: str, path: str, size: int, label: str, refresh=None) -> 
                         _fetch_part(opener, url, out, start, end, size, label)
                         break
                     except _PartLimited as exc:
-                        if waits == PART_WAITS:
-                            raise CliError(str(exc), status=429)
-                        waits += 1
-                        SLEEP(exc.wait)
+                        patience.wait(str(exc), exc.wait)
                     except _LinkExpired as exc:
-                        if refresh is None or refreshed:
-                            raise CliError(str(exc), status=404)
-                        refreshed = True
-                        url = refresh()
+                        url = patience.new_link(str(exc))
                     except _PartFailed as exc:
                         tries += 1
                         if tries == PART_TRIES:
@@ -909,6 +986,26 @@ def fetch_in_parts(url: str, path: str, size: int, label: str, refresh=None) -> 
         raise CliError(f"{label}: cannot write {part}: {exc.strerror}")
 
 
+def file_link(client, item: dict, label: str) -> str:
+    """The absolute link of a normal file's item: https only, or plain http to a local http server (url_allowed)."""
+    url = urllib.parse.urljoin(client.base_url + "/", item["url"])
+    if not url_allowed(url, client.base_url):
+        raise CliError(f"{label}: the download link is not https; refusing it")
+    return url
+
+
+def _item_again(holder: dict, key: str, n: int, size: int) -> dict | None:
+    """Item `n` of the list `key` in an ask or a task read again, if it is still a normal file of `size` bytes, not
+    deleted, with a link; else None."""
+    items = holder.get(key)
+    item = next((i for i in (items if isinstance(items, list) else []) if isinstance(i, dict) and i.get("id") == n),
+                None)
+    if (item is None or item.get("bytes") != size or item.get("secret") is not False or item.get("deleted_at")
+            or not item.get("url")):
+        return None
+    return item
+
+
 def fresh_link(client, ask_id: int, answered_at, n: int, size: int, label: str) -> str:
     """A new link for normal file `n` whose link expired mid-download: the ask read again, as cmd_files reads it. The
     file must be the same: still answered at `answered_at` (the agent never sees a file_id, and another file in an
@@ -916,25 +1013,33 @@ def fresh_link(client, ask_id: int, answered_at, n: int, size: int, label: str) 
     ask = client.request("GET", f"/api/asks/{ask_id}")
     if not isinstance(ask, dict):
         raise CliError(f"{label}: the link expired and the server's answer to reading the ask again is not an ask")
-    items = ask.get("answer_files")
-    item = next((i for i in (items if isinstance(items, list) else []) if isinstance(i, dict) and i.get("id") == n),
-                None)
-    if (item is None or ask.get("answered_at") != answered_at or item.get("bytes") != size
-            or item.get("secret") is not False or item.get("deleted_at") or not item.get("url")):
+    item = _item_again(ask, "answer_files", n, size)
+    if item is None or ask.get("answered_at") != answered_at:
         raise CliError(f"{label}: the link expired and the file in the ask is not the same any more: read the ask "
                        "again")
-    url = urllib.parse.urljoin(client.base_url + "/", item["url"])
-    if not url_allowed(url, client.base_url):
-        raise CliError(f"{label}: the download link is not https; refusing it")
-    return url
+    return file_link(client, item, label)
 
 
-def cmd_files(client, args):
-    ask = client.request("GET", f"/api/asks/{args.id}")
-    items = [i for i in (ask.get("answer_files") or []) if isinstance(i, dict) and isinstance(i.get("id"), int)]
-    if not items:
-        print("no files" if not args.raw else "[]")
-        return
+def fresh_task_link(client, task_id: int, n: int, reply_id, size: int, label: str) -> str:
+    """fresh_link for a file of a reply on a task (SPEC 8.7): the task read again, as cmd_task_files reads it. The same
+    file is item `n` of the same reply (`reply_id`: a reply is never replaced, and only its own write adds its items)
+    with the same `bytes`, normal, not deleted, with a link. Else CliError."""
+    task = client.request("GET", f"/api/tasks/{task_id}")
+    if not isinstance(task, dict):
+        raise CliError(f"{label}: the link expired and the server's answer to reading the task again is not a task")
+    item = _item_again(task, "reply_files", n, size)
+    if item is None or item.get("reply_id") != reply_id:
+        raise CliError(f"{label}: the link expired and the file in the task is not the same any more: read the task "
+                       "again")
+    return file_link(client, item, label)
+
+
+def save_files(client, args, kind: str, holder_id: int, items: list, refresh_for, patient: bool) -> None:
+    """Save `items` (an answer's files or a task's, `kind` ask or task) into --out as <kind>-<id>-file-<n>[.ext] and
+    print a line per file, or with --json the results ({id, path, bytes, status}); CliError when one is not saved.
+    `refresh_for(item, name)` gives the callable that renews the expired link of a normal file. `patient` (askhooman
+    task files, SPEC 8.3): every fetch waits out a 429, a whole file and a secret one too, and a whole normal file also
+    takes a new link after a 404; without it only a file in parts does (askhooman files, as before)."""
     out_dir = args.out or "."
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -943,7 +1048,7 @@ def cmd_files(client, args):
     failed, results = 0, []
     for item in items:
         n, size = item["id"], item.get("bytes")
-        name = file_save_name(args.id, item)
+        name = file_save_name(holder_id, item, kind)
         path = os.path.join(out_dir, name)
         result = {"id": n, "path": path, "bytes": size, "status": "saved"}
         if item.get("deleted_at"):
@@ -952,27 +1057,20 @@ def cmd_files(client, args):
             result["status"] = "skipped"
         elif not isinstance(size, int) or isinstance(size, bool) or size < 0:
             result["status"] = "failed"
-            print(f"error: {name}: the ask gives no size", file=sys.stderr)
-        elif item.get("secret"):
-            try:
-                fetch_file(f"{client.base_url}/api/asks/{args.id}/files/{n}/content", path, size, name, client.token,
-                           SECRET_LOST)
-            except CliError as exc:
-                result["status"] = "failed"
-                print(f"error: {exc}", file=sys.stderr)
-        elif not item.get("url"):
-            result["status"] = "failed"
-            print(f"error: {name}: no download link (blocked or deleted); read the ask again", file=sys.stderr)
+            print(f"error: {name}: the {kind} gives no size", file=sys.stderr)
         else:
             try:
-                url = urllib.parse.urljoin(client.base_url + "/", item["url"])
-                if not url_allowed(url, client.base_url):
-                    raise CliError(f"{name}: the download link is not https; refusing it")
-                if size > PART_BYTES:  # more than one response of the bridge carries: in parts
-                    fetch_in_parts(url, path, size, name, lambda n=n, size=size, name=name: fresh_link(
-                        client, args.id, ask.get("answered_at"), n, size, name))
+                if item.get("secret"):  # the bearer route: no link to renew
+                    fetch_file(f"{client.base_url}/api/{kind}s/{holder_id}/files/{n}/content", path, size, name,
+                               client.token, SECRET_LOST, kind, _Patience() if patient else None)
+                elif not item.get("url"):
+                    raise CliError(f"{name}: no download link (blocked or deleted); read the {kind} again")
                 else:
-                    fetch_file(url, path, size, name)
+                    url, refresh = file_link(client, item, name), refresh_for(item, name)
+                    if size > PART_BYTES:  # more than one response of the bridge carries: in parts
+                        fetch_in_parts(url, path, size, name, refresh)
+                    else:
+                        fetch_file(url, path, size, name, kind=kind, patience=_Patience(refresh) if patient else None)
             except CliError as exc:
                 result["status"] = "failed"
                 print(f"error: {exc}", file=sys.stderr)
@@ -990,6 +1088,33 @@ def cmd_files(client, args):
         print_json(results)
     if failed:
         raise CliError(f"{failed} of {len(items)} files not saved")
+
+
+def cmd_files(client, args):
+    ask = client.request("GET", f"/api/asks/{args.id}")
+    items = [i for i in (ask.get("answer_files") or []) if isinstance(i, dict) and isinstance(i.get("id"), int)]
+    if not items:
+        print("no files" if not args.raw else "[]")
+        return
+    save_files(client, args, "ask", args.id, items, lambda item, name: lambda: fresh_link(
+        client, args.id, ask.get("answered_at"), item["id"], item["bytes"], name), patient=False)
+
+
+def cmd_task_files(client, args):
+    """The files your user attached to replies on your task (SPEC 8.7), read from the task once: all the replies' by
+    default (two replies may come before the agent wakes, and a file missed is worse than one fetched twice), with
+    --reply N those of the reply with event id N."""
+    task = client.request("GET", f"/api/tasks/{args.id}")
+    if not isinstance(task, dict):
+        raise CliError("the server's answer to reading the task is not a task")
+    items = [i for i in (task.get("reply_files") or []) if isinstance(i, dict) and isinstance(i.get("id"), int)]
+    if args.reply is not None:
+        items = [i for i in items if i.get("reply_id") == args.reply]
+    if not items:
+        print("[]" if args.raw else "no files" if args.reply is None else f"no files of reply {args.reply}")
+        return
+    save_files(client, args, "task", args.id, items, lambda item, name: lambda: fresh_task_link(
+        client, args.id, item["id"], item.get("reply_id"), item["bytes"], name), patient=True)
 
 
 # ---------- task commands ----------
@@ -1242,7 +1367,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, help="max tasks (server default 200; 100 for done/dropped/finished)")
     p.set_defaults(func=cmd_tasks)
 
-    p = sub.add_parser("task", help="one task: show, create, update, done, drop, reopen, ask, unask")
+    p = sub.add_parser("task", help="one task: show, create, update, done, drop, reopen, ask, unask, files")
     tsub = p.add_subparsers(dest="task_command", metavar="ACTION", required=True)
 
     def task_flags(q, update: bool):
@@ -1293,6 +1418,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("id", type=int)
     q.add_argument("--note", help="where the answer came from, or why it no longer matters")
     q.set_defaults(func=cmd_task_unask)
+
+    q = tsub.add_parser("files", parents=[raw], help="save the files your user attached to replies on my task "
+                                                     "(hosted bridge; task-<id>-file-<n>[.ext], size checked; "
+                                                     "a 429 is waited out)")
+    q.add_argument("id", type=int)
+    q.add_argument("--out", metavar="DIR", help="directory to save into (default: the current one)")
+    q.add_argument("--secret", action="store_true",
+                   help="also fetch secret files: each can be fetched once, then AskHooman deletes it")
+    q.add_argument("--reply", type=int, metavar="N",
+                   help="only the files of the reply with event id N (their reply_id); default: all replies'")
+    q.set_defaults(func=cmd_task_files)
 
     p = sub.add_parser("listen", help="wait for the user's answers and replies (hosted bridge, agent key); "
                                       "one JSON line per event")
