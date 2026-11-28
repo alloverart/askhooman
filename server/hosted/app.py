@@ -399,7 +399,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     add_api_routes(app, services, ask_create=media.create)
     add_media_routes(app, media)
-    file_download = add_file_routes(app, file_links, accounts, pool, limiter, file_claims)
+    file_download = add_file_routes(app, file_links, accounts, pool, limiter, file_claims, task_links=task_file_links)
     secret_fetch = secret_file_tool(app, accounts, pool, limiter, file_claims)  # ask_secret_file (built before app)
     add_voice_route(app, voice_links, accounts, pool, limiter, media.guard.slots, file_download)
     add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed, voice_links)

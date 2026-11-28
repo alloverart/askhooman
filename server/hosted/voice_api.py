@@ -23,6 +23,11 @@ The bytes pass through memory only while they are read from Drive and sent (at m
 HEAD is 405). They hold one of the instance's media slots from the read until the response has gone out, so the memory
 budget of pictures and video holds (busy is 503 with Retry-After). Nothing of the recording, its transcript or the
 token is stored or logged; Cloud Run's request log keeps the path, and the token in it is dead within the hour.
+
+The same path carries three kinds of token, each sealed under its own context: a recording's ("media", here), an
+answer's file ("file", SPEC 7.4) and a task reply's file ("taskfile", SPEC 8.3). A token that does not open as a
+recording goes to files_api (add_file_routes), which tries the two kinds of file; one that opens as none of the three
+gets this route's 404, since nothing says what it was.
 """
 
 import logging
@@ -87,12 +92,13 @@ def _size(meta: dict) -> int | None:
 def add_voice_route(app: FastAPI, links: VoiceLinks, accounts: Accounts, pool: DrivePool, limiter: RateLimiter,
                     slots: Slots, files: Callable[[str, str | None], Response | None] | None = None) -> None:
     """The route, on the hosted app (create_hosted_app): `slots` are the media slots of attachments (media_api).
-    `files` (files_api.add_file_routes) answers a token that is a file's link and gives None for any other."""
+    `files` (files_api.add_file_routes) answers a token that is the link to an answer's file or to a task reply's
+    file, and gives None for any other."""
 
     @app.get(f"{MEDIA_PATH}{{token:path}}", include_in_schema=False)
     def voice_recording(token: str, request: Request):
         sealed = links.open(token)
-        if sealed is None:  # not a recording's link: a file's (SPEC 7.4, own context), else nothing we sealed
+        if sealed is None:  # not a recording's link: an answer's or a reply's file (SPEC 7.4, 8.3), else nothing
             answer = files(token, request.headers.get("range")) if files is not None else None
             return answer if answer is not None else _refuse(404, NO_SUCH)
         user = sealed["user"]

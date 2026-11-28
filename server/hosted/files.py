@@ -109,13 +109,14 @@ def clean_name(raw: str) -> str:
     return name or "file"
 
 
-def download_name(ask_id: int, n: int, name: str) -> tuple[str, str]:
+def download_name(holder_id: int, n: int, name: str, holder: str = "ask") -> tuple[str, str]:
     """(the ASCII `filename`, the RFC 5987 `filename*` value) of a download's Content-Disposition. The first is
-    ask-<id>-file-<n>[.<ext>], <ext> the cleaned name's last extension when it is 1-10 ASCII letters or digits
-    (lower-cased); the second is UTF-8''<percent-encoded cleaned name>. The caller quotes the first."""
+    <holder>-<id>-file-<n>[.<ext>] (ask-3-file-1.pdf for an answer's file, task-3-file-1.pdf for a reply's), <ext> the
+    cleaned name's last extension when it is 1-10 ASCII letters or digits (lower-cased); the second is
+    UTF-8''<percent-encoded cleaned name>. The caller quotes the first."""
     name = clean_name(name)
     ext = _extension(name)[1:]
-    ascii_name = f"ask-{ask_id}-file-{n}" + (f".{ext.lower()}" if EXTENSION.fullmatch(ext) else "")
+    ascii_name = f"{holder}-{holder_id}-file-{n}" + (f".{ext.lower()}" if EXTENSION.fullmatch(ext) else "")
     return ascii_name, "UTF-8''" + quote(name, safe="")
 
 

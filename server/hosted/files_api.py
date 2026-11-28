@@ -66,6 +66,22 @@ the claim is made done FIRST, then the Drive file is deleted
 deleted_reason "sent", file_id null, event file_downloaded) under the guards of mark_downloaded: a closed, reopened or
 re-answered ask, or an item that no longer names this file, is skipped. A failed delete leaves the file in Drive, the
 claim done (nothing can read it) and the item as it was but downloaded_at: the sweep retries the delete.
+
+A task reply's normal file (SPEC 8.3 «The routes»: 7.4 with the names changed) comes on the same path, with a link
+sealed under a context of its own, "taskfile" (files.TaskFileLinks): the download() add_file_routes returns tries an
+answer's opener, then a task's, so a token opens as one of them at most. The same checks in the same order
+(_check_task), the same parts, slots, Drive refusals and streaming, and the same budgets, shared and not doubled: one
+`files` bucket and one `file_bytes` budget for an agent's answers' and replies' files alike. What differs: the task is
+read with its events and must be the agent's own; its reply_files must have item `n` of the link's reply_id and
+file_id (a finished task or a deleted item: 410; a secret item or anything else: 404, worded for the task,
+TASK_NO_SUCH; a reopened task has only deleted items); an id no item has but one of the user's `replied` events names
+(an item the user's next reply pruned; through a link, that event is the link's reply_id and names its file_id) is 410
+like a deleted item, the «sent» one when that snapshot was a secret file and the history holds its file_downloaded;
+Drive must mark the file kind "file" with this task_id and file = n, and no ask_id; the 409 names `askhooman task
+files`; the download is task-<id>-file-<n>[.<ext>]. mark_task_downloaded (mark_task_blocked) writes its stamp only if
+the task is still open, the item still has this file_id and the stamp is still null, with the owner agent as the
+event's actor; `updated_at` is not written, and these events are not the owner's (task_rules.OWNER_KINDS): a download
+never clears reply_pending.
 """
 
 import base64
@@ -88,6 +104,7 @@ from ..app import current_identity
 from ..db import utc_now
 from ..drive import BLOCK_REASONS, DriveBadFile, DriveBlocked, DriveError, DriveNotFound
 from ..rules import ANSWER_FILES, AskError, Change, NotFound, Unavailable
+from ..task_rules import FINISHED, OPEN, REPLY_FILES
 from ..tokens import Identity
 from .accounts import Accounts, HostedIdentity
 from .files import (
@@ -97,6 +114,7 @@ from .files import (
     SECRET_TTL,
     FileClaims,
     FileLinks,
+    TaskFileLinks,
     claim_key,
     created_epoch,
     download_name,
@@ -104,11 +122,12 @@ from .files import (
 )
 from .media_api import STREAM_SLOTS, STREAM_SLOTS_PER_AGENT, Slots
 from .ratelimit import ByteBudget, RateLimiter
-from .records import BadFile, DrivePool, HostedAsks
+from .records import BadFile, DrivePool, HostedAsks, HostedTasks
 
 log = logging.getLogger("asks.hosted.files")
 
 NO_SUCH = "no such file, or the link has expired: read the ask again for a new link"
+TASK_NO_SUCH = "no such file, or the link has expired: read the task again for a new link"
 DELETED = "the file was deleted"
 BLOCKED = "Google blocked this file"
 UNAVAILABLE = "Google Drive is not available right now, try again"
@@ -146,37 +165,55 @@ def _refuse(status: int, detail: str, headers: dict | None = None, background: B
                         background=background)
 
 
-def _stamp(pool: DrivePool, user: str, ask_id: int, n: int, file_id: str, answered_at: str, at: str, field: str,
-           kind: str, extra: dict | None = None) -> bool:
-    """Set `field` (downloaded_at or blocked_at) of answer file `n` to `at` and add the event `kind` {id: n}, only if
-    the ask is still answered with this answered_at, the item still has this file_id and the field is still null:
-    checked again on the ask as it is when written (HostedAsks.items.mutate retries a concurrent write). True if it
-    wrote; False for a closed, reopened or re-answered ask, a changed or deleted item, or a stamp already there
-    (not an error: a later download writes nothing). `extra` is set on the item with it (the sent secret file's deletion)."""
-    asks = HostedAsks(pool.records(user))
+def _stamp_item(holders: HostedAsks | HostedTasks, holder_id: int, list_field: str, current: Callable[[dict], bool],
+                n: int, file_id: str, at: str, field: str, kind: str, extra: dict | None = None) -> bool:
+    """Set `field` (downloaded_at or blocked_at) of item `n` of the holder's `list_field` to `at` and add the event
+    `kind` {id: n} (actor: the holder's agent), only if `current(holder)` (the ask or task is still the one the file
+    was fetched from), the item still has this file_id and the field is still null: checked again on the holder as it
+    is when written (DriveCollection.mutate retries a concurrent write). Nothing else is written (not updated_at). True
+    if it wrote; False when the holder is not current, the item changed or went, or the stamp is already there (not an
+    error: a later download writes nothing). `extra` is set on the item with it (the sent secret file's deletion)."""
     try:
-        who = Identity("agent", asks.get(ask_id, with_events=False)["agent"])
+        who = Identity("agent", holders.get(holder_id, with_events=False)["agent"])
     except NotFound:
         return False
     wrote = []
 
     def plan(load):
-        ask = load()
-        if ask["status"] != "answered" or ask["answered_at"] != answered_at:
-            return ask, None
-        items = ask.get(ANSWER_FILES) or []
+        holder = load()
+        if not current(holder):
+            return holder, None
+        items = holder.get(list_field) or []
         found = next((i for i in items if i["id"] == n), None)
         if found is None or found["file_id"] != file_id or found[field] is not None:
-            return ask, None
+            return holder, None
         wrote.append(n)
-        return ask, Change({ANSWER_FILES: [{**i, field: at, **(extra or {})} if i is found else i for i in items]}, kind,
-                              {"id": n}, at)
+        return holder, Change({list_field: [{**i, field: at, **(extra or {})} if i is found else i for i in items]},
+                              kind, {"id": n}, at)
 
     try:
-        asks.items.mutate(who, ask_id, plan)
+        holders.items.mutate(who, holder_id, plan)
     except NotFound:
         return False
     return bool(wrote)
+
+
+def _stamp(pool: DrivePool, user: str, ask_id: int, n: int, file_id: str, answered_at: str, at: str, field: str,
+           kind: str, extra: dict | None = None) -> bool:
+    """_stamp_item for answer file `n`: only while the ask is still answered with this answered_at (a closed,
+    reopened or re-answered ask is skipped)."""
+    return _stamp_item(HostedAsks(pool.records(user)), ask_id, ANSWER_FILES,
+                       lambda ask: ask["status"] == "answered" and ask["answered_at"] == answered_at,
+                       n, file_id, at, field, kind, extra)
+
+
+def _task_stamp(pool: DrivePool, user: str, task_id: int, n: int, file_id: str, at: str, field: str, kind: str,
+                extra: dict | None = None) -> bool:
+    """_stamp_item for item `n` of a task's reply_files (SPEC 8.3 «downloaded_at and blocked_at»): only while the task
+    is open (a finished task's items are stamped finished, a reopened one's stay so). A reply is never replaced, so
+    the item's file_id alone says it is the same file."""
+    return _stamp_item(HostedTasks(pool.records(user)), task_id, REPLY_FILES, lambda task: task["status"] in OPEN,
+                       n, file_id, at, field, kind, extra)
 
 
 def mark_downloaded(pool: DrivePool, user: str, ask_id: int, n: int, file_id: str, answered_at: str, at: str) -> bool:
@@ -196,6 +233,18 @@ def mark_sent(pool: DrivePool, user: str, ask_id: int, n: int, file_id: str, ans
     ask still answered with this answered_at, the item still naming this file). True if it wrote."""
     extra = {"deleted_at": at, "deleted_reason": "sent", "file_id": None} if deleted else None
     return _stamp(pool, user, ask_id, n, file_id, answered_at, at, "downloaded_at", "file_downloaded", extra)
+
+
+def mark_task_downloaded(pool: DrivePool, user: str, task_id: int, n: int, file_id: str, at: str) -> bool:
+    """Write `downloaded_at` of item `n` of the task's reply_files (and the `file_downloaded` event) once: see
+    _task_stamp. The event is not the owner's (task_rules.OWNER_KINDS): reply_pending stays. True if it wrote."""
+    return _task_stamp(pool, user, task_id, n, file_id, at, "downloaded_at", "file_downloaded")
+
+
+def mark_task_blocked(pool: DrivePool, user: str, task_id: int, n: int, file_id: str, at: str) -> bool:
+    """Write `blocked_at` of item `n` of the task's reply_files (and a `file_blocked` event) once, as
+    mark_task_downloaded does."""
+    return _task_stamp(pool, user, task_id, n, file_id, at, "blocked_at", "file_blocked")
 
 
 class StreamAborted(Exception):
@@ -276,14 +325,16 @@ def _size(meta: dict) -> int | None:
 
 @dataclass
 class Target:
-    """What _check found: the ask, its item `n` and the checked Drive file; for a normal file asked to be streamed,
-    `span` = _span's (start, end, ask_end)."""
-    ask: dict
+    """What _check (_check_task) found: the holder (the ask; or the task, with its events), its item `n` and the
+    checked Drive file; `kind` says which ("ask" | "task"); for a normal file asked to be streamed, `span` = _span's
+    (start, end, ask_end)."""
+    holder: dict
     item: dict
     n: int
     records: object
     ids: str
     span: tuple | None = None
+    kind: str = "ask"
 
     @property
     def secret(self) -> bool:
@@ -292,6 +343,28 @@ class Target:
 
 def _epoch(stamp: str) -> float:
     return datetime.fromisoformat(stamp).timestamp()
+
+
+def _confirm(records, item: dict, ids: str, own: Callable[[dict], bool], born: float | None, no_such: str,
+             what: str):
+    """Drive's word on the file `item` names, for both kinds: gone is 410; its appProperties must say it is the item's
+    own (`own`), and its size must be `bytes` and within the cap (MAX_SECRET_BYTES for a secret file), else 404
+    `no_such`, logged by ids; a secret file past its lifetime (from `born`, bounded by Drive's createdTime) is 410
+    expired. None if the file may be sent; Drive unreachable is 503."""
+    try:
+        meta = records.call(records.drive.get_meta, item["file_id"])
+    except (AskError, DriveError):
+        return _refuse(503, UNAVAILABLE, {"Retry-After": "30"})
+    if meta is None:
+        return _refuse(410, DELETED)
+    size = _size(meta)
+    cap = MAX_SECRET_BYTES if item["secret"] else MAX_FILE_BYTES
+    if not own(meta.get("appProperties") or {}) or size != item["bytes"] or size > cap:
+        log.warning("hosted: the Drive file named by %s is not its %s: not sent", ids, what)
+        return _refuse(404, no_such)
+    if born is not None and _now() >= lifetime_end(born, created_epoch(meta), SECRET_TTL):
+        return _refuse(410, EXPIRED)  # the sweep deletes it
+    return None
 
 
 def _check(pool: DrivePool, user: str, ask_id: int, n: int, slug: str, expect: tuple[str, str] | None, secret_ok: bool,
@@ -334,27 +407,100 @@ def _check(pool: DrivePool, user: str, ask_id: int, n: int, slug: str, expect: t
             born = min(_epoch(item["uploaded_at"]), _epoch(ask["answered_at"]))
         except (TypeError, ValueError):
             return _refuse(404, NO_SUCH)
-    file_id, length = item["file_id"], item["bytes"]
     ids = f"ask #{ask['id']} item {n}"
-    try:
-        meta = records.call(records.drive.get_meta, file_id)
-    except (AskError, DriveError):
-        return _refuse(503, UNAVAILABLE, {"Retry-After": "30"})
-    if meta is None:
-        return _refuse(410, DELETED)
-    props, size = meta.get("appProperties") or {}, _size(meta)
-    cap = MAX_SECRET_BYTES if item["secret"] else MAX_FILE_BYTES
-    if (props.get("kind") != "file" or props.get("ask_id") != str(ask["id"]) or props.get("file") != str(n)
-            or size != length or size > cap):
-        log.warning("hosted: the Drive file named by %s is not its answer file: not sent", ids)
-        return _refuse(404, NO_SUCH)
-    if born is not None and _now() >= lifetime_end(born, created_epoch(meta), SECRET_TTL):
-        return _refuse(410, EXPIRED)  # the sweep deletes it
+    refused = _confirm(records, item, ids, lambda props: (
+        props.get("kind") == "file" and props.get("ask_id") == str(ask["id"]) and props.get("file") == str(n)),
+        born, NO_SUCH, "answer file")
+    if refused is not None:
+        return refused
     return Target(ask, item, n, records, ids, span)
 
 
-def _headers(ask_id: int, n: int, item: dict, length: int) -> dict:
-    ascii_name, starred = download_name(ask_id, n, item["name"])
+def _is_id(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _pruned(task: dict, n: int, expect: tuple[int, str] | None, sent_detail: str | None):
+    """No item of the task has id `n` (SPEC 8.3, «An id whose item was pruned»): an id that never was (404), or the
+    item of a file that is gone, which the user's next reply pruned from reply_files (410, like a deleted item). Told
+    apart by the snapshot in the `files` of one of the user's `replied` events (ids are never reused); through a link
+    it must be the event `reply_id`, its snapshot naming this file_id. «Sent» (`sent_detail`, else SENT) when the
+    snapshot was a secret file and the history holds its `file_downloaded`, so «a second call says it was already
+    sent» holds after the prune."""
+    events = task.get("events") or []
+    snapshot = None
+    for event in events:
+        if event.get("kind") != "replied" or event.get("actor") != "denis" or not _is_id(event.get("id")):
+            continue
+        if expect is not None and event["id"] != expect[0]:
+            continue
+        payload = event.get("payload")
+        files = payload.get("files") if isinstance(payload, dict) else None
+        for entry in files if isinstance(files, list) else []:
+            if (isinstance(entry, dict) and _is_id(entry.get("id")) and entry["id"] == n
+                    and (expect is None or entry.get("file_id") == expect[1])):
+                snapshot = entry
+    if snapshot is None:
+        return _refuse(404, TASK_NO_SUCH)
+    sent = any(e.get("kind") == "file_downloaded" and isinstance(e.get("payload"), dict)
+               and _is_id(e["payload"].get("id")) and e["payload"]["id"] == n for e in events)
+    if snapshot.get("secret") is True and sent:
+        return _refuse(410, sent_detail or SENT)
+    return _refuse(410, DELETED)
+
+
+def _check_task(pool: DrivePool, user: str, task_id: int, n: int, slug: str, expect: tuple[int, str] | None,
+                secret_ok: bool, sent_detail: str | None = None, streams: bool = False,
+                range_header: str | None = None):
+    """_check for item `n` of a task's reply_files, in SPEC 8.3's order (the module text): a Target(kind="task"), or
+    the refusal (a response), every 404 TASK_NO_SUCH. `expect` = (reply_id, file_id) the link carries (None on the
+    bearer route); `secret_ok`, `sent_detail`, `streams` and `range_header` are _check's. The task is read with its
+    events, as checked (a task file that is not one: 404; Drive unreachable: 503)."""
+    records = pool.records(user)
+    try:
+        task = HostedTasks(records).get(task_id)  # with its events: a pruned id is told apart by them
+    except (NotFound, BadFile):  # a broken task file: retrying won't help
+        return _refuse(404, TASK_NO_SUCH)
+    except AskError:
+        return _refuse(503, UNAVAILABLE, {"Retry-After": "30"})
+    if task["agent"] != slug:
+        return _refuse(404, TASK_NO_SUCH)
+    item = next((i for i in task.get(REPLY_FILES) or [] if i["id"] == n), None)
+    if item is None:  # never was, or pruned by a later reply
+        return _pruned(task, n, expect, sent_detail)
+    if (expect is not None and item["reply_id"] != expect[0]) or (item["secret"] and not secret_ok):
+        return _refuse(404, TASK_NO_SUCH)  # another reply's file, or a file with no link
+    if item["file_id"] is None or task["status"] in FINISHED:  # deleted, or went with the finish
+        return _refuse(410, sent_detail if sent_detail and item["deleted_reason"] == "sent" else DELETED)
+    if expect is not None and item["file_id"] != expect[1]:
+        return _refuse(404, TASK_NO_SUCH)
+    if item["secret"] and item["downloaded_at"] is not None:  # sent already, and the delete after it failed
+        return _refuse(410, sent_detail or SENT)
+    if item["blocked_at"] is not None:  # Drive refused it before: no Drive call, slot or charge
+        return _refuse(410, BLOCKED)
+    span = None
+    if streams and not item["secret"]:  # what the response may carry is known from `bytes` alone
+        span = _span(range_header, item["bytes"], "askhooman task files")
+        if not isinstance(span, tuple):
+            return span
+    born = None
+    if item["secret"]:  # the route refuses by itself past 24 h (checked against Drive's createdTime)
+        try:
+            born = min(_epoch(item["uploaded_at"]), _epoch(item["replied_at"]))
+        except (TypeError, ValueError):
+            return _refuse(404, TASK_NO_SUCH)
+    ids = f"task #{task['id']} item {n}"
+    refused = _confirm(records, item, ids, lambda props: (
+        props.get("kind") == "file" and props.get("task_id") == str(task["id"]) and props.get("file") == str(n)
+        and "ask_id" not in props),  # a file with an ask's mark is never a task's (HostedTasks._delete_reply_file)
+        born, TASK_NO_SUCH, "reply file")
+    if refused is not None:
+        return refused
+    return Target(task, item, n, records, ids, span, "task")
+
+
+def _headers(holder_id: int, n: int, item: dict, length: int, holder: str = "ask") -> dict:
+    ascii_name, starred = download_name(holder_id, n, item["name"], holder)
     return {
         "Content-Type": "application/octet-stream",
         "Content-Length": str(length),
@@ -365,17 +511,18 @@ def _headers(ask_id: int, n: int, item: dict, length: int) -> dict:
     }
 
 
-def _span(range_header: str | None, length: int):
+def _span(range_header: str | None, length: int, command: str = "askhooman files"):
     """What a normal file's response carries (the module text): (start, end, ask_end), the first and last byte sent
     and the `end` to ask Drive for (None: an open range, or the whole file when start is 0); or the refusal (a
-    response, before any slot, charge or Drive call). A Range in another unit than bytes is ignored (RFC 9110 14.2)."""
+    response, before any slot, charge or Drive call). A Range in another unit than bytes is ignored (RFC 9110 14.2).
+    The 409 names `command`, the CLI command that fetches this kind of file in parts."""
     header = (range_header or "").strip()
     if header.partition("=")[0].lower() != "bytes":
         header = ""
     if not header:
         if length > PART_BYTES:
             return _refuse(409, f"this file is {length} bytes, more than one response can carry: fetch it in parts "
-                                f"with Range: bytes=START-END, at most {PART_BYTES} bytes each (askhooman files does "
+                                f"with Range: bytes=START-END, at most {PART_BYTES} bytes each ({command} does "
                                 "this)")
         return 0, length - 1, None
     unsatisfiable = {"Content-Range": f"bytes */{length}"}
@@ -393,11 +540,31 @@ def _span(range_header: str | None, length: int):
     return start, end, end if closed else None
 
 
-def _stream(app: FastAPI, pool: DrivePool, user: str, who: str, target: Target, answered_at: str):
-    """A normal file: its span (decided in _check: the whole file, or a part), a stream slot, Drive opened, the byte
-    budget charged with the span, then streamed (see the module text)."""
-    ask, item, n, records, ids = target.ask, target.item, target.n, target.records, target.ids
+@dataclass
+class Writes:
+    """The writes into the holder that fetching target's file makes, each called with the stamp's time: True if it
+    wrote (_writes)."""
+    downloaded: Callable[[str], bool]
+    blocked: Callable[[str], bool]
+
+
+def _writes(pool: DrivePool, user: str, target: Target, answered_at: str | None = None) -> Writes:
+    """The holder's own writes for target.kind: an ask's item is stamped under `answered_at` (the answer the link
+    names, or the ask's on the bearer route), a task's while the task is open (mark_task_downloaded)."""
+    holder_id, n, file_id = target.holder["id"], target.n, target.item["file_id"]
+    if target.kind == "task":
+        return Writes(lambda at: mark_task_downloaded(pool, user, holder_id, n, file_id, at),
+                      lambda at: mark_task_blocked(pool, user, holder_id, n, file_id, at))
+    return Writes(lambda at: mark_downloaded(pool, user, holder_id, n, file_id, answered_at, at),
+                  lambda at: mark_blocked(pool, user, holder_id, n, file_id, answered_at, at))
+
+
+def _stream(app: FastAPI, pool: DrivePool, user: str, who: str, target: Target, answered_at: str | None = None):
+    """A normal file: its span (decided in _check / _check_task: the whole file, or a part), a stream slot, Drive
+    opened, the byte budget charged with the span, then streamed (see the module text). `answered_at` is _writes'."""
+    holder, item, n, records, ids = target.holder, target.item, target.n, target.records, target.ids
     file_id, length = item["file_id"], item["bytes"]
+    writes = _writes(pool, user, target, answered_at)
     start, end, ask_end = target.span
     size = end - start + 1
     whole = start == 0 and ask_end is None  # 200 the whole file; anything else is a 206 with its Content-Range
@@ -410,8 +577,7 @@ def _stream(app: FastAPI, pool: DrivePool, user: str, who: str, target: Target, 
             stream = records.call(_open, records.drive, file_id, start, ask_end)
         except _Blocked:
             log.warning("hosted: Drive refused to serve the file of %s: blocked", ids)
-            return _refuse(410, BLOCKED, background=BackgroundTask(
-                mark_blocked, pool, user, ask["id"], n, file_id, answered_at, utc_now()))
+            return _refuse(410, BLOCKED, background=BackgroundTask(writes.blocked, utc_now()))
         except DriveNotFound:
             return _refuse(410, DELETED)
         except (AskError, DriveError):
@@ -421,12 +587,11 @@ def _stream(app: FastAPI, pool: DrivePool, user: str, who: str, target: Target, 
             stream.close()
             return _refuse(429, "too many bytes downloaded: at most 1 GiB an hour per agent",
                            {"Retry-After": str(int(budget.retry_after()))})
-        headers = _headers(ask["id"], n, item, size)
+        headers = _headers(holder["id"], n, item, size, target.kind)
         if not whole:
             headers["Content-Range"] = f"bytes {start}-{end}/{length}"
         # only a response that ends at the file's last byte (the whole file, the last part) marks it downloaded
-        done = ((lambda: mark_downloaded(pool, user, ask["id"], n, file_id, answered_at, utc_now()))
-                if end == length - 1 else None)
+        done = (lambda: writes.downloaded(utc_now())) if end == length - 1 else None
         response = _Streamed(stream, size, 200 if whole else 206, headers, lambda: slots.give(1, who), done, ids)
         handed_over = True  # the response gives the slot back and closes the stream when it ends
         return response
@@ -528,7 +693,7 @@ def take_secret(app: FastAPI, pool: DrivePool, claims: FileClaims, user: str, wh
     """The one send sequence of a secret file, shared by the bearer route (_Once) and the MCP tool: claim, slot, the
     whole file read and checked, the byte budget; a Refusal, or a Taken whose `finish` the caller MUST call. `cap` (the
     tool's 16 KiB) refuses a larger file before the claim is taken."""
-    ask, item, n, records, ids = target.ask, target.item, target.n, target.records, target.ids
+    ask, item, n, records, ids = target.holder, target.item, target.n, target.records, target.ids
     file_id, length, answered_at = item["file_id"], item["bytes"], ask["answered_at"]
     if cap is not None and length > cap:
         return Refusal(413, f"too big for MCP — fetch it with `askhooman files {ask['id']} --secret`")
@@ -614,19 +779,22 @@ def _secret(app: FastAPI, pool: DrivePool, claims: FileClaims, user: str, who: s
     got = take_secret(app, pool, claims, user, who, target)
     if isinstance(got, Refusal):
         return got.response()
-    ask, item = target.ask, target.item
-    return _Once(got.raw, _headers(ask["id"], target.n, item, item["bytes"]), got.finish)
+    holder, item = target.holder, target.item
+    return _Once(got.raw, _headers(holder["id"], target.n, item, item["bytes"], target.kind), got.finish)
 
 
-def file_download(app: FastAPI, links: FileLinks, accounts: Accounts, pool: DrivePool, limiter: RateLimiter):
-    """download(token, range_header) -> a Response, or None if `token` is not a file link (the voice route's 404).
-    The stream slots and the byte budget are read from app.state at each request."""
+def _link_download(app: FastAPI, links: FileLinks | TaskFileLinks, accounts: Accounts, pool: DrivePool,
+                   limiter: RateLimiter, no_such: str, check: Callable[[str, dict, str, str | None], object]):
+    """download(token, range_header) -> a Response, or None if `links` does not open `token`. What a link route does
+    whatever kind of file it names: the token, the `files` budget of its user and agent (one bucket for both kinds),
+    the agent (revoked or not the user's: 404 `no_such`), then `check(user, sealed, slug, range_header)` (a Target or
+    the refusal) and the stream. The stream slots and the byte budget are read from app.state at each request."""
 
     def download(token: str, range_header: str | None = None):
         sealed = links.open(token)
         if sealed is None:
             return None
-        user, agent_id, n = sealed["user"], sealed["agent"], sealed["n"]
+        user, agent_id = sealed["user"], sealed["agent"]
         who = f"{user}:{agent_id}"
         if not limiter.allow("files", who):  # per agent: one link can't block the user's others
             return _refuse(429, "too many requests for files: at most 20 a minute per agent",
@@ -637,14 +805,32 @@ def file_download(app: FastAPI, links: FileLinks, accounts: Accounts, pool: Driv
             log.warning("file link check failed: %s", type(exc).__name__)
             return _refuse(503, "temporarily unavailable, try again", {"Retry-After": "5"})
         if agent is None:  # revoked, another user's, or no longer there
-            return _refuse(404, NO_SUCH)
-        target = _check(pool, user, sealed["ask_id"], n, agent["slug"], (sealed["answered_at"], sealed["file_id"]),
-                        False, streams=True, range_header=range_header)
+            return _refuse(404, no_such)
+        target = check(user, sealed, agent["slug"], range_header)
         if not isinstance(target, Target):
             return target
-        return _stream(app, pool, user, who, target, sealed["answered_at"])
+        # an answer's link names its answer (the stamps' guard); a reply's has no answered_at
+        return _stream(app, pool, user, who, target, sealed.get("answered_at"))
 
     return download
+
+
+def file_download(app: FastAPI, links: FileLinks, accounts: Accounts, pool: DrivePool, limiter: RateLimiter):
+    """download(token, range_header) for the link to an answer's normal file (SPEC 7.4): a Response, or None if
+    `token` is not one."""
+    return _link_download(app, links, accounts, pool, limiter, NO_SUCH, lambda user, sealed, slug, range_header: _check(
+        pool, user, sealed["ask_id"], sealed["n"], slug, (sealed["answered_at"], sealed["file_id"]), False,
+        streams=True, range_header=range_header))
+
+
+def task_file_download(app: FastAPI, links: TaskFileLinks, accounts: Accounts, pool: DrivePool,
+                       limiter: RateLimiter):
+    """download(token, range_header) for the link to a task reply's normal file (SPEC 8.3): a Response, or None if
+    `token` is not one."""
+    return _link_download(app, links, accounts, pool, limiter, TASK_NO_SUCH,
+                          lambda user, sealed, slug, range_header: _check_task(
+                              pool, user, sealed["task_id"], sealed["n"], slug, (sealed["reply_id"], sealed["file_id"]),
+                              False, streams=True, range_header=range_header))
 
 
 # ask_secret_file: what goes inline. MCP clients cap a tool result (Claude Code about 25k tokens): a bigger file would
@@ -733,15 +919,26 @@ def add_content_route(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter
             return target
         if target.secret:  # one response, no Range
             return _secret(app, pool, claims, user, key, target)
-        return _stream(app, pool, user, key, target, target.ask["answered_at"])
+        return _stream(app, pool, user, key, target, target.holder["answered_at"])
 
 
 def add_file_routes(app: FastAPI, links: FileLinks, accounts: Accounts, pool: DrivePool, limiter: RateLimiter,
-                    claims: FileClaims | None = None):
+                    claims: FileClaims | None = None, task_links: TaskFileLinks | None = None):
     """The file downloads of the hosted app (create_hosted_app): the stream slots and the byte budget go into
-    app.state (one of each per instance); adds the bearer route; returns download(token, range_header), which the
-    voice route calls for a token that is not a recording's (both live on /media/v1/)."""
+    app.state (one of each per instance, for both kinds of file); adds the bearer route; returns
+    download(token, range_header), which the voice route calls for a token that is not a recording's (all three live
+    on /media/v1/). It tries the link to an answer's file, then (with `task_links`) to a task reply's: each is sealed
+    under its own context, so a token opens as one at most; None for a token that is neither (the voice route's 404)."""
     app.state.stream_slots = Slots(STREAM_SLOTS, STREAM_SLOTS_PER_AGENT)
     app.state.file_bytes = ByteBudget()
     add_content_route(app, accounts, pool, limiter, claims or FileClaims(accounts.store))
-    return file_download(app, links, accounts, pool, limiter)
+    answers = file_download(app, links, accounts, pool, limiter)
+    replies = task_file_download(app, task_links, accounts, pool, limiter) if task_links is not None else None
+
+    def download(token: str, range_header: str | None = None):
+        found = answers(token, range_header)
+        if found is None and replies is not None:
+            return replies(token, range_header)
+        return found
+
+    return download
