@@ -42,7 +42,7 @@ from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
 from .feed import EventFeed, add_feed_route
-from .files_api import add_file_routes, is_content_path, secret_file_tool
+from .files_api import add_file_routes, is_content_path, secret_file_tool, task_secret_file_tool
 from .google import GoogleError, GoogleOAuth
 from .looks import AGENT_COLORS, own_look
 from .media_api import MEDIA_SLOTS, MediaGuard, MediaService, Slots, add_media_routes
@@ -223,8 +223,9 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         lambda who: ping_own_webhook(accounts, webhooks, limiter, who))
     def hosted_mcp(chatgpt: bool):
         """The MCP server for every client but ChatGPT, or ChatGPT's: the same tools on the same services, without
-        secret files (SPEC 7.8 «ChatGPT: no secret files»)."""
-        secret_file = None if chatgpt else SecretFileTool(lambda who, ask_id, n: secret_fetch(who, ask_id, n))
+        secret files (SPEC 7.8 «ChatGPT: no secret files», 8.7 for a task's)."""
+        secret_file = None if chatgpt else SecretFileTool(lambda who, ask_id, n: secret_fetch(who, ask_id, n),
+                                                          lambda who, task_id, n: task_secret_fetch(who, task_id, n))
         server = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user),
                            webhook=own_webhook, media=MediaTool(media.create, media.attach, media.upload, media.detach),
                            secret_file=secret_file, chatgpt=chatgpt)
@@ -403,6 +404,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     add_media_routes(app, media)
     file_download = add_file_routes(app, file_links, accounts, pool, limiter, file_claims, task_links=task_file_links)
     secret_fetch = secret_file_tool(app, accounts, pool, limiter, file_claims)  # ask_secret_file (built before app)
+    task_secret_fetch = task_secret_file_tool(app, accounts, pool, limiter, file_claims)  # task_secret_file
     add_voice_route(app, voice_links, accounts, pool, limiter, media.guard.slots, file_download)
     add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed, voice_links)
     add_feed_route(app, feed, accounts)

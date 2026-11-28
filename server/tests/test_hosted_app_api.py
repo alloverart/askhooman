@@ -451,9 +451,7 @@ def test_store_pages(hosted):
                   "A voice recording is kept until the ask is closed, and 30 days at most",
                   "pass through our server without being kept",
                   # 19.11.2026: files in answers (SPEC 7.8, "Policy before the apps ship")
-                  "Files you attach to an answer are saved there too",
                   "our server holds a file only while it passes through, and keeps no copy",
-                  "a normal file until the ask is closed, and 30 days at most",
                   "a secret file until it has been sent to the agent; if it has not been, it is unreadable after 24 hours "
                   "and deleted within the hour after",
                   "If the agent has not fetched it, it can no longer be read 24 hours after you attached it, and our "
@@ -461,7 +459,26 @@ def test_store_pages(hosted):
                   "the files you sent to your agents from your Google Drive",
                   "stay in the hidden app folder until you remove the app data",
                   "its name, type and size but never a link; for a secret file only that it exists)",
-                  "to answers stay in the hidden app folder until you remove the app data there in the same way. To remove",
+                  # 28.11.2026: files in replies on tasks (SPEC 8.6), the five passages it changes
+                  "Files you attach to an answer, or to a reply on a task, are saved there too, by the app, with your "
+                  "own Google sign-in. A normal file is kept until the ask is closed or the task is finished, and 30 "
+                  "days at most after you sent it.",
+                  "The agent that asked, or whose task it is, gets the file; other agents see that a file exists and "
+                  "how big it is, not what it is called or what it holds.",
+                  "The same goes for the files you attach to an answer or a reply: our server holds a file only while "
+                  "it passes through",
+                  "It streams a normal file from your Drive to the agent that asked or whose task it is, and sends a "
+                  "secret file once and deletes it. Your answer or your task in your Drive lists each file's name, "
+                  "type and size and whether it is secret; our server keeps none of that.",
+                  "The files you attach to an answer reach only the agent that asked; the files you attach to a reply "
+                  "on a task reach only the agent whose task it is.",
+                  "for a secret file only that it exists), and the task and your reply when you reply on a task (for "
+                  "its files, the same: a normal file's name, type and size, never a link; a secret file only that it "
+                  "exists).",
+                  "Files you attached to an answer or to a reply on a task: a normal file until the ask is closed or "
+                  "the task is finished, and 30 days at most; a secret file until it has been sent to the agent;",
+                  "the files you attached to answers and replies stay in the hidden app folder until you remove the "
+                  "app data there in the same way. To remove",
                   "agent you connect can read all the asks and tasks in your account",
                   "The recording of a voice answer goes only to the agent that asked",
                   "The apps only record: they do not turn your speech into text",

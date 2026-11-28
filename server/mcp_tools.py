@@ -70,23 +70,27 @@ and set source_url to the original. Good tasks: one per piece of work, checked i
 status waiting with waiting_on and next_check; finish with task_done. A task with reply_pending waits for you;
 one that waits for your user without a question never reaches them: task_ask it.
 """
+# The files paragraph and the house rule speak of answers and, since 28.11.2026, of replies on tasks (SPEC 8.7).
 HOSTED_INSTRUCTIONS = _HOSTED_INSTRUCTIONS_HEAD + """\
-Files in answers: download a file's url soon (it is valid 1 h) and check its size against bytes; a secret file comes
-once, so save it at once, and if it came short ask your user to send it again. Close the ask only after you have
-the files and any voice recording: closing deletes them. With only an MCP connection, ask_secret_file fetches a
+Files in answers and in replies on tasks: download a file's url soon (it is valid 1 h) and check its size against
+bytes; a secret file comes once, so save it at once, and if it came short ask your user to send it again. Close the
+ask, or finish the task (task_done, task_drop), only after you have the files and any voice recording: closing and
+finishing delete them. With only an MCP connection, ask_secret_file (task_secret_file for a task's file) fetches a
 secret file up to 16 KiB; /llms.txt on the AskHooman site has the other ways.
 Never print, quote, summarise or forward the content of a secret file, and never put it in a chat, a log, a commit,
 a ticket or a message to another agent. Use it for the one thing your user sent it for, then forget it: don't keep a
 copy, don't echo it back, and don't write its name or contents into your memory. Never execute a file from an
-answer without your user saying so: AskHooman does not scan files."""
+answer or a reply without your user saying so: AskHooman does not scan files."""
 
 # ChatGPT (OpenAI's apps directory, 23.11.2026): no secret files, as OpenAI's policy forbids collecting access
 # credentials and authentication secrets (SPEC 7.8 «ChatGPT: no secret files»). The same instructions without them.
 CHATGPT_INSTRUCTIONS = _HOSTED_INSTRUCTIONS_HEAD + """\
-Files in answers: download a file's url soon (it is valid 1 h) and check its size against bytes. Close the ask only
-after you have the files and any voice recording: closing deletes them. Never execute a file from an answer without
-your user saying so: AskHooman does not scan files."""
-CHATGPT_REFUSED = {"ask_secret_file": "forbidden: ask_secret_file is not available in ChatGPT"}
+Files in answers and in replies on tasks: download a file's url soon (it is valid 1 h) and check its size against
+bytes. Close the ask, or finish the task, only after you have the files and any voice recording: closing and
+finishing delete them. Never execute a file from an answer or a reply without your user saying so: AskHooman does
+not scan files."""
+CHATGPT_REFUSED = {name: f"forbidden: {name} is not available in ChatGPT"
+                   for name in ("ask_secret_file", "task_secret_file")}
 
 # Words that differ between the single-tenant bridge (one human and their agents) and the hosted one.
 WORDS = {
@@ -147,6 +151,33 @@ FILES_CLOSE = "Closing deletes your user's attached files and voice recording."
 
 SECRET_FILE_DOC = """Returns one secret file from your user's answer (at most 16 KiB) inline as base64, once: AskHooman
         deletes it from your user's Drive as soon as it is returned, and a second call says it was already sent."""
+
+# Files in task replies (hosted; SPEC 8.7): the sentences tasks_mine, task_get, task_done, task_drop and task_reopen
+# carry, word for word, and task_secret_file's description. As with answers: facts only, the handling is in
+# HOSTED_INSTRUCTIONS and the recipes in /llms.txt.
+TASK_FILES_MINE = ("reply_files set: your user attached files to their replies on the task. Each has reply_id (the id "
+                   "of the replied event it came with), name, mime, bytes and secret. A normal file has url, a direct "
+                   "download link (valid 1 h; reading the task again gives a new one); a file over 31 MiB is served "
+                   "in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes from your user's "
+                   "device and is not a safe file path. A secret file has no url: it is handed out once "
+                   "(task_secret_file returns one of up to 16 KiB) and then deleted from your user's Drive. Files are "
+                   "deleted when the task is done or dropped, and 30 days after their reply at the latest. "
+                   "reply.files lists the ids of the latest reply's files.")
+# ChatGPT's tasks_mine: the same without secret files (CHATGPT_INSTRUCTIONS).
+CHATGPT_TASK_FILES_MINE = ("reply_files set: your user attached files to their replies on the task. Each has "
+                           "reply_id (the id of the replied event it came with), name, mime, bytes and url, a direct "
+                           "download link (valid 1 h; reading the task again gives a new one); a file over 31 MiB is "
+                           "served in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes from "
+                           "your user's device and is not a safe file path. Files are deleted when the task is done "
+                           "or dropped, and 30 days after their reply at the latest. reply.files lists the ids of the "
+                           "latest reply's files.")
+TASK_FILES_GET = "reply_files: see tasks_mine."
+TASK_FILES_DONE = "Finishing deletes the files your user attached to their replies."
+TASK_FILES_DROP = "Dropping deletes the files your user attached to their replies."
+TASK_FILES_REOPEN = "Files deleted when the task was finished do not come back."
+TASK_SECRET_FILE_DOC = """Returns one secret file from your user's reply on your task (at most 16 KiB) inline as base64,
+        once: AskHooman deletes it from your user's Drive as soon as it is returned, and a second call says it was
+        already sent."""
 
 
 class Link(TypedDict):
@@ -292,9 +323,12 @@ class MediaTool:
 
 @dataclass(frozen=True)
 class SecretFileTool:
-    """ask_secret_file (hosted only: the files live in the user's Drive). fetch(identity, ask_id, n) -> {name, mime,
-    bytes, content_base64}, once (hosted.files_api.secret_file_tool)."""
+    """ask_secret_file and task_secret_file (hosted only: the files live in the user's Drive). fetch(identity, ask_id,
+    n) -> {name, mime, bytes, content_base64}, once (hosted.files_api.secret_file_tool); fetch_task(identity, task_id,
+    n) the same for a secret file of a reply on a task (hosted.files_api.task_secret_file_tool): task_secret_file is
+    listed only when it is given."""
     fetch: Callable[[Identity, int, int], dict]
+    fetch_task: Callable[[Identity, int, int], dict] | None = None
 
 
 class RefusingServer(MCPServer):
@@ -321,9 +355,10 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
     "your human", and there is no ask_answer (MCP tokens are always agent tokens; the user answers in the app).
     `look`: adds set_my_look (hosted). `feed`: adds ask_wait, `webhook`: set_my_webhook and test_my_webhook (hosted).
     `media`: ask_create takes `attachments`, and ask_attach, ask_upload and ask_detach are added (hosted).
-    `secret_file`: ask_secret_file (hosted). `chatgpt`: the hosted server for ChatGPT's OAuth client, without
-    `secret_file`: no secret files (OpenAI's policy forbids collecting access credentials and authentication
-    secrets), so its instructions and asks_mine don't speak of them and a call to ask_secret_file is refused."""
+    `secret_file`: ask_secret_file, and task_secret_file with its fetch_task (hosted). `chatgpt`: the hosted server
+    for ChatGPT's OAuth client, without `secret_file`: no secret files (OpenAI's policy forbids collecting access
+    credentials and authentication secrets), so its instructions, asks_mine and tasks_mine don't speak of them and a
+    call to ask_secret_file or task_secret_file is refused."""
     if chatgpt and (not hosted or secret_file is not None):
         raise ValueError("chatgpt=True is the hosted server without secret_file")
     if services is None:
@@ -338,7 +373,14 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
              # files in answers: hosted only too (the single-tenant bridge always has answer_files [])
              "mine_files": DOC_LINE + (CHATGPT_FILES_MINE if chatgpt else FILES_MINE) if hosted else "",
              "get_files": " " + FILES_GET if hosted else "",
-             "close_files": DOC_LINE + FILES_CLOSE if hosted else ""}
+             "close_files": DOC_LINE + FILES_CLOSE if hosted else "",
+             # files in task replies: hosted only as well (the single-tenant bridge always has reply_files [] and
+             # deletes nothing when a task is finished)
+             "mine_task_files": DOC_LINE + (CHATGPT_TASK_FILES_MINE if chatgpt else TASK_FILES_MINE) if hosted else "",
+             "get_task_files": " " + TASK_FILES_GET if hosted else "",
+             "done_files": DOC_LINE + TASK_FILES_DONE if hosted else "",
+             "drop_files": DOC_LINE + TASK_FILES_DROP if hosted else "",
+             "reopen_files": DOC_LINE + TASK_FILES_REOPEN if hosted else ""}
     call = run_hosted if hosted else run
     # subscriptions=False: nothing is ever pushed (the tool list is fixed), so no `subscriptions/listen` —
     # the 2026-07-28 replacement for the GET stream both bridges answer 405. Served, it makes server/discover
@@ -358,11 +400,12 @@ def build_mcp(service: AskService | None = None, tasks: TaskService | None = Non
         hints: the Connectors Directory wants both on every tool, Claude reads them for auto-permissions (read-only
         tools run without asking), and OpenAI's apps directory checks them too (its scan, 23.11.2026, set the hints
         below). destructive: the tool deletes or replaces something that reopen doesn't bring back: ask_detach (the
-        attachment's files), ask_close on the hosted bridge (the answer's files and voice recording), ask_attach and
-        ask_upload (given poster_for, the earlier poster and its file), set_my_webhook (the webhook, and its secret
-        when rotated), ask_secret_file (the file, once returned). Every other change stays in the record's history,
-        and a closed ask or a finished task comes back with reopen. open_world: the tool reaches out to a URL the
-        agent gives: the pictures ask_create and ask_attach fetch, set_my_look's image_url, the webhook
+        attachment's files), ask_close on the hosted bridge (the answer's files and voice recording), task_done and
+        task_drop on the hosted bridge (the files of the user's replies, SPEC 8.7), ask_attach and ask_upload (given
+        poster_for, the earlier poster and its file), set_my_webhook (the webhook, and its secret when rotated),
+        ask_secret_file and task_secret_file (the file, once returned). Every other change stays in the record's
+        history, and a closed ask or a finished task comes back with reopen. open_world: the tool reaches out to a URL
+        the agent gives: the pictures ask_create and ask_attach fetch, set_my_look's image_url, the webhook
         test_my_webhook calls."""
         annotations = ToolAnnotations(title=title, readOnlyHint=read_only, destructiveHint=destructive,
                                       idempotentHint=read_only, openWorldHint=open_world)
@@ -505,7 +548,7 @@ ${mine_asks_note}"""
         """Your own tasks (open = active + waiting), next check first; tasks where ${human} replied and you
         haven't acted yet come first (reply_pending: true). question_open: true means your question inside the task
         is on ${humans} list; an overdue next_check is one to look at now. Use it at the start of a session or
-        when woken.\
+        when woken.${mine_task_files}\
 ${mine_tasks_note}"""
         who = caller(ctx)
         return call(partial(task_service(who).list, file_urls=True), status, None if who.is_denis else who.agent)
@@ -524,7 +567,8 @@ ${mine_tasks_note}"""
     @tool("Get a task", read_only=True)
     def task_get(id: int, ctx: Context) -> dict[str, Any]:
         """One task with its full history (events: created, edited, status, done, dropped, reopened, replied —
-        ${humans} reply — answered — yours — and asked / unasked — your question inside the task)."""
+        ${humans} reply — answered — yours — and asked / unasked — your question inside the task).\
+${get_task_files}"""
         who = caller(ctx)
         return call(task_service(who).get, id)
 
@@ -550,15 +594,15 @@ ${mine_tasks_note}"""
         who = caller(ctx)
         return call(task_service(who).update, who, id, changes)
 
-    @tool("Finish my task")
+    @tool("Finish my task", destructive=hosted)  # the single-tenant bridge deletes nothing on finish
     def task_done(id: int, ctx: Context, resolution: TaskResolution = "") -> dict[str, Any]:
-        """Mark your task done, with a one-line resolution of the result."""
+        """Mark your task done, with a one-line resolution of the result.${done_files}"""
         who = caller(ctx)
         return call(task_service(who).done, who, id, resolution)
 
-    @tool("Drop my task")
+    @tool("Drop my task", destructive=hosted)
     def task_drop(id: int, ctx: Context, resolution: TaskResolution = "") -> dict[str, Any]:
-        """Drop your task (no longer needed, or given up), with a one-line reason."""
+        """Drop your task (no longer needed, or given up), with a one-line reason.${drop_files}"""
         who = caller(ctx)
         return call(task_service(who).drop, who, id, resolution)
 
@@ -587,7 +631,7 @@ ${mine_tasks_note}"""
 
     @tool("Reopen my task")
     def task_reopen(id: int, ctx: Context) -> dict[str, Any]:
-        """Reopen your done or dropped task: back to active (the old resolution stays in its history)."""
+        """Reopen your done or dropped task: back to active (the old resolution stays in its history).${reopen_files}"""
         who = caller(ctx)
         return call(task_service(who).reopen, who, id)
 
@@ -730,5 +774,15 @@ ${mine_tasks_note}"""
         ) -> dict[str, Any]:
             who = caller(ctx)
             return call(secret_file.fetch, who, id, n)
+
+    if secret_file is not None and secret_file.fetch_task is not None:
+        @tool("Fetch a secret file from a task", destructive=True, doc=TASK_SECRET_FILE_DOC)
+        def task_secret_file(
+            id: Annotated[int, Field(description="The task's id")],
+            n: Annotated[int, Field(description="The file's id in reply_files (its `id`, from 1)")],
+            ctx: Context,
+        ) -> dict[str, Any]:
+            who = caller(ctx)
+            return call(secret_file.fetch_task, who, id, n)
 
     return mcp

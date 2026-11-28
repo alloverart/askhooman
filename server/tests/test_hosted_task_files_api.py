@@ -4,7 +4,7 @@ task's 404, the 410s of a finished task, a deleted item and a pruned id, Drive's
 an answer's files share, the stamps that never clear reply_pending, a finish while the file streams, and the links of
 answers and recordings on the same path. Then the owner agent's bearer route GET /api/tasks/{id}/files/{n}/content
 for both kinds of file, a secret file's one send and its claim (7.4 «Secret file» with the names changed), and the
-fetch behind the MCP tool task_secret_file (8.7)."""
+fetch behind the MCP tool task_secret_file and the tool itself (8.7)."""
 
 import base64
 import json
@@ -27,7 +27,7 @@ from server.task_rules import REPLY_FILES
 from server.tokens import Identity
 
 from .fake_drive import app_task_reply_files, now_iso
-from .hosted_support import DENIS_SUB, KEY, OLGA_EMAIL, OLGA_SUB, PUBLIC, id_token, mcp, tool_result
+from .hosted_support import DENIS_SUB, KEY, OLGA_EMAIL, OLGA_SUB, PUBLIC, id_token, mcp, tool_error, tool_result
 from .test_hosted_files_api import (
     BLOCKED,
     BODY,
@@ -899,7 +899,7 @@ def test_delete_failure_leaves_the_claim_done_and_the_route_refusing(hosted, goo
     assert len(world.content_reads()) == 1
 
 
-# ---------- the fetch behind the MCP tool task_secret_file (SPEC 8.7; the tool itself is wired elsewhere) ----------
+# ---------- the fetch behind the MCP tool task_secret_file, and the tool (SPEC 8.7) ----------
 
 def test_the_tool_fetches_a_secret_file_once(hosted, google, caplog):
     world = secret_task(hosted, google)
@@ -980,6 +980,24 @@ def test_the_tool_on_a_held_claim_is_busy(hosted, google):
     key = hold(world, created_of(world) + 500)
     assert refused_by(task_tool(world), identity(world)) == (409, "being sent")
     assert world.content_reads() == [] and claim_docs(world)[key]["owner"] == "someone"
+
+
+def test_task_secret_file_over_mcp_once(hosted, google, caplog):
+    """The tool through /mcp: the file inline, then «already sent»; nothing in the result names the Drive file, and
+    nothing of the file reaches the log."""
+    world = secret_task(hosted, google)
+    with caplog.at_level(logging.DEBUG):
+        response = mcp(hosted, world.token, "task_secret_file", {"id": 1, "n": 1})
+    got = tool_result(response)
+    assert got == {"name": "Q3 report.PDF", "mime": "application/pdf", "bytes": len(SECRET_BYTES),
+                   "content_base64": base64.b64encode(SECRET_BYTES).decode("ascii")}
+    assert "file_id" not in response.text and world.file_id not in response.text
+    assert world.file_id not in world.drive.files and world.stored()["deleted_reason"] == "sent"
+    again = tool_error(mcp(hosted, world.token, "task_secret_file", {"id": 1, "n": 1}))
+    assert again.removeprefix("Error executing tool task_secret_file: ") == ALREADY_SENT
+    assert len(world.content_reads()) == 1 and [d["state"] for d in claim_docs(world).values()] == ["done"]
+    for marker in SECRET_MARKERS:  # no byte, no name, nothing of the base64
+        assert marker not in caplog.text
 
 
 # ---------- what the two kinds share, and what tells them apart ----------
