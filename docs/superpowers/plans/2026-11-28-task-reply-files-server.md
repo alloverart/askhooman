@@ -295,4 +295,4 @@ The texts are SPEC 8.7 (lines 1699–1746) and 8.6 (lines 1674–1689), word for
 
 - [ ] The whole suite once: `… pytest server/tests -q` → PASS, counts into the report.
 - [ ] The final whole-branch review on the most capable model, against SPEC section 8 and this plan's Global Constraints and Review Focus.
-- [ ] The report: `/Users/deniskuzmin/sonya-tools/askhooman-task-files/server-report.md`.
+- [ ] The report: written to the controller's scratch folder (outside the repository).
