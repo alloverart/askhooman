@@ -2,21 +2,27 @@
 «Parts», «Budgets», «Drive refusals» and «Normal file: streaming» with the names changed): the check order and the
 task's 404, the 410s of a finished task, a deleted item and a pruned id, Drive's word on the file, parts, the budgets
 an answer's files share, the stamps that never clear reply_pending, a finish while the file streams, and the links of
-answers and recordings on the same path."""
+answers and recordings on the same path. Then the owner agent's bearer route GET /api/tasks/{id}/files/{n}/content
+for both kinds of file, a secret file's one send and its claim (7.4 «Secret file» with the names changed), and the
+fetch behind the MCP tool task_secret_file (8.7)."""
 
+import base64
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
+import anyio
 import httpx
 import pytest
 
 from server.hosted import files_api
+from server.hosted.accounts import HostedIdentity
 from server.hosted.crypto import Keyring
-from server.hosted.files import PART_BYTES, download_name
-from server.hosted.files_api import Target
+from server.hosted.files import PART_BYTES, FileClaims, claim_key, download_name, task_claim_key
+from server.hosted.files_api import FileRefused, Target
 from server.hosted.ratelimit import ByteBudget
 from server.hosted.records import HostedTasks
+from server.hosted.store import MemoryStore
 from server.task_rules import REPLY_FILES
 from server.tokens import Identity
 
@@ -29,13 +35,17 @@ from .test_hosted_files_api import (
     LARGE,
     MIB,
     PART_TOO_BIG,
+    SECRET_BYTES,
+    SECRET_MARKERS,
     World,
+    _disconnect_after_final,
+    _disconnect_at_once,
     asgi_get,
     charged,
     patch_media,
 )
 from .test_hosted_task_files import put_task_file, rewrite_task, sent_item, task_item, tasks_of
-from .test_hosted_voice import agent, agent_id, answered_by_voice
+from .test_hosted_voice import agent, agent_id, answered_by_voice, bearer
 
 NO_SUCH = {"detail": "no such file, or the link has expired: read the task again for a new link"}
 NO_RECORDING = {"detail": "no such recording, or the link has expired: read the ask again for a new link"}
@@ -495,7 +505,7 @@ def test_check_task_secret_branches(hosted, google, monkeypatch):
     assert refusal(check(sent_detail="already sent")) == (410, "already sent")
     rewrite_task(world.drive, 1, reply_files=[{**world.stored(), "file_id": None, "deleted_at": now_iso(),
                                                "deleted_reason": "sent"}])
-    assert refusal(check()) == (410, DELETED["detail"])
+    assert refusal(check()) == (410, SENT)  # as after the prune below: the words don't flip on it
     assert refusal(check(sent_detail="already sent")) == (410, "already sent")
     # pruned by the next reply: the snapshot says secret and the history holds its file_downloaded
     app_task_reply_files(world.drive, 1, [sent_item(world.drive, 2, secret=True)], text="And this one")
@@ -511,3 +521,472 @@ def test_check_task_secret_branches(hosted, google, monkeypatch):
     assert refusal(check(n=2, sent_detail="already sent")) == (410, DELETED["detail"])
     assert refusal(check(n=3)) == (404, NO_SUCH["detail"])  # never was
     assert refusal(files_api._check_task(pool, DENIS_SUB, 1, 1, "feynman", None, True)) == (404, NO_SUCH["detail"])
+
+
+# ---------- the bearer route GET /api/tasks/{id}/files/{n}/content, a secret file and its claim (Task 5) ----------
+
+ALREADY_SENT = "already sent — if you did not receive it, ask your user to send it again"
+HAS_URL = "this file has a url — download it with the url"
+TOO_BIG_FOR_MCP = "too big for MCP — fetch it with `askhooman task files 1 --secret`"
+NOT_THE_AGENT = "only the agent whose task it is can fetch its replies' files"
+NOT_THE_USER = "this file is for the agent whose task it is: fetch it with its own token"
+BUCKET = "too many requests for files: at most 20 a minute per agent"
+KIB16 = 16 * 1024
+
+
+def secret_task(hosted, google, **over) -> TaskWorld:
+    return TaskWorld(hosted, google, content=SECRET_BYTES, secret=True, **over)
+
+
+def content_path(task_id=1, n=1) -> str:
+    return f"/api/tasks/{task_id}/files/{n}/content"
+
+
+def fetch(world, task_id=1, n=1, **kwargs):
+    """GET the task's bearer route with the owner agent's token."""
+    headers = {**bearer(world.token), **kwargs.pop("headers", {})}
+    return world.hosted.get(content_path(task_id, n), headers=headers, **kwargs)
+
+
+def claim_docs(world) -> dict:
+    return world.hosted.store.all("fileclaims")
+
+
+def epoch(stamp: str) -> float:
+    return datetime.fromisoformat(stamp).timestamp()
+
+
+def iso(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def created_of(world) -> float:
+    return epoch(world.drive.files[world.file_id]["createdTime"])
+
+
+def hold(world, until: float) -> str:
+    """A held claim of the reply's secret file, someone else's send in flight: its key."""
+    key = task_claim_key(DENIS_SUB, 1, world.file_id)
+    world.hosted.store.put("fileclaims", key, {"user": DENIS_SUB, "task_id": 1, "state": "held", "until": until,
+                                               "owner": "someone"})
+    return key
+
+
+def asgi_bearer(world, receive_script) -> dict:
+    """GET the task's bearer route straight through the app with `receive_script(sent_final)` as the client side (as
+    test_hosted_files_api.asgi_bearer does on an ask's)."""
+    path, host = content_path(), PUBLIC.split("://", 1)[1]
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "https",
+             "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+             "headers": [(b"host", host.encode()), (b"authorization", f"Bearer {world.token}".encode())],
+             "client": ("127.0.0.1", 5000), "server": (host, 443)}
+    out, final_sent = {"messages": [], "error": None}, anyio.Event()
+    script = receive_script(final_sent)
+
+    async def receive():
+        return await script.__anext__()
+
+    async def send(message):
+        out["messages"].append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body"):
+            final_sent.set()
+
+    async def run():
+        try:
+            await world.hosted.app(scope, receive, send)
+        except BaseException as exc:  # noqa: BLE001
+            out["error"] = exc.exceptions[0] if isinstance(exc, BaseExceptionGroup) else exc
+
+    anyio.run(run)
+    return out
+
+
+def test_normal_file_through_the_bearer_route_streams(world):
+    response = fetch(world)
+    assert response.status_code == 200 and response.content == BODY
+    assert response.headers["content-length"] == str(len(BODY))
+    assert response.headers["content-disposition"] == ("attachment; filename=\"task-1-file-1.pdf\"; "
+                                                       "filename*=UTF-8''Q3%20report.PDF")
+    assert world.stored()["downloaded_at"] is not None and world.kinds()[-1] == "file_downloaded"
+    assert tasks_of(world.hosted).get(1)["reply_pending"] is True
+    ranged = fetch(world, headers={"Range": "bytes=10-"})
+    assert ranged.status_code == 206 and ranged.content == BODY[10:]
+    assert ranged.headers["content-range"] == f"bytes 10-{len(BODY) - 1}/{len(BODY)}"
+    assert world.file_id in world.drive.files and claim_docs(world) == {}
+    assert world.hosted.app.state.stream_slots.in_use == 0
+
+
+def test_secret_sent_once_then_410(hosted, google):
+    world = secret_task(hosted, google)
+    response = fetch(world)
+    assert response.status_code == 200 and response.content == SECRET_BYTES
+    assert dict(response.headers) == {
+        "content-type": "application/octet-stream",
+        "content-length": str(len(SECRET_BYTES)),
+        "content-disposition": "attachment; filename=\"task-1-file-1.pdf\"; filename*=UTF-8''Q3%20report.PDF",
+        "cache-control": "private, no-store",
+        "x-content-type-options": "nosniff",
+        "content-security-policy": "sandbox",
+    }
+    # after the response: the claim done, the file deleted from Drive, the task written
+    assert world.file_id not in world.drive.files
+    stored = world.stored()
+    assert (stored["file_id"], stored["deleted_reason"]) == (None, "sent")
+    assert stored["downloaded_at"] is not None and stored["deleted_at"] == stored["downloaded_at"]
+    event = world.task()["events"][-1]
+    assert (event["kind"], event["payload"], event["actor"]) == ("file_downloaded", {"id": 1}, "allen")
+    [doc] = claim_docs(world).values()
+    assert set(doc) == {"user", "task_id", "state", "expires_at"} and "ask_id" not in doc
+    assert (doc["user"], doc["task_id"], doc["state"]) == (DENIS_SUB, 1, "done")
+    assert tasks_of(hosted).get(1)["reply_pending"] is True  # a send is not the owner's answer
+    assert world.task()["status"] == "active"
+    again = fetch(world)
+    assert (again.status_code, again.json()) == (410, {"detail": SENT})
+    assert len(world.content_reads()) == 1  # Drive's content was read once
+
+
+def test_the_claim_document_is_keyed_and_shaped_for_a_task(hosted, google, monkeypatch):
+    world = secret_task(hosted, google)
+    taken = []
+    real = FileClaims.take
+
+    def spy(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        taken.append(dict(self.store.all("fileclaims")))
+        return result
+    monkeypatch.setattr(FileClaims, "take", spy)
+    now = created_of(world) + 60
+    monkeypatch.setattr(files_api, "_now", lambda: now)
+    assert fetch(world).content == SECRET_BYTES
+    key = task_claim_key(DENIS_SUB, 1, world.file_id)
+    [(held_key, held)] = taken[0].items()
+    assert held_key == key and set(held) == {"user", "task_id", "state", "until", "owner"}
+    assert (held["user"], held["task_id"], held["state"], held["until"]) == (DENIS_SUB, 1, "held", now + 960)
+    assert set(claim_docs(world)) == {key}
+    assert claim_key(DENIS_SUB, 1, world.file_id) != key  # ask #1 naming the same Drive file: another document
+    claims = hosted.app.state.file_claims
+    claims.delete_for_ask(DENIS_SUB, 1)  # ask #1's claims go: the task's stays
+    assert set(claim_docs(world)) == {key}
+    claims.delete_for_task(DENIS_SUB, 1)
+    assert claim_docs(world) == {}
+
+
+def test_file_claims_name_their_holder():
+    claims = FileClaims(MemoryStore())
+    state, owner = claims.take("k", "u", 3, 100.0, holder="task")
+    assert state == "taken" and claims.store.get("fileclaims", "k") == {
+        "user": "u", "task_id": 3, "state": "held", "until": 100.0 + 960, "owner": owner}
+    claims.done("k", owner, "u", 3, 200.0, holder="task")
+    assert claims.store.get("fileclaims", "k") == {"user": "u", "task_id": 3, "state": "done",
+                                                   "expires_at": 200.0 + 90 * 86400}
+    state, owner = claims.take("a", "u", 3, 100.0)  # an ask's, as it always was
+    assert claims.store.get("fileclaims", "a") == {"user": "u", "ask_id": 3, "state": "held", "until": 100.0 + 960,
+                                                   "owner": owner}
+    claims.done("a", owner, "u", 3, 200.0)
+    assert claims.store.get("fileclaims", "a") == {"user": "u", "ask_id": 3, "state": "done",
+                                                   "expires_at": 200.0 + 90 * 86400}
+    state, owner = claims.take("t", "u", 3, 100.0, holder="task")
+    claims.delete_for_task("u", 3)  # a finish came first
+    claims.done("t", owner, "u", 3, holder="task")
+    assert claims.store.get("fileclaims", "t") is None  # no orphan
+    with pytest.raises(ValueError):
+        claims.take("x", "u", 3, 100.0, holder="tasks")
+
+
+def test_held_claim_409_and_expired_lease_taken_over(hosted, google):
+    world = secret_task(hosted, google)
+    now = created_of(world)
+    key = hold(world, now + 500)
+    response = fetch(world)
+    assert (response.status_code, response.json()) == (409, {"detail": "being sent"})
+    assert world.content_reads() == [] and world.file_id in world.drive.files
+    assert claim_docs(world)[key]["owner"] == "someone"
+    hold(world, now - 1)  # its lease ran out: taken over
+    assert fetch(world).content == SECRET_BYTES
+    assert claim_docs(world)[key]["state"] == "done" and world.file_id not in world.drive.files
+
+
+def test_disconnect_releases_the_claim(hosted, google):
+    world = secret_task(hosted, google)
+    out = asgi_bearer(world, _disconnect_at_once)
+    assert out["error"] is None
+    assert claim_docs(world) == {}  # released: the agent can try again
+    assert world.file_id in world.drive.files and world.stored()["file_id"] == world.file_id
+    assert world.stored()["downloaded_at"] is None and "file_downloaded" not in world.kinds()
+    out = asgi_bearer(world, _disconnect_after_final)  # the agent hangs up only once everything was sent
+    assert out["error"] is None and out["messages"][-1]["body"] == SECRET_BYTES
+    assert [d["state"] for d in claim_docs(world).values()] == ["done"] and world.file_id not in world.drive.files
+    assert world.stored()["deleted_reason"] == "sent"
+
+
+def test_secret_past_24h_is_410_expired(hosted, google, monkeypatch):
+    world = secret_task(hosted, google)
+    created = created_of(world)
+    monkeypatch.setattr(files_api, "_now", lambda: created + 24 * 3600 + 1)
+    response = fetch(world)
+    assert (response.status_code, response.json()) == (410, {"detail": "expired"})
+    assert world.content_reads() == [] and claim_docs(world) == {} and world.file_id in world.drive.files
+    # From min(uploaded_at, replied_at), bounded by Drive's createdTime. A held claim answers 409 once the expiry
+    # check has passed, so a file that has not expired is told apart without being sent.
+    hold(world, created + 10 * 86400)
+    replied = epoch(world.stored()["replied_at"])
+
+    def status_at(uploaded_at: float, now: float) -> int:
+        rewrite_task(world.drive, 1, reply_files=[{**world.stored(), "uploaded_at": iso(uploaded_at)}])
+        monkeypatch.setattr(files_api, "_now", lambda: now)
+        return fetch(world).status_code
+
+    day = 24 * 3600
+    assert (status_at(replied - 300, replied - 300 + day - 1), status_at(replied - 300, replied - 300 + day + 1)) == (
+        409, 410)  # uploaded before the reply: from the upload
+    assert (status_at(replied + 300, replied + day - 1), status_at(replied + 300, replied + day + 1)) == (
+        409, 410)  # a stamp after the reply does not make it last longer
+    assert (status_at(created - 2 * day, created + day - 1), status_at(created - 2 * day, created + day + 1)) == (
+        409, 410)  # a clock two days behind does not make it expire early: Drive's createdTime is the floor
+    assert world.content_reads() == [] and world.file_id in world.drive.files
+
+
+def test_bearer_route_checks(hosted, google):
+    world = secret_task(hosted, google)
+    # the `files` bucket, before any claim: 20 refusals of an id that never was, then the file itself
+    for _ in range(20):
+        assert fetch(world, n=9).status_code == 404
+    refused = fetch(world)
+    assert (refused.status_code, refused.json()) == (429, {"detail": BUCKET})
+    assert int(refused.headers["retry-after"]) >= 1
+    assert claim_docs(world) == {} and world.file_calls() == []
+    limiter = hosted.app.state.limiter
+    clock = limiter.clock
+    limiter.clock = lambda: clock() + 61  # a minute on: the bucket is free again
+    assert hosted.head(content_path(), headers=bearer(world.token)).status_code == 405
+    assert hosted.get(content_path()).status_code == 401
+    mine = hosted.get(content_path(), headers=id_token(google))  # the user's own token
+    assert (mine.status_code, mine.json()) == (403, {"detail": NOT_THE_USER})
+    ask_side = hosted.get("/api/asks/1/files/1/content", headers=id_token(google))
+    assert (ask_side.status_code, ask_side.json()) == (
+        403, {"detail": "this file is for the agent that asked: fetch it with its own token"})  # an ask's: its words
+    other = agent(hosted, google, name="Feynman")  # another agent of the same user: not the task's owner
+    response = hosted.get(content_path(), headers=bearer(other))
+    assert (response.status_code, response.json()) == (404, NO_SUCH)
+    key = hosted.post("/api/agents/keys", json={"name": "Hamilton"}, headers=id_token(google)).json()["key"]
+    assert hosted.get(content_path(), headers=bearer(key)).json() == NO_SUCH  # an agent key works the same way
+    for task_id, n in ((1, 9), (7, 1)):  # an id that never was, a task that never was
+        response = fetch(world, task_id, n)
+        assert (response.status_code, response.json()) == (404, NO_SUCH)
+    assert claim_docs(world) == {} and world.file_calls() == []
+    tool_result(mcp(hosted, world.token, "task_done", {"id": 1}))
+    response = fetch(world)  # a finished task
+    assert (response.status_code, response.json()) == (410, DELETED)
+    assert claim_docs(world) == {} and world.content_reads() == []
+
+
+def task_tool(world):
+    state = world.hosted.app.state
+    return files_api.task_secret_file_tool(world.hosted.app, state.accounts, state.pool, state.limiter,
+                                           state.file_claims)
+
+
+def identity(world, name="Allen") -> HostedIdentity:
+    return HostedIdentity("agent", name.lower(), user=DENIS_SUB, agent_id=agent_id(world.hosted, world.google, name))
+
+
+def refused_by(fetch_tool, who, task_id=1, n=1) -> tuple[int, str]:
+    with pytest.raises(FileRefused) as caught:
+        fetch_tool(who, task_id, n)
+    return caught.value.status_code, str(caught.value)
+
+
+def test_pruned_secret_id_says_already_sent(hosted, google):
+    world = secret_task(hosted, google)
+    assert fetch(world).content == SECRET_BYTES
+    app_task_reply_files(world.drive, 1, [], text="Any news?")  # the user's next reply prunes the sent item
+    assert world.task()[REPLY_FILES] == []
+    response = fetch(world)
+    assert (response.status_code, response.json()) == (410, {"detail": SENT})
+    assert refused_by(task_tool(world), identity(world)) == (410, ALREADY_SENT)
+    # a pruned secret that was never sent: it expired (its file_deleted), then a reply pruned it
+    second = app_task_reply_files(world.drive, 1, [sent_item(world.drive, 2, secret=True)], text="This one")
+    gone = {**world.stored(), "file_id": None, "deleted_at": now_iso(), "deleted_reason": "expired"}
+    events = second["events"]
+    rewrite_task(world.drive, 1, reply_files=[gone], events=[*events, {
+        "id": events[-1]["id"] + 1, "task_id": 1, "at": now_iso(), "actor": "allen", "kind": "file_deleted",
+        "payload": {"id": 2, "reason": "expired"}}])
+    app_task_reply_files(world.drive, 1, [], text="Never mind")
+    assert world.task()[REPLY_FILES] == []
+    response = fetch(world, n=2)
+    assert (response.status_code, response.json()) == (410, DELETED)
+    assert refused_by(task_tool(world), identity(world), n=2) == (410, DELETED["detail"])
+    assert len(world.content_reads()) == 1
+
+
+@pytest.mark.parametrize("point", ["done", "delete"])
+def test_finished_while_sending_writes_nothing(hosted, google, monkeypatch, point):
+    """The agent finishes the task while its secret file goes out: before the claim is made done (the finish deletes
+    the held claim, so done makes no orphan), or between the claim and the write (the finish deletes the done one).
+    Either way the finish's stamps stand: nothing of the send is written over them."""
+    world = secret_task(hosted, google)
+    finished = []
+
+    def finish_first():
+        if not finished:  # once: the finish deletes the file through the same seam
+            finished.append(1)
+            tasks = HostedTasks(hosted.app.state.pool.records(DENIS_SUB), claims=hosted.app.state.file_claims)
+            tasks.done(Identity("agent", "allen"), 1)
+    seam = (FileClaims, "done") if point == "done" else (files_api.HostedTasks, "_delete_reply_file")
+    real = getattr(*seam)
+
+    def after_the_finish(self, *args, **kwargs):
+        finish_first()
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(*seam, after_the_finish)
+    assert fetch(world).content == SECRET_BYTES
+    assert finished == [1]
+    stored = world.stored()
+    assert (stored["file_id"], stored["deleted_reason"], stored["downloaded_at"]) == (None, "finished", None)
+    assert "file_downloaded" not in world.kinds() and world.task()["status"] == "done"
+    assert world.file_id not in world.drive.files
+    assert claim_docs(world) == {}  # no claim outlives the finish
+    assert (fetch(world).status_code, fetch(world).json()) == (410, DELETED)
+
+
+def test_delete_failure_leaves_the_claim_done_and_the_route_refusing(hosted, google, caplog):
+    world = secret_task(hosted, google)
+    world.drive.fail_next("DELETE", f"/drive/v3/files/{world.file_id}", 500)
+    with caplog.at_level(logging.DEBUG):
+        assert fetch(world).content == SECRET_BYTES
+    assert world.file_id in world.drive.files  # the sweep retries the delete
+    assert [d["state"] for d in claim_docs(world).values()] == ["done"]
+    stored = world.stored()
+    assert stored["file_id"] == world.file_id and stored["deleted_at"] is None and stored["deleted_reason"] is None
+    assert stored["downloaded_at"] is not None and world.kinds()[-1] == "file_downloaded"
+    again = fetch(world)  # the item still names the file: it says it was sent
+    assert (again.status_code, again.json()) == (410, {"detail": SENT})
+    assert refused_by(task_tool(world), identity(world)) == (410, ALREADY_SENT)
+    assert len(world.content_reads()) == 1
+    for marker in SECRET_MARKERS:
+        assert marker not in caplog.text
+    # then the finish deletes the file: «sent» it stays, finished, reopened, and once a reply has pruned the item
+    tool_result(mcp(hosted, world.token, "task_done", {"id": 1}))
+    assert world.file_id not in world.drive.files and world.stored()["deleted_reason"] == "finished"
+    assert fetch(world).json() == {"detail": SENT}
+    tool_result(mcp(hosted, world.token, "task_reopen", {"id": 1}))
+    assert fetch(world).json() == {"detail": SENT}
+    app_task_reply_files(world.drive, 1, [], text="Got it?")
+    assert world.task()[REPLY_FILES] == [] and fetch(world).json() == {"detail": SENT}
+    assert len(world.content_reads()) == 1
+
+
+# ---------- the fetch behind the MCP tool task_secret_file (SPEC 8.7; the tool itself is wired elsewhere) ----------
+
+def test_the_tool_fetches_a_secret_file_once(hosted, google, caplog):
+    world = secret_task(hosted, google)
+    fetch_tool = task_tool(world)
+    world.drive.fail_next("DELETE", f"/drive/v3/files/{world.file_id}", 500)  # the noisy path too
+    with caplog.at_level(logging.DEBUG):
+        got = fetch_tool(identity(world), 1, 1)
+        again = refused_by(fetch_tool, identity(world))
+    assert got == {"name": "Q3 report.PDF", "mime": "application/pdf", "bytes": len(SECRET_BYTES),
+                   "content_base64": base64.b64encode(SECRET_BYTES).decode("ascii")}
+    assert again == (410, ALREADY_SENT)
+    assert [d["state"] for d in claim_docs(world).values()] == ["done"]
+    assert world.stored()["downloaded_at"] is not None and world.kinds()[-1] == "file_downloaded"
+    assert tasks_of(hosted).get(1)["reply_pending"] is True
+    assert hosted.app.state.stream_slots.in_use == 0
+    response = fetch(world)  # the bearer route then answers 410
+    assert (response.status_code, response.json()) == (410, {"detail": SENT})
+    assert len(world.content_reads()) == 1
+    for marker in SECRET_MARKERS:  # no byte, no name, nothing of the base64 in the log
+        assert marker not in caplog.text
+    assert base64.b64encode(SECRET_BYTES).decode()[:24] not in caplog.text
+
+
+def test_the_tool_deletes_the_file_it_returned(hosted, google):
+    world = secret_task(hosted, google)
+    assert task_tool(world)(identity(world), 1, 1)["bytes"] == len(SECRET_BYTES)
+    assert world.file_id not in world.drive.files
+    assert len(world.drive.calls("DELETE", f"/drive/v3/files/{world.file_id}")) == 1
+    stored = world.stored()
+    assert (stored["file_id"], stored["deleted_reason"]) == (None, "sent")
+    assert refused_by(task_tool(world), identity(world)) == (410, ALREADY_SENT)
+
+
+def test_the_tool_refuses_a_file_over_16_kib_before_any_claim(hosted, google):
+    world = TaskWorld(hosted, google, content=b"X" * (KIB16 + 1), secret=True)
+    assert refused_by(task_tool(world), identity(world)) == (413, TOO_BIG_FOR_MCP)
+    assert claim_docs(world) == {} and world.content_reads() == [] and world.file_id in world.drive.files
+    assert fetch(world).content == b"X" * (KIB16 + 1)  # the route still sends it
+
+
+def test_the_tool_takes_exactly_16_kib(hosted, google):
+    world = TaskWorld(hosted, google, content=b"Y" * KIB16, secret=True)
+    assert task_tool(world)(identity(world), 1, 1)["bytes"] == KIB16
+
+
+def test_the_tool_points_a_normal_file_to_its_url(world):
+    assert refused_by(task_tool(world), identity(world)) == (400, HAS_URL)
+    assert claim_docs(world) == {} and world.content_reads() == [] and world.file_id in world.drive.files
+
+
+def test_the_tool_is_only_the_owner_agents(hosted, google):
+    world = secret_task(hosted, google)
+    fetch_tool = task_tool(world)
+    agent(hosted, google, name="Feynman")
+    assert refused_by(fetch_tool, identity(world, "Feynman")) == (404, NO_SUCH["detail"])
+    assert refused_by(fetch_tool, identity(world), n=9) == (404, NO_SUCH["detail"])  # no such item: the same text
+    assert refused_by(fetch_tool, identity(world), task_id=77) == (404, NO_SUCH["detail"])
+    for who in (Identity("denis"), Identity("agent", "allen")):  # not an agent of a hosted user: before any claim
+        assert refused_by(fetch_tool, who) == (403, NOT_THE_AGENT)
+    assert claim_docs(world) == {} and world.content_reads() == [] and world.file_id in world.drive.files
+    allen = identity(world)
+    hosted.delete(f"/api/agents/{allen.agent_id}", headers=id_token(google)).raise_for_status()
+    assert refused_by(fetch_tool, allen) == (404, NO_SUCH["detail"])  # revoked since its token was checked
+
+
+def test_the_tool_has_the_files_bucket(hosted, google):
+    world = secret_task(hosted, google)
+    fetch_tool = task_tool(world)
+    for _ in range(19):
+        refused_by(fetch_tool, identity(world), n=9)  # refused as no such item, but each counts
+    assert fetch(world, n=9).status_code == 404  # the route's requests count in the same bucket
+    assert refused_by(fetch_tool, identity(world)) == (429, BUCKET)
+    assert claim_docs(world) == {} and world.content_reads() == []
+
+
+def test_the_tool_on_a_held_claim_is_busy(hosted, google):
+    world = secret_task(hosted, google)
+    key = hold(world, created_of(world) + 500)
+    assert refused_by(task_tool(world), identity(world)) == (409, "being sent")
+    assert world.content_reads() == [] and claim_docs(world)[key]["owner"] == "someone"
+
+
+# ---------- what the two kinds share, and what tells them apart ----------
+
+def test_writes_know_two_kinds_and_no_third(world):
+    task = tasks_of(world.hosted).get(1)
+    target = Target(task, world.stored(), 1, None, "task #1 item 1", kind="task")
+    writes = files_api._writes(world.hosted.app.state.pool, DENIS_SUB, target)
+    assert writes.claim_key == task_claim_key(DENIS_SUB, 1, world.file_id)
+    assert writes.too_big == TOO_BIG_FOR_MCP and writes.no_such == NO_SUCH["detail"]
+    with pytest.raises(ValueError):
+        files_api._writes(world.hosted.app.state.pool, DENIS_SUB, Target(task, world.stored(), 1, None, "x",
+                                                                         kind="voice"))
+
+
+REPLY = {"id": 2, "task_id": 1, "at": "2026-11-28T09:00:00.000Z", "actor": "denis", "kind": "replied",
+         "payload": {"text": "x", "preset": None, "files": [{"id": 1, "file_id": "fid-1", "secret": True}]}}
+
+
+@pytest.mark.parametrize("change, counts", [
+    ({}, True),
+    ({"at": None}, False),  # no `at`: not a reply an item can name, so not one a pruned id can name either
+    ({"actor": "allen"}, False),
+    ({"id": True}, False),
+    ({"kind": "answered"}, False),
+])
+def test_the_pruned_rule_counts_the_replies_the_cleaning_counts(change, counts):
+    from server.hosted.files import _replies
+    event = {**REPLY, **change}
+    assert bool(_replies([event])) is counts
+    found = files_api._pruned({"events": [event]}, 1, None, None)
+    assert (found.status_code, json.loads(found.body)["detail"]) == ((410, DELETED["detail"]) if counts else
+                                                                     (404, NO_SUCH["detail"]))

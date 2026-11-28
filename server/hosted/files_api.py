@@ -82,6 +82,17 @@ files`; the download is task-<id>-file-<n>[.<ext>]. mark_task_downloaded (mark_t
 the task is still open, the item still has this file_id and the stamp is still null, with the owner agent as the
 event's actor; `updated_at` is not written, and these events are not the owner's (task_rules.OWNER_KINDS): a download
 never clears reply_pending.
+
+GET /api/tasks/{id}/files/{n}/content is the bearer route for the task's own agent (the user's own token: 403 in
+app.authenticate, worded for the task), both kinds of file, with _check_task's checks: a normal file is streamed as
+above, a SECRET file is sent once by the same sequence as an answer's (take_secret: one claim machine in the one
+collection, the same order and retries), and task_secret_file_tool is ask_secret_file's fetch for it. What is the
+holder's own comes from _writes by Target.kind: the claim (files.task_claim_key; its document names task_id, never
+ask_id), the stamps (mark_task_sent: downloaded_at, deleted_at, deleted_reason "sent", file_id null, event
+file_downloaded, only while the task is open and the item names the file), the Drive delete through the task's guard
+(HostedTasks._delete_reply_file) and the words. A finish meanwhile deletes the claim (held or done) and the file, and
+the send then writes nothing. A reply's file that was sent says so (410 "the file was deleted after it was sent", the
+tool's «already sent») whether its item is still listed, finished or pruned, so the words don't change with a reply.
 """
 
 import base64
@@ -118,7 +129,9 @@ from .files import (
     claim_key,
     created_epoch,
     download_name,
+    is_user_reply,
     lifetime_end,
+    task_claim_key,
 )
 from .media_api import STREAM_SLOTS, STREAM_SLOTS_PER_AGENT, Slots
 from .ratelimit import ByteBudget, RateLimiter
@@ -141,11 +154,12 @@ SENT = "the file was deleted after it was sent"
 RANGE = re.compile(r"bytes=(\d{1,19})-(\d{0,19})", re.ASCII | re.IGNORECASE)
 PAST_END = "the range starts past the end of the file"
 BAD_RANGE = "a Range served here is bytes=START-END (START <= END) or bytes=START-"
-CONTENT_PATH = re.compile(r"/api/asks/\d+/files/\d+/content")
+CONTENT_PATH = re.compile(r"/api/(?:asks|tasks)/\d+/files/\d+/content")
 
 
 def is_content_path(path: str) -> bool:
-    """The bearer route of a file's bytes (app.authenticate answers the user's own token there with 403)."""
+    """The bearer route of a file's bytes, an answer's or a reply's (app.authenticate answers the user's own token
+    there with 403)."""
     return CONTENT_PATH.fullmatch(path) is not None
 
 
@@ -245,6 +259,14 @@ def mark_task_blocked(pool: DrivePool, user: str, task_id: int, n: int, file_id:
     """Write `blocked_at` of item `n` of the task's reply_files (and a `file_blocked` event) once, as
     mark_task_downloaded does."""
     return _task_stamp(pool, user, task_id, n, file_id, at, "blocked_at", "file_blocked")
+
+
+def mark_task_sent(pool: DrivePool, user: str, task_id: int, n: int, file_id: str, at: str, deleted: bool) -> bool:
+    """A reply's secret file has been sent: mark_sent for item `n` of the task's reply_files, under the guards of
+    mark_task_downloaded (the task still open, the item still naming this file, no downloaded_at yet). True if it
+    wrote."""
+    extra = {"deleted_at": at, "deleted_reason": "sent", "file_id": None} if deleted else None
+    return _task_stamp(pool, user, task_id, n, file_id, at, "downloaded_at", "file_downloaded", extra)
 
 
 class StreamAborted(Exception):
@@ -430,7 +452,7 @@ def _pruned(task: dict, n: int, expect: tuple[int, str] | None, sent_detail: str
     events = task.get("events") or []
     snapshot = None
     for event in events:
-        if event.get("kind") != "replied" or event.get("actor") != "denis" or not _is_id(event.get("id")):
+        if not is_user_reply(event):  # the replies an item can name (files.clean_reply_files): no other
             continue
         if expect is not None and event["id"] != expect[0]:
             continue
@@ -454,8 +476,10 @@ def _check_task(pool: DrivePool, user: str, task_id: int, n: int, slug: str, exp
                 range_header: str | None = None):
     """_check for item `n` of a task's reply_files, in SPEC 8.3's order (the module text): a Target(kind="task"), or
     the refusal (a response), every 404 TASK_NO_SUCH. `expect` = (reply_id, file_id) the link carries (None on the
-    bearer route); `secret_ok`, `sent_detail`, `streams` and `range_header` are _check's. The task is read with its
-    events, as checked (a task file that is not one: 404; Drive unreachable: 503)."""
+    bearer route); `secret_ok`, `streams` and `range_header` are _check's. A file that was sent is 410 `sent_detail`
+    (the MCP tool's), else SENT, whether its item is deleted, finished or pruned (an answer's deleted item says
+    DELETED to the route). The task is read with its events, as checked (a task file that is not one: 404; Drive
+    unreachable: 503)."""
     records = pool.records(user)
     try:
         task = HostedTasks(records).get(task_id)  # with its events: a pruned id is told apart by them
@@ -470,11 +494,14 @@ def _check_task(pool: DrivePool, user: str, task_id: int, n: int, slug: str, exp
         return _pruned(task, n, expect, sent_detail)
     if (expect is not None and item["reply_id"] != expect[0]) or (item["secret"] and not secret_ok):
         return _refuse(404, TASK_NO_SUCH)  # another reply's file, or a file with no link
+    # Sent: deleted as sent, or a secret file with downloaded_at (the delete after the send failed, and the finish may
+    # have deleted it since). Its 410 says so with or without the item, as _pruned does once a reply pruned it.
+    sent = item["deleted_reason"] == "sent" or (item["secret"] and item["downloaded_at"] is not None)
     if item["file_id"] is None or task["status"] in FINISHED:  # deleted, or went with the finish
-        return _refuse(410, sent_detail if sent_detail and item["deleted_reason"] == "sent" else DELETED)
+        return _refuse(410, (sent_detail or SENT) if sent else DELETED)
     if expect is not None and item["file_id"] != expect[1]:
         return _refuse(404, TASK_NO_SUCH)
-    if item["secret"] and item["downloaded_at"] is not None:  # sent already, and the delete after it failed
+    if sent:  # a secret file sent already, and the delete after it failed (the sweep retries it)
         return _refuse(410, sent_detail or SENT)
     if item["blocked_at"] is not None:  # Drive refused it before: no Drive call, slot or charge
         return _refuse(410, BLOCKED)
@@ -542,21 +569,41 @@ def _span(range_header: str | None, length: int, command: str = "askhooman files
 
 @dataclass
 class Writes:
-    """The writes into the holder that fetching target's file makes, each called with the stamp's time: True if it
-    wrote (_writes)."""
+    """What fetching target's file does to its holder, by its kind (_writes): the stamps, each called with the
+    stamp's time and True if it wrote (`sent(at, deleted)`: a secret file handed over, and gone from Drive or not);
+    `delete(reason)`, the Drive file deleted through the holder's own guard, True if it is gone; and for a secret
+    file, its claim's key and the words of the kind (the 404, the MCP tool's «too big»)."""
     downloaded: Callable[[str], bool]
     blocked: Callable[[str], bool]
+    sent: Callable[[str, bool], bool]
+    delete: Callable[[str], bool]
+    claim_key: str
+    too_big: str
+    no_such: str
 
 
 def _writes(pool: DrivePool, user: str, target: Target, answered_at: str | None = None) -> Writes:
-    """The holder's own writes for target.kind: an ask's item is stamped under `answered_at` (the answer the link
-    names, or the ask's on the bearer route), a task's while the task is open (mark_task_downloaded)."""
-    holder_id, n, file_id = target.holder["id"], target.n, target.item["file_id"]
+    """The holder's own writes for target.kind, "ask" or "task" (anything else is a bug: ValueError). An ask's item
+    is stamped under `answered_at` (the answer the link names; by default the ask's own, on the bearer route and in
+    the tool), a task's while the task is open (mark_task_downloaded)."""
+    holder_id, n, file_id, records = target.holder["id"], target.n, target.item["file_id"], target.records
     if target.kind == "task":
         return Writes(lambda at: mark_task_downloaded(pool, user, holder_id, n, file_id, at),
-                      lambda at: mark_task_blocked(pool, user, holder_id, n, file_id, at))
+                      lambda at: mark_task_blocked(pool, user, holder_id, n, file_id, at),
+                      lambda at, deleted: mark_task_sent(pool, user, holder_id, n, file_id, at, deleted),
+                      lambda reason: HostedTasks(records)._delete_reply_file(holder_id, n, file_id, reason),
+                      task_claim_key(user, holder_id, file_id),
+                      f"too big for MCP — fetch it with `askhooman task files {holder_id} --secret`", TASK_NO_SUCH)
+    if target.kind != "ask":
+        raise ValueError(f"no writes for a holder of kind {target.kind!r}")
+    if answered_at is None:
+        answered_at = target.holder["answered_at"]
     return Writes(lambda at: mark_downloaded(pool, user, holder_id, n, file_id, answered_at, at),
-                  lambda at: mark_blocked(pool, user, holder_id, n, file_id, answered_at, at))
+                  lambda at: mark_blocked(pool, user, holder_id, n, file_id, answered_at, at),
+                  lambda at, deleted: mark_sent(pool, user, holder_id, n, file_id, answered_at, at, deleted),
+                  lambda reason: HostedAsks(records)._delete_answer_file(holder_id, n, file_id, reason),
+                  claim_key(user, holder_id, file_id),
+                  f"too big for MCP — fetch it with `askhooman files {holder_id} --secret`", NO_SUCH)
 
 
 def _stream(app: FastAPI, pool: DrivePool, user: str, who: str, target: Target, answered_at: str | None = None):
@@ -683,23 +730,26 @@ class Refusal:
 class Taken:
     """A secret file claimed and read whole (and size-checked): `raw`, and `finish(sent)` to call once it has been
     handed over (True) or not (False): the slot given back, then the claim released, or made done, the Drive file
-    deleted and the ask written."""
+    deleted and the ask or task written."""
     raw: bytes
     finish: Callable[[bool], None]
 
 
 def take_secret(app: FastAPI, pool: DrivePool, claims: FileClaims, user: str, who: str, target: Target,
                 cap: int | None = None):
-    """The one send sequence of a secret file, shared by the bearer route (_Once) and the MCP tool: claim, slot, the
-    whole file read and checked, the byte budget; a Refusal, or a Taken whose `finish` the caller MUST call. `cap` (the
-    tool's 16 KiB) refuses a larger file before the claim is taken."""
-    ask, item, n, records, ids = target.holder, target.item, target.n, target.records, target.ids
-    file_id, length, answered_at = item["file_id"], item["bytes"], ask["answered_at"]
+    """The one send sequence of a secret file, an answer's or a reply's, shared by the bearer routes (_Once) and the
+    MCP tools: claim, slot, the whole file read and checked, the byte budget; a Refusal, or a Taken whose `finish` the
+    caller MUST call. `cap` (the tools' 16 KiB) refuses a larger file before the claim is taken. Whatever is the
+    holder's own (the claim's key and document, the stamps, the guarded Drive delete, the words) comes from _writes,
+    by target.kind; the sequence is the same for both."""
+    item, records, ids = target.item, target.records, target.ids
+    holder_id, file_id, length = target.holder["id"], item["file_id"], item["bytes"]
+    writes = _writes(pool, user, target)
     if cap is not None and length > cap:
-        return Refusal(413, f"too big for MCP — fetch it with `askhooman files {ask['id']} --secret`")
-    key = claim_key(user, ask["id"], file_id)
+        return Refusal(413, writes.too_big)
+    key = writes.claim_key
     try:
-        state, owner = claims.take(key, user, ask["id"], _now())
+        state, owner = claims.take(key, user, holder_id, _now(), holder=target.kind)
     except Exception as exc:  # the metadata store is down
         log.warning("claim of %s failed: %s", ids, type(exc).__name__)
         return Refusal(503, "temporarily unavailable, try again", {"Retry-After": "5"})
@@ -717,15 +767,14 @@ def take_secret(app: FastAPI, pool: DrivePool, claims: FileClaims, user: str, wh
             raw = records.call(_read_whole, records.drive, file_id)
         except _Blocked:
             log.warning("hosted: Drive refused to serve the file of %s: blocked", ids)
-            return Refusal(410, BLOCKED, after=lambda: mark_blocked(pool, user, ask["id"], n, file_id, answered_at,
-                                                                      utc_now()))
+            return Refusal(410, BLOCKED, after=lambda: writes.blocked(utc_now()))
         except DriveNotFound:
             return Refusal(410, DELETED)
         except (AskError, DriveError):
             return Refusal(503, UNAVAILABLE, {"Retry-After": "30"})
         if raw is None or len(raw) != length:  # before the first byte: what Drive holds is not the item's file
             log.warning("hosted: the Drive file of %s does not match its item: not sent", ids)
-            return Refusal(404, NO_SUCH)
+            return Refusal(404, writes.no_such)
         budget: ByteBudget = app.state.file_bytes
         if not budget.charge(who, length):
             return Refusal(429, "too many bytes downloaded: at most 1 GiB an hour per agent",
@@ -738,8 +787,8 @@ def take_secret(app: FastAPI, pool: DrivePool, claims: FileClaims, user: str, wh
                     claims.release(key, owner)
                     return
                 for attempt in (1, 2, 3):  # the bytes are out: a claim left held would let a second send happen
-                    try:
-                        claims.done(key, owner, user, ask["id"], _now())  # before the delete: nothing can read it from here on
+                    try:  # before the delete: nothing can read it from here on
+                        claims.done(key, owner, user, holder_id, _now(), holder=target.kind)
                         break
                     except Exception as exc:
                         log.warning("hosted: could not mark the claim of %s done (attempt %d): %s", ids, attempt,
@@ -747,10 +796,10 @@ def take_secret(app: FastAPI, pool: DrivePool, claims: FileClaims, user: str, wh
                         if attempt < 3:
                             _pause(RETRY_PAUSES[attempt - 1])
                 # whether or not it got written, the file goes: the next request finds no file (410), never the bytes
-                gone = HostedAsks(records)._delete_answer_file(ask["id"], n, file_id, "sent")
-                for attempt in (1, 2, 3):  # the ask says «sent» once this is written (the claim is what stopped a resend)
+                gone = writes.delete("sent")
+                for attempt in (1, 2, 3):  # the holder says «sent» once this is written (the claim stopped a resend)
                     try:
-                        mark_sent(pool, user, ask["id"], n, file_id, answered_at, utc_now(), gone)
+                        writes.sent(utc_now(), gone)
                         break
                     except Exception as exc:
                         log.warning("hosted: could not write the send of %s (attempt %d): %s", ids, attempt,
@@ -849,15 +898,21 @@ class FileRefused(AskError):
         self.status_code = status
 
 
-def secret_file_tool(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter: RateLimiter, claims: FileClaims):
-    """fetch(identity, ask_id, n) -> {name, mime, bytes, content_base64} for the MCP tool ask_secret_file (SPEC 7.8):
-    the bearer route's checks in the same order (_check) and the same send (take_secret), only for a secret file of
-    at most 16 KiB. MCP has no disconnect signal: the file counts as handed over once the result is built and returned
-    to the MCP layer (the route's own approximation at its final send). Raises FileRefused with the route's text."""
+ASK_ONLY = "only the agent that asked can fetch its answer's files"
+TASK_ONLY = "only the agent whose task it is can fetch its replies' files"
 
-    def fetch(who: HostedIdentity, ask_id: int, n: int) -> dict:
+
+def _secret_fetch(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter: RateLimiter, claims: FileClaims,
+                  only: str, no_such: str, check: Callable):
+    """fetch(identity, holder_id, n) for the MCP tool of one kind of holder: not an agent of a hosted user is 403
+    `only` (before any claim), the `files` bucket, the agent (revoked: 404 `no_such`), then `check` (_check or
+    _check_task) and take_secret, only for a secret file of at most 16 KiB. MCP has no disconnect signal: the file
+    counts as handed over once the result is built and returned to the MCP layer (the route's own approximation at
+    its final send). Raises FileRefused with the route's text, «already sent» for a file that was."""
+
+    def fetch(who: HostedIdentity, holder_id: int, n: int) -> dict:
         if not isinstance(who, HostedIdentity):  # the route's 403: before any claim
-            raise FileRefused("only the agent that asked can fetch its answer's files", 403)
+            raise FileRefused(only, 403)
         user, key = who.user, f"{who.user}:{who.agent_id}"
         if not limiter.allow("files", key):
             raise FileRefused("too many requests for files: at most 20 a minute per agent", 429)
@@ -867,8 +922,8 @@ def secret_file_tool(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter:
             log.warning("secret file tool check failed: %s", type(exc).__name__)
             raise Unavailable("temporarily unavailable, try again") from None
         if agent is None:  # revoked since the token was checked
-            raise FileRefused(NO_SUCH, 404)
-        target = _check(pool, user, ask_id, n, agent["slug"], None, True, ALREADY_SENT)
+            raise FileRefused(no_such, 404)
+        target = check(pool, user, holder_id, n, agent["slug"], None, True, ALREADY_SENT)
         if not isinstance(target, Target):
             raise FileRefused(json.loads(target.body)["detail"], target.status_code)
         if not target.secret:
@@ -893,15 +948,30 @@ def secret_file_tool(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter:
     return fetch
 
 
-def add_content_route(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter: RateLimiter,
-                      claims: FileClaims) -> None:
-    """GET /api/asks/{id}/files/{n}/content: the owner agent's bearer (RequestGuard has identified it; the user's own
-    token never gets here: 403 in app.authenticate), both kinds of file, the same checks in the same order."""
+def secret_file_tool(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter: RateLimiter, claims: FileClaims):
+    """fetch(identity, ask_id, n) -> {name, mime, bytes, content_base64} for the MCP tool ask_secret_file (SPEC 7.8):
+    the bearer route's checks in the same order (_check) and the same send (take_secret), only for a secret file of
+    at most 16 KiB (_secret_fetch). Raises FileRefused with the route's text."""
+    return _secret_fetch(app, accounts, pool, limiter, claims, ASK_ONLY, NO_SUCH, _check)
 
-    @app.get("/api/asks/{ask_id}/files/{n}/content", include_in_schema=False)
-    def content(ask_id: int, n: int, request: Request, who=Depends(current_identity)):
+
+def task_secret_file_tool(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter: RateLimiter,
+                          claims: FileClaims):
+    """fetch(identity, task_id, n) -> {name, mime, bytes, content_base64} for the MCP tool task_secret_file (SPEC
+    8.7): ask_secret_file for a reply's secret file, only the task's own agent, with the task route's checks
+    (_check_task) and the same send and claim (take_secret). Raises FileRefused with the route's text."""
+    return _secret_fetch(app, accounts, pool, limiter, claims, TASK_ONLY, TASK_NO_SUCH, _check_task)
+
+
+def _content(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter: RateLimiter, claims: FileClaims,
+             only: str, no_such: str, check: Callable):
+    """content(holder_id, n, request, identity) -> the response of a bearer route for one kind of holder: not an
+    agent of a hosted user is 403 `only`, the `files` bucket, the agent (revoked: 404 `no_such`), `check` (_check or
+    _check_task), then a secret file once (_secret) and a normal one streamed (_stream, Range included)."""
+
+    def content(holder_id: int, n: int, request: Request, who):
         if not isinstance(who, HostedIdentity):
-            return _refuse(403, "only the agent that asked can fetch its answer's files")
+            return _refuse(403, only)
         user, key = who.user, f"{who.user}:{who.agent_id}"
         if not limiter.allow("files", key):
             return _refuse(429, "too many requests for files: at most 20 a minute per agent",
@@ -912,14 +982,33 @@ def add_content_route(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter
             log.warning("file route check failed: %s", type(exc).__name__)
             return _refuse(503, "temporarily unavailable, try again", {"Retry-After": "5"})
         if agent is None:  # revoked since the token was checked
-            return _refuse(404, NO_SUCH)
-        target = _check(pool, user, ask_id, n, agent["slug"], None, True, streams=True,
-                        range_header=request.headers.get("range"))
+            return _refuse(404, no_such)
+        target = check(pool, user, holder_id, n, agent["slug"], None, True, streams=True,
+                       range_header=request.headers.get("range"))
         if not isinstance(target, Target):
             return target
         if target.secret:  # one response, no Range
             return _secret(app, pool, claims, user, key, target)
-        return _stream(app, pool, user, key, target, target.holder["answered_at"])
+        return _stream(app, pool, user, key, target)  # an ask's stamps: under its own answered_at
+
+    return content
+
+
+def add_content_route(app: FastAPI, accounts: Accounts, pool: DrivePool, limiter: RateLimiter,
+                      claims: FileClaims) -> None:
+    """GET /api/asks/{id}/files/{n}/content and GET /api/tasks/{id}/files/{n}/content: the owner agent's bearer
+    (RequestGuard has identified it; the user's own token never gets here: 403 in app.authenticate), both kinds of
+    file, the same checks in the same order (SPEC 7.4, 8.3)."""
+    answers = _content(app, accounts, pool, limiter, claims, ASK_ONLY, NO_SUCH, _check)
+    replies = _content(app, accounts, pool, limiter, claims, TASK_ONLY, TASK_NO_SUCH, _check_task)
+
+    @app.get("/api/asks/{ask_id}/files/{n}/content", include_in_schema=False)
+    def content(ask_id: int, n: int, request: Request, who=Depends(current_identity)):
+        return answers(ask_id, n, request, who)
+
+    @app.get("/api/tasks/{task_id}/files/{n}/content", include_in_schema=False)
+    def task_content(task_id: int, n: int, request: Request, who=Depends(current_identity)):
+        return replies(task_id, n, request, who)
 
 
 def add_file_routes(app: FastAPI, links: FileLinks, accounts: Accounts, pool: DrivePool, limiter: RateLimiter,

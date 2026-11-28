@@ -240,13 +240,20 @@ def clean_files(value, answered_at, status) -> list[dict]:
     return items
 
 
+def is_user_reply(event) -> bool:
+    """A `replied` event of the user (actor denis) with an integer id and an `at`: the only events an item of
+    reply_files can name (clean_reply_files), so the only ones whose files can name a pruned item (files_api); junk
+    is no event."""
+    return (isinstance(event, dict) and event.get("kind") == "replied" and event.get("actor") == "denis"
+            and isinstance(event.get("id"), int) and not isinstance(event.get("id"), bool)
+            and isinstance(event.get("at"), str))
+
+
 def _replies(events) -> set[tuple[int, str]]:
-    """(id, at) of every `replied` event of the user (actor denis) among a task's events; junk is no event."""
+    """(id, at) of every `replied` event of the user among a task's events (is_user_reply)."""
     if not isinstance(events, list):
         return set()
-    return {(e["id"], e["at"]) for e in events
-            if isinstance(e, dict) and e.get("kind") == "replied" and e.get("actor") == "denis"
-            and isinstance(e.get("id"), int) and not isinstance(e.get("id"), bool) and isinstance(e.get("at"), str)}
+    return {(e["id"], e["at"]) for e in events if is_user_reply(e)}
 
 
 def clean_reply_files(value, events) -> list[dict]:
@@ -386,27 +393,36 @@ def task_claim_key(user: str, task_id: int, file_id: str) -> str:
     return hashlib.sha256(json.dumps([user, "task", task_id, file_id]).encode("utf-8")).hexdigest()
 
 
+HOLDERS = ("ask", "task")  # what a claim's document names its holder by: ask_id or task_id
+
+
+def _holder_field(holder: str) -> str:
+    if holder not in HOLDERS:
+        raise ValueError(f"a claim is held for an ask or a task, not {holder!r}")
+    return f"{holder}_id"
+
+
 class FileClaims:
     """Claims of secret files in the metadata store, collection `fileclaims`, changed only in store transactions (a
     Firestore transaction in production, a lock in MemoryStore), so two requests at the same instant on two instances
     cannot both take one. A document: {user, ask_id, state: "held" | "done", until, owner}; a reply's secret file has
-    one with task_id in place of ask_id, keyed by task_claim_key (SPEC 8.3). States: none (no document),
-    held until `until` by `owner`, done (the file has been sent; `expires_at` 90 days on)."""
+    one with task_id in place of ask_id (`holder` "task"), keyed by task_claim_key (SPEC 8.3). States: none (no
+    document), held until `until` by `owner`, done (the file has been sent; `expires_at` 90 days on)."""
 
     def __init__(self, store: Store):
         self.store = store
 
-    def take(self, key: str, user: str, ask_id: int, now: float) -> tuple[str, str | None]:
+    def take(self, key: str, user: str, holder_id: int, now: float, holder: str = "ask") -> tuple[str, str | None]:
         """none -> held, or an expired held -> held (taken over): ("taken", owner id of the new lease); a held claim
-        that has not expired: ("held", None); done: ("done", None)."""
-        owner = secrets.token_hex(8)
+        that has not expired: ("held", None); done: ("done", None). The document names its holder as `<holder>_id`."""
+        owner, field = secrets.token_hex(8), _holder_field(holder)
 
         def decide(doc):
             if doc is not None and doc.get("state") == "done":
                 return UNCHANGED, ("done", None)
             if doc is not None and doc.get("state") == "held" and doc.get("until", 0) > now:
                 return UNCHANGED, ("held", None)
-            return ({"user": user, "ask_id": ask_id, "state": "held", "until": now + LEASE, "owner": owner},
+            return ({"user": user, field: holder_id, "state": "held", "until": now + LEASE, "owner": owner},
                     ("taken", owner))
         return self.store.transact(CLAIMS_COLLECTION, key, decide)
 
@@ -418,15 +434,17 @@ class FileClaims:
             return UNCHANGED, None
         self.store.transact(CLAIMS_COLLECTION, key, decide)
 
-    def done(self, key: str, owner: str, user: str, ask_id: int, now: float | None = None) -> None:
-        """held -> done, only if the claim still exists, is held and is `owner`'s: a close, a reopen or a re-answer
-        that deleted it came first (no orphan is made), a takeover's lease is not overwritten. A done claim has
-        `expires_at` = now + DONE_TTL: by then the file is long gone, and the claim document goes with it."""
-        stamp = (time.time() if now is None else now) + DONE_TTL
+    def done(self, key: str, owner: str, user: str, holder_id: int, now: float | None = None,
+             holder: str = "ask") -> None:
+        """held -> done, only if the claim still exists, is held and is `owner`'s: a close, a reopen, a re-answer or
+        a finish that deleted it came first (no orphan is made), a takeover's lease is not overwritten. A done claim
+        has `expires_at` = now + DONE_TTL: by then the file is long gone, and the claim document goes with it. The
+        document names its holder as take's does."""
+        stamp, field = (time.time() if now is None else now) + DONE_TTL, _holder_field(holder)
 
         def decide(doc):
             if doc is not None and doc.get("state") == "held" and doc.get("owner") == owner:
-                return {"user": user, "ask_id": ask_id, "state": "done", "expires_at": stamp}, None
+                return {"user": user, field: holder_id, "state": "done", "expires_at": stamp}, None
             return UNCHANGED, None
         self.store.transact(CLAIMS_COLLECTION, key, decide)
 

@@ -277,8 +277,10 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
                     google.verify_id_token(token, settings.app_client_ids)
                 except Exception:  # GoogleError, or Google's certs unreachable: not a Google ID token as far as we
                     pass  # can tell; the agent check below says what is wrong with it
-                else:
-                    raise HTTPException(403, "this file is for the agent that asked: fetch it with its own token")
+                else:  # the user's own token: an answer's file is the asking agent's, a reply's the task's agent's
+                    raise HTTPException(403, "this file is for the agent whose task it is: fetch it with its own token"
+                                        if path.startswith("/api/tasks/") else
+                                        "this file is for the agent that asked: fetch it with its own token")
             return resource_auth.identify(headers.get("authorization"), ip, headers.get("host"))
         if token is None:
             raise HTTPException(401, "sign in with Google", headers={"WWW-Authenticate": "Bearer"})
