@@ -202,14 +202,14 @@ def test_delete_account_purges_both_kinds(hosted, google, caplog):
     import logging
     connect(hosted, google, register(hosted)["client_id"])
     drive = google.drive(DENIS_SUB)
-    mine = [put_answer_file(drive, 1, 1), put_reply_file(drive, 1, 1), put_reply_file(drive, 2, 3, secret=True)]
+    mine = [put_answer_file(drive, 1, 1), put_reply_file(drive, 1, 1), put_reply_file(drive, 2, 3, secret=True),
+            put_answer_file(drive, 9, 7, task_id="9")]  # the ask's by its marks, whatever else it carries (as before)
     others = [
         drive.add("tfile-9-1-1700000000000", b"x", {}),  # no marks: not ours
         drive.add("tfile-9-2-1700000000000", b"x", {"kind": "voice", "task_id": "9", "file": "2"}),
         drive.add("tfile-9-3-1700000000000", b"x", {"kind": "file", "task_id": "8", "file": "3"}),  # another task's
         drive.add("tfile-9-4-1700000000000", b"x", {"kind": "file", "task_id": "9", "file": "5"}),  # another item's
-        put_reply_file(drive, 9, 6, ask_id="9"),  # both kinds' marks: nobody's
-        put_answer_file(drive, 9, 7, task_id="9"),  # the same, named as an ask's
+        put_reply_file(drive, 9, 6, ask_id="9"),  # a task's file that carries an ask's mark: nobody's
         drive.add("tfile-notes", b"x", {"kind": "file", "task_id": "9", "file": "1"}),  # not our name
         drive.add("task-1.json", {"id": 1}, {"task_id": "1"}),
     ]
@@ -217,7 +217,7 @@ def test_delete_account_purges_both_kinds(hosted, google, caplog):
     assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
     assert not any(file_id in drive.files for file_id in mine)
     assert all(file_id in drive.files for file_id in others)  # the tasks and everything not marked stay
-    assert "3 answer files deleted from Drive, 0 not, 0 left past the cap" in caplog.text
+    assert "4 answer files deleted from Drive, 0 not, 0 left past the cap" in caplog.text
     assert len(google.revocations) == 1  # and the grant went after the files
     assert "tfile-" not in caplog.text and "Q3 report" not in caplog.text
 

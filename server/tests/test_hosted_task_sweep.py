@@ -490,10 +490,8 @@ def test_nothing_of_an_ask_is_touched_and_the_reverse(world):
     t2 = world.replied(2, (1, False), (2, True))
     world.finish(2)
     t2_claim = world.hold_task(2, t2[1]["file_id"], "done")
-    # files that look like the other kind's and are not
-    old = time.time() - 3 * DAY
-    both_marks = [world.put_task(2, 9, uploaded=old, ask_id="2"),  # a tfile- of finished task #2 that names an ask
-                  world.put(2, 9, uploaded=old, task_id="2")]  # an afile- of ask #2 that names a task: an orphan else
+    # a file of finished task #2 that also carries an ask's mark: nobody's
+    foreign = world.put_task(2, 9, uploaded=time.time() - 3 * DAY, ask_id="2")
     app_task_reply_files(world.drive, 1, [task_item(5, file_id=a2[0]["file_id"], bytes=100)])  # task #1 names an afile-
     ask2, task1 = world.doc(2), world.task_doc(1)
     world.hosted.app.state.pool._cache.clear()
@@ -501,15 +499,34 @@ def test_nothing_of_an_ask_is_touched_and_the_reverse(world):
     _, stats = world.sweep()
     assert stats["deleted_closed"] == 2 and stats["deleted_finished"] == 2 and stats["claims_deleted"] == 2
     assert not any(world.exists(one["file_id"]) for one in (*a1, *t2))
-    assert all(world.exists(one["file_id"]) for one in (*t1, *a2)) and all(world.exists(f) for f in both_marks)
+    assert all(world.exists(one["file_id"]) for one in (*t1, *a2)) and world.exists(foreign)
     assert world.claim(a1_claim) is None and world.claim(t2_claim) is None
     assert world.claim(t1_claim) is not None and world.claim(a2_claim) is not None  # task #1's survives ask #1's close
     assert world.task_doc(1) == task1 and world.doc(2) == ask2  # nothing written into the other kind's live record
     assert {(i["file_id"], i["deleted_reason"]) for i in world.doc(1)["answer_files"]} == {(None, "closed")}
 
 
-def test_an_afile_with_a_tasks_mark_is_nobodys():
-    marks = {"ask_id": "3", "kind": "file", "file": "1", "secret": "0"}
-    ours = {"id": "f1", "name": "afile-3-1-1700000000000", "appProperties": marks}
-    assert sweep_module.answer_files([ours]) == [(ours, 3, 1)]
-    assert sweep_module.answer_files([{**ours, "appProperties": {**marks, "task_id": "3"}}]) == []
+def test_an_afile_with_a_stray_task_id_is_the_asks_and_a_tfile_with_an_ask_id_is_nobodys(world):
+    """An `afile-` with the ask's marks is the ask's whatever else its appProperties carry, exactly as before 8.5: it
+    is swept and purged as the ask's. Only a task's file refuses the other key: a `tfile-` that carries ask_id is
+    nobody's, never swept, purged or written into the task that names it."""
+    marks = {"ask_id": "3", "kind": "file", "file": "1", "secret": "0", "task_id": "3"}
+    afile = {"id": "f1", "name": "afile-3-1-1700000000000", "appProperties": marks}
+    tfile = {"id": "f2", "name": "tfile-3-1-1700000000000", "appProperties": marks}
+    assert sweep_module.answer_files([afile, tfile]) == [(afile, 3, 1)] and reply_files([afile, tfile]) == []
+    old = time.time() - 3 * DAY
+    stray = world.put(9, 1, uploaded=old, task_id="9")  # no ask #9: an orphan after 24 h, by the ask's rules
+    task = world.task()
+    named = world.put_task(task, 1, uploaded=old, ask_id=str(task))
+    app_task_reply_files(world.drive, task, [task_item(1, file_id=named, bytes=100)])  # the task names it
+    world.replied(task, (2, False))  # and has a file of its own: the task side is looked at, the task read and healed
+    unnamed = world.put_task(8, 1, uploaded=old, ask_id="8")  # no task #8: an orphan, were it a task's
+    doc = world.task_doc(task)
+    world.now = time.time()
+    _, stats = world.sweep()
+    assert stats == {"users": 1, "deleted_orphan": 1} and not world.exists(stray)
+    assert world.exists(named) and world.exists(unnamed) and world.task_doc(task) == doc
+    # Delete Account's purge splits them the same way: the ask's goes (with the task's own file), the stray tfile- stays
+    again = world.put(9, 2, uploaded=old, task_id="9")
+    assert sweep_module.purge_answer_files(world.hosted.app.state.pool, world.sub) == (2, 0, 0, False)
+    assert not world.exists(again) and world.exists(named) and world.exists(unnamed)

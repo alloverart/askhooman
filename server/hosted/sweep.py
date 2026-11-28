@@ -24,11 +24,12 @@ Without a read go only a task finished by its confirmed marks, a done claim, the
 unreadable one (kept); every other file of a task that is open by its marks takes a read of the task file.
 
 One listing serves both kinds (LIST_FILES: one cap, one cut-short flag), split by the full name AND Drive's marks
-(kind "file", the holder's id and the item's): a file with an ask's mark is never a task's and the reverse, so a file
-with both is nobody's. A file is deleted only through its holder's guard, which asks Drive for the file's appProperties
-first (HostedAsks._delete_answer_file, HostedTasks._delete_reply_file); then, if an item names it, the record is
-written (file_id null, deleted_at, deleted_reason): an ask under the guards of 7.4, a task while the item still names
-the file (a reply is never replaced), with a file_deleted event. The sweep also heals what the routes leave: an item
+(kind "file", the holder's id and the item's): a `tfile-` that also carries an ask's mark is nobody's (a task's file
+never has ask_id), while an `afile-` is the ask's by those marks whatever else it carries, exactly as before 8.5. A file
+is deleted only through its holder's guard, which asks Drive for the file's appProperties first
+(HostedAsks._delete_answer_file, HostedTasks._delete_reply_file); then, if an item names it, the record is written
+(file_id null, deleted_at, deleted_reason): an ask under the guards of 7.4, a task while the item still names the file
+(a reply is never replaced), with a file_deleted event. The sweep also heals what the routes leave: an item
 whose Drive file is already gone (for the records of each kind changed in the last HEAL_WINDOW, at most HEAL_ASKS of
 each). A claim document belongs to the side its own key names (task_id, else ask_id). A user whose grant is revoked, or
 whose Drive fails, is logged by id and skipped; the run goes on. Nothing of a file (name, content, link) is logged or
@@ -99,7 +100,8 @@ class Side:
     kind: str  # the record kind in the ask/task listing, and in the log lines
     field: str  # the record's list of files
     key: str  # the holder's id in a Drive file's appProperties and in a claim document
-    other: str  # the other side's key: a file that carries it is never this side's
+    refuses: str | None  # a key that makes a file not this side's (a task's never carries ask_id); None: none (an
+    #                      ask's file is matched as before 8.5, whatever else its appProperties carry)
     name: re.Pattern  # the full name of the holder's Drive files: <prefix>-<holder id>-<item id>-<unix ms>
     live: tuple  # the statuses whose items go by their own stamps (secret 24 h, normal 30 days)
     finished: tuple  # the statuses whose files go at any age ...
@@ -117,11 +119,11 @@ class Side:
 
 def _match(side: Side, meta: dict) -> tuple[int, int] | None:
     """(holder id, item id) when the listed file is one of `side`'s by its full name AND Drive marks (kind "file",
-    this holder, this item, and not the other side's mark); else None."""
+    this holder, this item, and for a task no ask_id); else None."""
     found = side.name.fullmatch(meta.get("name") or "")
     props = meta.get("appProperties") or {}
     if (found is None or not meta.get("id") or props.get("kind") != "file" or props.get(side.key) != found.group(1)
-            or props.get("file") != found.group(2) or side.other in props):
+            or props.get("file") != found.group(2) or (side.refuses is not None and side.refuses in props)):
         return None
     return int(found.group(1)), int(found.group(2))
 
@@ -134,7 +136,7 @@ def _ours(files: list[dict]) -> list[tuple[Side, dict, int, int]]:
 
 def answer_files(files: list[dict]) -> list[tuple[dict, int, int]]:
     """(meta, ask id, item id) of the listed files that are an ask's answer files by name AND Drive marks (kind
-    "file", this ask, this item, no task_id): any other file is never touched."""
+    "file", this ask, this item; nothing else is looked at, as before 8.5): any other file is never touched."""
     return [(meta, ask_id, n) for side, meta, ask_id, n in _ours(files) if side is ASKS]
 
 
@@ -344,13 +346,13 @@ def _mark_task_deleted(pool: DrivePool, user: str, task: dict, file_id: str, rea
 
 
 # The two sides. The ask's delete, read and write are looked up when called (tests patch them by these names).
-ASKS = Side(kind="ask", field=ANSWER_FILES, key="ask_id", other="task_id", name=FILE_NAME, live=("answered",),
+ASKS = Side(kind="ask", field=ANSWER_FILES, key="ask_id", refuses=None, name=FILE_NAME, live=("answered",),
             finished=("closed",), reason="closed", stamp="answered_at", opened=("open",), open_names_nothing=True,
             finish_stamps_items=False, claim=claim_key,
             delete=lambda records, *args: HostedAsks(records)._delete_answer_file(*args),
             read=lambda records, meta: HostedAsks(records).items._entry(meta),
             mark=lambda *args: _mark_deleted(*args))
-TASKS = Side(kind="task", field=REPLY_FILES, key="task_id", other="ask_id", name=TASK_FILE_NAME, live=OPEN,
+TASKS = Side(kind="task", field=REPLY_FILES, key="task_id", refuses="ask_id", name=TASK_FILE_NAME, live=OPEN,
              finished=FINISHED, reason="finished", stamp="replied_at", opened=OPEN, open_names_nothing=False,
              finish_stamps_items=True, claim=task_claim_key,
              delete=lambda records, *args: HostedTasks(records)._delete_reply_file(*args),
