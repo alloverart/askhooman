@@ -1317,6 +1317,8 @@ is built (the server, the web app, Apple 1.0.7 (198) in TestFlight), and this se
 an **open** task (`active`, `waiting`) for an *answered* ask and a **finished** one (`done`, `dropped`) for a *closed*
 ask. What was decided while writing it is marked *ruling*.
 
+The `file:line` references of this section are as of 6fbdd82, before the server step was built.
+
 The user attaches files to a reply on a task exactly as to an answer: Attach and drop (and paste, where the ask's box
 takes it), the same chips with their states and the Secret checkbox, the same first-use dialog and error texts, up to 6
 files a reply, each up to 100 MiB (a secret one up to 10 MiB), sent by the app straight to the user's own Google Drive.
@@ -1581,25 +1583,29 @@ Headers as 7.2 with `Content-Disposition: attachment; filename="task-<id>-file-<
   milliseconds is lost as it could be before; its files are then orphans and go after 24 h (8.5), and an item that lost
   a stamp gets it at the next download or, once its file is gone, from the sweep's healing.
 - **`tasks_mine` size:** metadata and normal links only; nothing is fetched until the agent asks.
-- *Built:* in the `files` of an event, an entry that is not an object is dropped and a `files` that is not a list reads
-  as `[]` (for a task; an ask's events are as they were).
+- *Built:* in the `files` of an event, an entry that is not an object, or whose `id` is not an integer (a boolean is
+  none), is dropped; a name is cleaned as `reply_files`' names are on every read (one that is not a string reads as
+  `null`); a `files` that is not a list reads as `[]`; and a payload that is not an object reads as `null` (for a task,
+  as every agent gets it; the bridge's own reads keep the history as stored, and an ask's events are as they were).
 - *Built:* what a write returns carries the owner's full metadata of each item (a secret one with its ten keys), and no
   `url`; only the webhook has a secret file in the form `{id, reply_id, secret: true}`.
 - *Built:* `GET /media/v1/<token>` hands a token that is not a recording's to one function in
-  `server/hosted/files_api.py`, which tries the answer's opener and then the task's; the route in `voice_api.py` hands a token it cannot open as a recording's to that one function, as it did before for
-  an answer's file.
+  `server/hosted/files_api.py`, which tries the answer's opener and then the task's; the route in `voice_api.py` hands
+  a token it cannot open as a recording's to that one function, as it did before for an answer's file.
 - *Built:* the 409 of a task's file over 31 MiB names its own command: «… (askhooman task files does this)», where an
   answer's says `askhooman files`.
 - *Built:* the 403s of the task's bearer route: the user's own ID token on `GET /api/tasks/{id}/files/{n}/content` is
   «this file is for the agent whose task it is: fetch it with its own token», and a caller that is not an agent is
   «only the agent whose task it is can fetch its replies' files».
-- *Built:* a secret file that was sent answers 410 «the file was deleted after it was sent» on the bearer route (the link route
-  never serves a secret file: 404), and `task_secret_file` answers «already sent — if you did not receive it, ask your
-  user to send it again», whether its item is still in `reply_files` (`deleted_reason: sent`, or a secret item with
-  `downloaded_at`) or was pruned (the snapshot says `secret` and the history holds its `file_downloaded`, or a
-  `file_deleted` with reason `sent`, which is what the sweep writes when it records a send), so the words do not
-  change when the user's next reply prunes the item; any other pruned or deleted file is 410 «the file was deleted». An ask's deleted item still answers «the file
-  was deleted» on its routes, as before.
+- *Built:* a secret file that was sent answers 410 «the file was deleted after it was sent» on the bearer route (the
+  link route never serves a secret file: 404), and `task_secret_file` answers «already sent — if you did not receive
+  it, ask your user to send it again», whether its item is still in `reply_files` (`deleted_reason: sent`, or a secret
+  item with `downloaded_at`) or was pruned (the snapshot says `secret` and the history holds its `file_downloaded`, or
+  a `file_deleted` with reason `sent`, which is what the sweep writes when it records a send), so the words do not
+  change when the user's next reply prunes the item; but for up to an hour after a send whose write into the task
+  failed (the file is gone, the item still names it), until the sweep records it, both the route and the tool answer
+  «the file was deleted». Any other pruned or deleted file is 410 «the file was deleted». An ask's deleted item still
+  answers «the file was deleted» on its routes, as before.
 - *Built:* the guard of the task's side also needs that the file's appProperties carry **no `ask_id`**: a `tfile-` with
   both marks is nobody's (not sent, not deleted at a finish, not swept, not purged). The ask's side is as it was (an
   `afile-` with the ask's marks is the ask's).
@@ -1804,11 +1810,13 @@ test's word list, `server/tests/test_mcp.py:472-474`). Hosted only, as section 7
   in parts); a secret file's 429 is waited out, but its 404 is final, since it has no link to renew; `--reply N` that
   matches no file prints `no files of reply N` (with `--json`, `[]`) and exits 0 without creating `--out`; `--json`
   prints the result objects of `askhooman files` (`id, path, bytes, status`), `[]` when there is nothing to save.
-- *Built:* `task show` prints, under each reply's history line, one line per file id of that event: `file <id>: <name>
-  · <bytes> bytes · <state>`. The state is read from the item in `reply_files` with that id and that `reply_id`:
-  `deleted (<reason>)`, `blocked by Google`, `downloaded` or `not downloaded yet`, each after `secret, ` for a secret
-  file. An id whose item was pruned shows its name and size from the event and `deleted`; a name another agent may not
-  see shows as `(hidden)`.
+- *Built:* `task show` prints, under each reply's history line, one line per file id of that event (an integer; a
+  boolean is none): `file <id>: <name> · <bytes> bytes · <state>`. The state is read from the item in `reply_files`
+  with that id and that `reply_id`: `deleted (<reason>)`, `blocked by Google`, `downloaded` or `not downloaded yet`,
+  each after `secret, ` for a secret file. An id whose item was pruned shows its name and size from the event and
+  `deleted`; a name another agent may not see shows as `(hidden)`. The bridge's own history lines name their file:
+  `file_downloaded: file <id>`, `file_blocked: file <id>`, `file_deleted: file <id> (<reason>)`, the reason left out
+  when there is none, and the bare kind when the id is not an integer.
 - *Built:* `askhooman files` (an ask's files) behaves as before: it does not wait out a 429 on a whole or a secret
   file.
 
@@ -1877,7 +1885,7 @@ Server (`alloverart/askhooman`):
 - `server/hosted/voice.py` (where `for_reader` lives): the task view (items, events, urls).
 - `server/hosted/files_api.py`: the checks (a pruned id, the task's 404 words), stamps and secret send for a task
   target; `GET /api/tasks/{id}/files/{n}/content`; the `task_secret_file` fetch; `CONTENT_PATH`.
-- `server/hosted/voice_api.py`: the third opener on `/media/v1/`.
+- `server/hosted/voice_api.py`: its texts (the third opener on `/media/v1/` is in `files_api.py`, 8.3 *built*).
 - `server/hosted/sweep.py`: one listing of both kinds, the tasks' state and rules, `fileclaims` documents told apart by
   `task_id`, the purge of both.
 - `server/hosted/app_api.py`: the `task.replied` body through the view, `reply.files`.
@@ -1945,7 +1953,8 @@ a task file for plain replies and the bridge's own writes (8.1).
    sent file a «Delete» in the task's history, which would free a place and let the user take back a file sent by
    mistake?
 8. **Ruled 28.11.2026 (Sonya, with the design's defaults; the owner may override later):** `task_done` and `task_drop`
-   delete the files of an unread reply too, and the server instructions tell agents to read a reply before finishing.
+   delete the files of an unread reply too. The server instructions say that a task with `reply_pending` waits for the
+   agent to act on it, and their files paragraph tells it to finish a task only after it has the files (8.7).
    Was: Files in task replies (8.3): `task_done` and `task_drop` delete the task's files at once, and that takes the
    files of a reply the agent has not read yet with them (it may finish a task minutes after the user sent a file,
    without knowing). The agent is told to finish only with the files in hand, and the finished task it gets back shows
