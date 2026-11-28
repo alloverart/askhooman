@@ -819,6 +819,29 @@ def test_pruned_secret_id_says_already_sent(hosted, google):
     assert len(world.content_reads()) == 1
 
 
+def test_a_secret_healed_as_sent_by_the_sweep_then_pruned_still_says_sent(hosted, google):
+    """The send went out and its delete went through, the task's write after it did not: only the done claim says
+    so. The sweep heals the item as sent (a file_deleted event with reason sent, no file_downloaded); the user's next
+    reply prunes it, and the routes still say it was sent (SPEC 8.5, 8.3 «An id whose item was pruned»)."""
+    from server.hosted.sweep import sweep
+    google.drive(DENIS_SUB)._clock = datetime.now(timezone.utc)  # Drive's times follow the sweep's clock: a recent task
+    world = secret_task(hosted, google)
+    now = epoch(now_iso())
+    hosted.store.put("fileclaims", task_claim_key(DENIS_SUB, 1, world.file_id),
+                     {"user": DENIS_SUB, "task_id": 1, "state": "done", "expires_at": now + 90 * 86400})
+    del world.drive.files[world.file_id]
+    state = hosted.app.state
+    assert sweep(state.store, state.pool, now, None, 10)[1]["healed"] == 1
+    assert (world.stored()["deleted_reason"], world.kinds()[-1]) == ("sent", "file_deleted")
+    assert "file_downloaded" not in world.kinds()
+    app_task_reply_files(world.drive, 1, [], text="Any news?")  # the user's next reply prunes the item
+    assert world.task()[REPLY_FILES] == []
+    response = fetch(world)
+    assert (response.status_code, response.json()) == (410, {"detail": SENT})
+    assert refused_by(task_tool(world), identity(world)) == (410, ALREADY_SENT)
+    assert world.content_reads() == []
+
+
 @pytest.mark.parametrize("point", ["done", "delete"])
 def test_finished_while_sending_writes_nothing(hosted, google, monkeypatch, point):
     """The agent finishes the task while its secret file goes out: before the claim is made done (the finish deletes

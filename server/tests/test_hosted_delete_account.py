@@ -189,3 +189,47 @@ def test_delete_account_says_at_least_when_the_listing_was_cut(hosted, google, m
     caplog.set_level(logging.INFO)
     assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
     assert "2 answer files deleted from Drive, 0 not, at least 2 left past the cap" in caplog.text
+
+
+# ---------- files in task replies (SPEC 8.5): Delete Account purges both kinds, within the one cap ----------
+
+def put_reply_file(drive, task_id, n, secret=False, **props):
+    marks = {"task_id": str(task_id), "kind": "file", "file": str(n), "secret": "1" if secret else "0", **props}
+    return drive.add(f"tfile-{task_id}-{n}-1700000000000", b"Q3 report", marks, mime="application/octet-stream")
+
+
+def test_delete_account_purges_both_kinds(hosted, google, caplog):
+    import logging
+    connect(hosted, google, register(hosted)["client_id"])
+    drive = google.drive(DENIS_SUB)
+    mine = [put_answer_file(drive, 1, 1), put_reply_file(drive, 1, 1), put_reply_file(drive, 2, 3, secret=True)]
+    others = [
+        drive.add("tfile-9-1-1700000000000", b"x", {}),  # no marks: not ours
+        drive.add("tfile-9-2-1700000000000", b"x", {"kind": "voice", "task_id": "9", "file": "2"}),
+        drive.add("tfile-9-3-1700000000000", b"x", {"kind": "file", "task_id": "8", "file": "3"}),  # another task's
+        drive.add("tfile-9-4-1700000000000", b"x", {"kind": "file", "task_id": "9", "file": "5"}),  # another item's
+        put_reply_file(drive, 9, 6, ask_id="9"),  # both kinds' marks: nobody's
+        put_answer_file(drive, 9, 7, task_id="9"),  # the same, named as an ask's
+        drive.add("tfile-notes", b"x", {"kind": "file", "task_id": "9", "file": "1"}),  # not our name
+        drive.add("task-1.json", {"id": 1}, {"task_id": "1"}),
+    ]
+    caplog.set_level(logging.INFO)
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    assert not any(file_id in drive.files for file_id in mine)
+    assert all(file_id in drive.files for file_id in others)  # the tasks and everything not marked stay
+    assert "3 answer files deleted from Drive, 0 not, 0 left past the cap" in caplog.text
+    assert len(google.revocations) == 1  # and the grant went after the files
+    assert "tfile-" not in caplog.text and "Q3 report" not in caplog.text
+
+
+def test_the_purge_cap_counts_both_kinds_together(hosted, google, monkeypatch, caplog):
+    import logging
+    from server.hosted import sweep as sweep_module
+    connect(hosted, google, register(hosted)["client_id"])
+    drive = google.drive(DENIS_SUB)
+    files = [put_answer_file(drive, 1, n) for n in (1, 2)] + [put_reply_file(drive, 1, n) for n in (1, 2, 3)]
+    monkeypatch.setattr(sweep_module, "PURGE_LIMIT", 3)
+    caplog.set_level(logging.INFO)
+    assert hosted.delete("/api/me", headers=id_token(google)).status_code == 204
+    assert sum(f in drive.files for f in files) == 2
+    assert "3 answer files deleted from Drive, 0 not, 2 left past the cap" in caplog.text

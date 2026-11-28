@@ -447,8 +447,9 @@ def _pruned(task: dict, n: int, expect: tuple[int, str] | None, sent_detail: str
     item of a file that is gone, which the user's next reply pruned from reply_files (410, like a deleted item). Told
     apart by the snapshot in the `files` of one of the user's `replied` events (ids are never reused); through a link
     it must be the event `reply_id`, its snapshot naming this file_id. «Sent» (`sent_detail`, else SENT) when the
-    snapshot was a secret file and the history holds its `file_downloaded`, so «a second call says it was already
-    sent» holds after the prune."""
+    snapshot was a secret file and the history holds its `file_downloaded`, or a `file_deleted` with reason `sent`
+    (the sweep's record of a send whose own write failed, SPEC 8.5: it has no file_downloaded), so «a second call says
+    it was already sent» holds after the prune."""
     events = task.get("events") or []
     snapshot = None
     for event in events:
@@ -464,8 +465,10 @@ def _pruned(task: dict, n: int, expect: tuple[int, str] | None, sent_detail: str
                 snapshot = entry
     if snapshot is None:
         return _refuse(404, TASK_NO_SUCH)
-    sent = any(e.get("kind") == "file_downloaded" and isinstance(e.get("payload"), dict)
-               and _is_id(e["payload"].get("id")) and e["payload"]["id"] == n for e in events)
+    sent = any(isinstance(e.get("payload"), dict) and _is_id(e["payload"].get("id")) and e["payload"]["id"] == n
+               and (e.get("kind") == "file_downloaded"
+                    or (e.get("kind") == "file_deleted" and e["payload"].get("reason") == "sent"))
+               for e in events)
     if snapshot.get("secret") is True and sent:
         return _refuse(410, sent_detail or SENT)
     return _refuse(410, DELETED)
