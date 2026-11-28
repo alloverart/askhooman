@@ -3,6 +3,8 @@
 Pure functions like rules.py: TaskService (SQLite, tasks.py) and the hosted bridge (Drive files) both apply them.
 Statuses: active <-> waiting (update), active|waiting -> done|dropped, done|dropped -> active (reopen).
 Only the owner agent writes its tasks; the human's token reads everything and writes nothing (403).
+Files in replies (SPEC 8.1, hosted only): the apps write `reply_files` with the `replied` event; the rules here only
+read the ids a reply carried (reply.files) and stamp the items that still have a file when the task is finished.
 """
 
 import re
@@ -58,6 +60,10 @@ OWNER_KINDS = ("answered", "edited", "status", "done", "dropped", "reopened", "a
 # task starts without one).
 QUESTION_CLOSERS = ("replied", "unasked", "done", "dropped")
 DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+# Files in task replies (SPEC 8.1): only the user's apps write the list, in the write of their `replied` event, and
+# only on the hosted bridge (hosted/files.py checks it); no tool or REST body sets it, and the single-tenant bridge
+# always has [] (no column).
+REPLY_FILES = "reply_files"
 
 
 # ---------- validation ----------
@@ -147,7 +153,10 @@ def plan_task_update(who: Identity, data: dict, load: Loader, now: str) -> tuple
 
 
 def plan_finish(who: Identity, status: str, resolution, load: Loader, now: str) -> tuple[dict, Change]:
-    """done or dropped, with an optional resolution."""
+    """done or dropped, with an optional resolution. The files of the task's replies stay for the record without
+    their Drive files, as plan_close keeps an ask's (SPEC 8.1): every item that still has one is stamped `finished`
+    in the same write (the hosted bridge deletes the files). The field is only written when there is such an item,
+    so the single-tenant store, which has none, never sees it."""
     resolution = _text(resolution, "resolution", RESOLUTION_MAX)
     verb = "finish" if status == "done" else "drop"
     task = load()
@@ -155,6 +164,10 @@ def plan_finish(who: Identity, status: str, resolution, load: Loader, now: str) 
     if task["status"] not in OPEN:
         raise Conflict(f"task #{task['id']} is already {task['status']}")
     updates = {"status": status, "resolution": resolution, "finished_at": now, "updated_at": now}
+    files = task.get(REPLY_FILES) or []
+    if any(f.get("file_id") is not None for f in files):
+        updates[REPLY_FILES] = [{**f, "file_id": None, "deleted_at": now, "deleted_reason": "finished"}
+                                if f.get("file_id") is not None else f for f in files]
     return task, Change(updates, status, {"resolution": resolution, "previous_status": task["status"]}, now)
 
 
@@ -237,10 +250,21 @@ def _check_open(task: dict, why: str) -> None:
         raise Conflict(f"task #{task['id']} is {task['status']}; {why}")
 
 
+def reply_file_ids(payload) -> list[int]:
+    """The ids of the files a `replied` event carried (its payload's `files`, SPEC 8.1): the `id` of every object in
+    it whose id is an int and not a bool, in order; [] for anything else (an older event has no `files`)."""
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(files, list):
+        return []
+    return [f["id"] for f in files
+            if isinstance(f, dict) and isinstance(f.get("id"), int) and not isinstance(f.get("id"), bool)]
+
+
 def reply_state(events: list) -> dict:
-    """`reply` = the user's latest reply {id, at, text, preset} or None; `reply_pending` while it is newer than
-    every event of the owner. Derived from the events, never stored. Non-dict events and events without an int
-    id don't count."""
+    """`reply` = the user's latest reply {id, at, text, preset, files} or None, `files` the ids of the files it
+    carried (reply_file_ids: ids only, the same for every reader); `reply_pending` while it is newer than every event
+    of the owner. Derived from the events, never stored. Non-dict events and events without an int id don't
+    count."""
     last_reply, last_owner = None, 0
     for event in events:
         if not isinstance(event, dict) or not isinstance(event.get("id"), int) or isinstance(event.get("id"), bool):
@@ -254,7 +278,7 @@ def reply_state(events: list) -> dict:
         return {"reply": None, "reply_pending": False}
     payload = last_reply.get("payload") if isinstance(last_reply.get("payload"), dict) else {}
     reply = {"id": last_reply["id"], "at": last_reply.get("at"), "text": payload.get("text"),
-             "preset": payload.get("preset")}
+             "preset": payload.get("preset"), "files": reply_file_ids(payload)}
     return {"reply": reply, "reply_pending": last_reply["id"] > last_owner}
 
 

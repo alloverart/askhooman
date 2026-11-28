@@ -22,6 +22,11 @@ writes the media files): read as a list of objects and `[]` on older files. A cr
 user's apps write it; every read checks it (voice.clean_voice: null when bad, another answer's or on an open ask),
 every write of the bridge drops such a one, and an agent's close or reopen deletes the recording after the ask is
 written (HostedAsks). HOSTED_ASK is the ask Kind with both fields.
+
+Hosted tasks carry one more field than single-tenant ones: `reply_files` (SPEC 8.1 "Files in task replies"), written
+by the user's apps with their `replied` event. Every read checks it against the file's own events
+(files.clean_reply_files), every write of the bridge drops what that check drops, and a new task is written with [].
+HOSTED_TASK is the task Kind with it.
 """
 
 import copy
@@ -61,6 +66,7 @@ from ..rules import (
 from ..task_rules import (
     FINISHED,
     OPEN,
+    REPLY_FILES,
     default_limit,
     new_task_record,
     plan_finish,
@@ -76,7 +82,7 @@ from ..task_rules import (
 )
 from ..task_rules import STATUS_FILTERS as TASK_FILTERS
 from ..tokens import Identity
-from .files import FileClaims, FileLinks, clean_files
+from .files import FileClaims, FileLinks, clean_files, clean_reply_files
 from .voice import VoiceLinks, clean_voice, for_reader
 
 log = logging.getLogger("asks.hosted.records")
@@ -92,14 +98,21 @@ LOCK_STRIPES = 64
 ASK_STATUSES = ("open", "answered", "closed")
 TASK_STATUSES = OPEN + FINISHED
 ATTACHMENTS = "attachments"
-# the hosted bridge's ask
+# the hosted bridge's ask and task
 HOSTED_ASK = dataclasses.replace(ASK, fields=(*ASK.fields, ANSWER_VOICE, ANSWER_FILES, ATTACHMENTS))
+HOSTED_TASK = dataclasses.replace(TASK, fields=(*TASK.fields, REPLY_FILES))
 
 
 def new_hosted_record(who: Identity, ask_id: int, fields: dict, now: str) -> dict:
     """A fresh open ask as the hosted REST returns it: rules.new_record plus `answer_voice` (null) and `answer_files` ([]: only an answer from
     the apps sets them) and `attachments` (empty until the media service adds the files)."""
     return {**new_record(who, ask_id, fields, now), ANSWER_VOICE: None, ANSWER_FILES: [], ATTACHMENTS: []}
+
+
+def new_hosted_task_record(who: Identity, task_id: int, fields: dict, now: str) -> dict:
+    """A fresh task as the hosted REST returns it: task_rules.new_task_record plus `reply_files` ([]: only a reply
+    from the apps adds to it)."""
+    return {**new_task_record(who, task_id, fields, now), REPLY_FILES: []}
 
 
 class BadFile(Unavailable):
@@ -322,14 +335,20 @@ class DriveCollection:
             record[ANSWER_VOICE] = clean_voice(record[ANSWER_VOICE], record.get("answered_at"), record.get("status"))
         if ANSWER_FILES in record:  # the same for the files: checked, this answer's, [] on an open ask
             record[ANSWER_FILES] = clean_files(record[ANSWER_FILES], record.get("answered_at"), record.get("status"))
+        if REPLY_FILES in record:  # a task's: checked against the file's own replies; the status keeps them all
+            record[REPLY_FILES] = clean_reply_files(record[REPLY_FILES], doc.get("events"))
         return record
 
     def _drop_bad_answer(self, doc: dict) -> None:
+        """What a read drops leaves the file on the bridge's writes: a voice answer or answer files that read as
+        null / [] here, a task's reply files that clean_reply_files drops. An absent or empty list stays as it is."""
         if ANSWER_VOICE in self.kind.fields and doc.get(ANSWER_VOICE) is not None \
                 and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at"), doc.get("status")) is None:
             doc[ANSWER_VOICE] = None
         if ANSWER_FILES in self.kind.fields and doc.get(ANSWER_FILES) not in (None, []):
             doc[ANSWER_FILES] = clean_files(doc[ANSWER_FILES], doc.get("answered_at"), doc.get("status"))
+        if REPLY_FILES in self.kind.fields and doc.get(REPLY_FILES) not in (None, []):
+            doc[REPLY_FILES] = clean_reply_files(doc[REPLY_FILES], doc.get("events"))
 
     def _missing(self, item_id) -> NotFound:
         return NotFound(f"no {self.kind.name} #{item_id}")
@@ -479,7 +498,8 @@ class DriveCollection:
 
     def _write(self, who: Identity, item_id: int, meta: dict, doc: dict, change: Change) -> dict:
         # answer_voice (and answer_files) that read as null (bad, another answer's, or on an open ask: an older app kept it) is dropped,
-        # checked on the file as read and again as written: a close must not make one left on an open ask valid again
+        # checked on the file as read and again as written: a close must not make one left on an open ask valid again;
+        # a task's reply_files keep only what a read keeps
         self._drop_bad_answer(doc)
         doc.update(change.updates)
         self._drop_bad_answer(doc)
@@ -641,10 +661,10 @@ class HostedAsks:
 
 
 class HostedTasks:
-    """TaskService's interface over one user's Drive."""
+    """TaskService's interface over one user's Drive. A task carries `reply_files`, as checked on read (SPEC 8.1)."""
 
     def __init__(self, records: UserRecords):
-        self.items = DriveCollection(records, TASK, TASK_FILTERS, TASK_STATUSES, task_order, ("links",),
+        self.items = DriveCollection(records, HOSTED_TASK, TASK_FILTERS, TASK_STATUSES, task_order, ("links",),
                                      {"active": 0, "waiting": 0, "done": 1, "dropped": 1},
                                      decorate=lambda record, events: {**record, **task_state(events)})
 
@@ -655,7 +675,7 @@ class HostedTasks:
         return self.items.list(status, agent, default_limit(status, limit))
 
     def create(self, who: Identity, data: dict) -> dict:
-        return self.items.create(who, plan_task_create(who, data), new_task_record)
+        return self.items.create(who, plan_task_create(who, data), new_hosted_task_record)
 
     def update(self, who: Identity, task_id: int, data: dict) -> dict:
         return self.items.mutate(who, task_id, lambda load: plan_task_update(who, data, load, utc_now()))

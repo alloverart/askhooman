@@ -98,6 +98,7 @@ def ask_from_row(row: sqlite3.Row) -> dict:
 def task_from_row(row: sqlite3.Row) -> dict:
     task = {field: row[field] for field in TASK_FIELDS}
     task["links"] = json.loads(task["links"] or "[]")
+    task["reply_files"] = []  # files in task replies live on the hosted bridge only (SPEC 8.1): always empty here
     return task
 
 

@@ -86,7 +86,7 @@ def test_reply_state():
     edited = {"id": 3, "actor": "bot", "kind": "edited", "at": "c", "payload": {}}
     assert reply_state([created]) == {"reply": None, "reply_pending": False}
     assert reply_state([created, replied]) == {
-        "reply": {"id": 2, "at": "b", "text": "Status?", "preset": "status"}, "reply_pending": True}
+        "reply": {"id": 2, "at": "b", "text": "Status?", "preset": "status", "files": []}, "reply_pending": True}
     assert reply_state([created, replied, edited])["reply_pending"] is False
     assert reply_state([created, replied, {"id": 9, "kind": "weird"}])["reply_pending"] is True  # unknown kinds
     assert reply_state([created, replied, "junk", {"kind": "answered"}])["reply_pending"] is True  # no int id
@@ -94,7 +94,8 @@ def test_reply_state():
     answered = {"id": 4, "actor": "bot", "kind": "answered", "at": "d", "payload": {"text": "On it"}}
     again = {"id": 5, "actor": "denis", "kind": "replied", "at": "e", "payload": {"text": "Thanks", "preset": None}}
     state = reply_state([created, replied, answered, again])
-    assert state == {"reply": {"id": 5, "at": "e", "text": "Thanks", "preset": None}, "reply_pending": True}
+    assert state == {"reply": {"id": 5, "at": "e", "text": "Thanks", "preset": None, "files": []},
+                     "reply_pending": True}
     for kind in ("answered", "edited", "status", "done", "dropped", "reopened"):
         assert reply_state([replied, {"id": 7, "kind": kind}])["reply_pending"] is False, kind
 

@@ -1,4 +1,5 @@
-"""Files in answers on hosted asks (SPEC section 7.2 "Data model"): what the ask's `answer_files` may be.
+"""Files in answers on hosted asks (SPEC section 7.2 "Data model") and in replies on hosted tasks (8.1 "Data model"):
+what the ask's `answer_files` and the task's `reply_files` may be.
 
 The user's apps upload each file to the user's Drive appDataFolder (afile-<ask id>-<n>-<unix ms>, appProperties ask_id
 and kind "file") and write `answer_files` with the answer, in the same write. No MCP tool or REST body sets it. The
@@ -17,6 +18,13 @@ reads as [], on a `closed` one it is shown as stored (the route gives no downloa
     uploaded_at, answered_at (the ask's), downloaded_at, blocked_at, deleted_at: ISO-8601 stamps, the last three or null
     deleted_reason null, or sent, closed, reopened, expired, replaced
 
+A reply's file is the same item with reply_id and replied_at (the id and `at` of the `replied` event that carried it)
+in place of answered_at, and deleted_reason null, sent, finished or expired (REPLY_ITEM_KEYS). The apps upload it as
+tfile-<task id>-<n>-<unix ms> (appProperties task_id and kind "file") and add it to `reply_files` in the write of their
+reply; clean_reply_files reads the list back against the task file's own events. A reply is a new message, not a
+changed answer: the files of several replies coexist (at most MAX_FILES a reply, MAX_TASK_FILES a task), none goes
+stale, and the task's status never empties the list.
+
 Nothing here touches Drive or logs anything of a file.
 """
 
@@ -26,10 +34,13 @@ import re
 import secrets
 import time
 import unicodedata
+from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..rules import Invalid
+from ..task_rules import REPLY_FILES
 from .crypto import CryptoError
 from .store import DELETE, UNCHANGED, Store
 from .voice import FILE_ID, LINK_TTL, MEDIA_PATH, STAMP_MAX, TOKEN_MAX, _iso
@@ -45,9 +56,15 @@ FILE_ORPHAN = 24 * 3600  # seconds: the same for a normal file
 REQUEST_TIMEOUT = 900  # seconds a download may take
 CLOCK_SLACK = 600  # seconds a client's clock may differ from Drive's before Drive's createdTime decides (SPEC 7.6)
 
+MAX_TASK_FILES = 30  # the most items a task's reply_files holds (SPEC 8.1): files add up over a task's life
+
 ITEM_KEYS = ("id", "name", "mime", "bytes", "file_id", "secret", "uploaded_at", "answered_at", "downloaded_at",
              "blocked_at", "deleted_at", "deleted_reason")
 DELETED_REASONS = ("sent", "closed", "reopened", "expired", "replaced")
+# A reply's item (SPEC 8.1): an answer's, with reply_id and replied_at in place of answered_at, and its own reasons
+REPLY_ITEM_KEYS = ("id", "name", "mime", "bytes", "file_id", "secret", "uploaded_at", "reply_id", "replied_at",
+                   "downloaded_at", "blocked_at", "deleted_at", "deleted_reason")
+REPLY_DELETED_REASONS = ("sent", "finished", "expired")
 NAME_MAX = 200
 OCTET_STREAM = "application/octet-stream"
 MIME = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
@@ -107,13 +124,14 @@ def _stamp(value) -> bool:
     return isinstance(value, str) and 0 < len(value) <= STAMP_MAX
 
 
-def _item(value, answered_at, index: int) -> dict:
-    """One well-formed item in ITEM_KEYS order with its name cleaned and its mime normalised; Invalid, with the
-    field's path, for anything else."""
-    path = f"{FIELD}[{index}]"
+def _checked(value, keys: tuple, reasons: tuple, path: str, own: Callable[[dict], None]) -> dict:
+    """The checks an answer's item and a reply's item share (SPEC 7.2, 8.1): every key of `keys` there; id, name,
+    secret, bytes, mime, file_id with deleted_at, deleted_reason (one of `reasons`), uploaded_at, downloaded_at,
+    blocked_at. `own(value)` checks the kind's own keys after uploaded_at (raising Invalid). Returns the item in `keys`
+    order with its name cleaned and its mime normalised; Invalid, with the field's path, for anything else."""
     if not isinstance(value, dict):
         raise Invalid(f"{path} must be an object")
-    for key in ITEM_KEYS:
+    for key in keys:
         if key not in value:
             raise Invalid(f"{path}.{key} is missing")
     if not _count(value["id"], 1, 2**53):
@@ -141,17 +159,41 @@ def _item(value, answered_at, index: int) -> dict:
     elif deleted_at is not None:
         raise Invalid(f"{path}.file_id must be null when deleted_at is set")
     reason = value["deleted_reason"]
-    if reason is not None and (deleted_at is None or reason not in DELETED_REASONS):
-        raise Invalid(f"{path}.deleted_reason must be null or one of {', '.join(DELETED_REASONS)}, with deleted_at set")
-    for key in ("uploaded_at", "answered_at"):
-        if not _stamp(value[key]):
-            raise Invalid(f"{path}.{key} must be an ISO-8601 timestamp")
-    if value["answered_at"] != answered_at:
-        raise Invalid(f"{path}.answered_at must be the ask's answered_at")
+    if reason is not None and (deleted_at is None or reason not in reasons):
+        raise Invalid(f"{path}.deleted_reason must be null or one of {', '.join(reasons)}, with deleted_at set")
+    if not _stamp(value["uploaded_at"]):
+        raise Invalid(f"{path}.uploaded_at must be an ISO-8601 timestamp")
+    own(value)
     for key in ("downloaded_at", "blocked_at"):
         if value[key] is not None and not _stamp(value[key]):
             raise Invalid(f"{path}.{key} must be an ISO-8601 timestamp or null")
-    return {**{key: value[key] for key in ITEM_KEYS}, "name": clean_name(value["name"]), "mime": mime}
+    return {**{key: value[key] for key in keys}, "name": clean_name(value["name"]), "mime": mime}
+
+
+def _item(value, answered_at, index: int) -> dict:
+    """One well-formed item of an answer in ITEM_KEYS order with its name cleaned and its mime normalised; Invalid,
+    with the field's path, for anything else (an answered_at that is not the ask's included)."""
+    path = f"{FIELD}[{index}]"
+
+    def own(value):
+        if not _stamp(value["answered_at"]):
+            raise Invalid(f"{path}.answered_at must be an ISO-8601 timestamp")
+        if value["answered_at"] != answered_at:
+            raise Invalid(f"{path}.answered_at must be the ask's answered_at")
+    return _checked(value, ITEM_KEYS, DELETED_REASONS, path, own)
+
+
+def _reply_item(value, index: int) -> dict:
+    """One well-formed item of a task's reply_files in REPLY_ITEM_KEYS order, cleaned as _item cleans an answer's;
+    Invalid, with the field's path, for anything else. Which reply it names is clean_reply_files' check."""
+    path = f"{REPLY_FILES}[{index}]"
+
+    def own(value):
+        if not _count(value["reply_id"], 1, 2**53):
+            raise Invalid(f"{path}.reply_id must be a positive integer")
+        if not _stamp(value["replied_at"]):
+            raise Invalid(f"{path}.replied_at must be an ISO-8601 timestamp")
+    return _checked(value, REPLY_ITEM_KEYS, REPLY_DELETED_REASONS, path, own)
 
 
 def validate_files(value, answered_at: str) -> list[dict]:
@@ -188,6 +230,41 @@ def clean_files(value, answered_at, status) -> list[dict]:
         if one["id"] in seen or len(items) >= MAX_FILES:
             continue
         seen.add(one["id"])
+        items.append(one)
+    return items
+
+
+def _replies(events) -> set[tuple[int, str]]:
+    """(id, at) of every `replied` event of the user (actor denis) among a task's events; junk is no event."""
+    if not isinstance(events, list):
+        return set()
+    return {(e["id"], e["at"]) for e in events
+            if isinstance(e, dict) and e.get("kind") == "replied" and e.get("actor") == "denis"
+            and isinstance(e.get("id"), int) and not isinstance(e.get("id"), bool) and isinstance(e.get("at"), str)}
+
+
+def clean_reply_files(value, events) -> list[dict]:
+    """A task's reply_files as the bridge reads it (SPEC 8.1 «Which items count»), checked against the task file's own
+    `events`: [] for anything that isn't a list (an older task has none), and per item: dropped when it is malformed,
+    when its (reply_id, replied_at) is not the (id, at) of a `replied` event of the user, when it repeats an id, when
+    it would be the seventh kept of its reply (MAX_FILES), or after MAX_TASK_FILES kept ones. A reply is never
+    replaced, so no later reply makes an item stale, and the task's status never empties the list: on a finished task
+    it is as stored (the route gives no download then)."""
+    if not isinstance(value, list):
+        return []
+    replies = _replies(events)
+    items, seen, per_reply = [], set(), Counter()
+    for index, raw in enumerate(value):
+        try:
+            one = _reply_item(raw, index)
+        except Invalid:
+            continue
+        if (one["reply_id"], one["replied_at"]) not in replies:
+            continue
+        if one["id"] in seen or per_reply[one["reply_id"]] >= MAX_FILES or len(items) >= MAX_TASK_FILES:
+            continue
+        seen.add(one["id"])
+        per_reply[one["reply_id"]] += 1
         items.append(one)
     return items
 
