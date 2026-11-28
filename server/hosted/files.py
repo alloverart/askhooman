@@ -379,10 +379,17 @@ def claim_key(user: str, ask_id: int, file_id: str) -> str:
     return hashlib.sha256(json.dumps([user, ask_id, file_id]).encode("utf-8")).hexdigest()
 
 
+def task_claim_key(user: str, task_id: int, file_id: str) -> str:
+    """The id of the claim document of a reply's secret file (SPEC 8.3 «Secret file»): the digest of [user, "task",
+    task_id, file_id], a shape no ask's key has, so task #3's claim is never ask #3's with the same Drive file."""
+    return hashlib.sha256(json.dumps([user, "task", task_id, file_id]).encode("utf-8")).hexdigest()
+
+
 class FileClaims:
     """Claims of secret files in the metadata store, collection `fileclaims`, changed only in store transactions (a
     Firestore transaction in production, a lock in MemoryStore), so two requests at the same instant on two instances
-    cannot both take one. A document: {user, ask_id, state: "held" | "done", until, owner}. States: none (no document),
+    cannot both take one. A document: {user, ask_id, state: "held" | "done", until, owner}; a reply's secret file has
+    one with task_id in place of ask_id, keyed by task_claim_key (SPEC 8.3). States: none (no document),
     held until `until` by `owner`, done (the file has been sent; `expires_at` 90 days on)."""
 
     def __init__(self, store: Store):
@@ -425,5 +432,12 @@ class FileClaims:
     def delete_for_ask(self, user: str, ask_id: int) -> None:
         """The claims of one ask of one user (the ask was closed or reopened)."""
         for key, doc in self.store.find(CLAIMS_COLLECTION, "ask_id", ask_id):
+            if doc.get("user") == user:
+                self.store.delete(CLAIMS_COLLECTION, key)
+
+    def delete_for_task(self, user: str, task_id: int) -> None:
+        """The claims of one task of one user (the task was finished, SPEC 8.3): its documents name `task_id` and no
+        `ask_id`, so this finds none of an ask's, and delete_for_ask none of a task's."""
+        for key, doc in self.store.find(CLAIMS_COLLECTION, "task_id", task_id):
             if doc.get("user") == user:
                 self.store.delete(CLAIMS_COLLECTION, key)

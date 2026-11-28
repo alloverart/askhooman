@@ -27,7 +27,8 @@ Hosted tasks carry one more field than single-tenant ones: `reply_files` (SPEC 8
 by the user's apps with their `replied` event. Every read checks it against the file's own events
 (files.clean_reply_files), every write of the bridge drops what that check drops, and a new task is written with [].
 HOSTED_TASK is the task Kind with it. An agent gets every task through the reader's view (voice.for_task_reader,
-SPEC 8.3): no Drive file id, and a link to a normal file only for the agent that owns the task (HostedTasks).
+SPEC 8.3): no Drive file id, and a link to a normal file only for the agent that owns the task (HostedTasks). An
+agent's done or drop deletes the files and their claims after the task is written (HostedTasks).
 """
 
 import copy
@@ -666,7 +667,8 @@ class HostedTasks:
     With a `reader` (an agent's calls) every task returned is as that agent gets it (voice.for_task_reader, SPEC 8.3):
     no Drive file id, and the owner's normal files with a link (`file_links`) only from get and from list with
     file_urls (task_get, REST GET /api/tasks/{id}, tasks_mine). Without one (the bridge's own reads: the webhook, the
-    file routes, the sweep) the task is as checked. `claims` holds the claims of secret files (files.FileClaims)."""
+    file routes, the sweep) the task is as checked. `claims` holds the claims of secret files (files.FileClaims). A
+    done or a drop deletes the Drive files the task's replies had, then its claims (SPEC 8.3)."""
 
     def __init__(self, records: UserRecords, reader: Identity | None = None, file_links: TaskFileLinks | None = None,
                  claims: FileClaims | None = None):
@@ -700,12 +702,10 @@ class HostedTasks:
         return self._out(self.items.mutate(who, task_id, lambda load: plan_task_update(who, data, load, utc_now())))
 
     def done(self, who: Identity, task_id: int, resolution=None) -> dict:
-        return self._out(self.items.mutate(who, task_id,
-                                           lambda load: plan_finish(who, "done", resolution, load, utc_now())))
+        return self._finishing(who, task_id, lambda load: plan_finish(who, "done", resolution, load, utc_now()))
 
     def drop(self, who: Identity, task_id: int, resolution=None) -> dict:
-        return self._out(self.items.mutate(who, task_id,
-                                           lambda load: plan_finish(who, "dropped", resolution, load, utc_now())))
+        return self._finishing(who, task_id, lambda load: plan_finish(who, "dropped", resolution, load, utc_now()))
 
     def reopen(self, who: Identity, task_id: int) -> dict:
         return self._out(self.items.mutate(who, task_id, lambda load: plan_task_reopen(who, load, utc_now())))
@@ -722,4 +722,56 @@ class HostedTasks:
     def unask(self, who: Identity, task_id: int, data: dict) -> dict:
         return self._out(self.items.mutate(who, task_id, lambda load: plan_task_unask(who, data, load, utc_now()),
                                            with_events=True))
+
+    def _finishing(self, who: Identity, task_id: int, plan) -> dict:
+        """A done or a drop, which ends the files of the task's replies (SPEC 8.3 «Finishing deletes at once»): the
+        write stamps every item that has a Drive file `finished` (plan_finish), then the bridge deletes those files
+        and the task's claims, best effort, as HostedAsks._ending does for an answer. Reopening brings none back."""
+        ended: dict = {}
+
+        def planned(load):
+            current, change = plan(load)
+            ended["files"] = current.get(REPLY_FILES) or []  # as checked on read: what the write stamped
+            return current, change
+
+        task = self.items.mutate(who, task_id, planned)
+        for item in ended.get("files", []):
+            if item.get("file_id") is not None:
+                self._delete_reply_file(task_id, item["id"], item["file_id"], "finished")
+        try:
+            self._drop_claims(task_id)
+        except Exception as exc:  # the task is written: a claim left behind is the sweep's
+            log.warning("hosted: could not delete the claims of task #%s (left to the sweep): %s", task_id,
+                        type(exc).__name__)
+        return self._out(task)
+
+    def _drop_claims(self, task_id: int) -> None:
+        """The seam of the claim documents of the task's secret files (SPEC 8.3 «Secret file»): called after every
+        done or drop by the agent, once the task is written."""
+        if self.claims is not None:
+            self.claims.delete_for_task(self.items.records.sub, task_id)
+
+    def _delete_reply_file(self, task_id: int, item_id: int, file_id: str, reason: str) -> bool:
+        """One file of the task's replies, best effort: deleted only when Drive says it is a file of this task
+        (appProperties kind "file", task_id and file = the item id, and no ask_id: a file of an ask is never a task's,
+        whatever an item names). A failure is logged with ids only (never a name, a message that could carry a link,
+        or content) and the file is left to the sweep: what is written stands. True if the file is gone from Drive
+        (deleted now, or already gone), False if it is still there (not this task's, or a failure). Never raises."""
+        records = self.items.records
+        try:
+            meta = records.call(records.drive.get_meta, file_id)
+            if meta is None:
+                return True  # already gone
+            props = meta.get("appProperties") or {}
+            if (props.get("kind") != "file" or props.get("task_id") != str(task_id)
+                    or props.get("file") != str(item_id) or "ask_id" in props):
+                log.warning("hosted: file %s named by task #%s item %s is not its reply file: not deleted", file_id,
+                            task_id, item_id)
+                return False
+            records.call(records.drive.delete, file_id)
+            return True
+        except Exception as exc:  # nothing may fail what is already written
+            log.warning("hosted: could not delete reply file %s of task #%s item %s on %s (left to the sweep): %s",
+                        file_id, task_id, item_id, reason, type(exc).__name__)
+            return False
 

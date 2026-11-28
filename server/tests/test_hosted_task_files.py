@@ -3,7 +3,10 @@ file's own `replied` events, the derived `reply.files`, the finish stamp, and th
 what an agent sees of them (8.3): the reader's view, the `taskfile` links of the owner agent, the task.replied body."""
 
 import base64
+import hashlib
 import json
+import logging
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -15,6 +18,7 @@ from server.hosted import files
 from server.hosted.accounts import HostedIdentity
 from server.hosted.crypto import Keyring
 from server.hosted.files import (
+    CLAIMS_COLLECTION,
     MAX_FILE_BYTES,
     MAX_SECRET_BYTES,
     MAX_TASK_FILES,
@@ -22,11 +26,15 @@ from server.hosted.files import (
     REPLY_ITEM_KEYS,
     TASK_CLAIMS,
     TASK_LINK_CONTEXT,
+    FileClaims,
     FileLinks,
     TaskFileLinks,
+    claim_key,
     clean_reply_files,
+    task_claim_key,
 )
 from server.hosted.records import HostedTasks
+from server.hosted.store import MemoryStore
 from server.hosted.voice import AGENT_TASK_FILE_KEYS, VoiceLinks, for_task_reader
 from server.rules import Invalid
 from server.task_rules import REPLY_FILES, plan_finish, plan_task_reply, reply_file_ids, reply_state
@@ -36,9 +44,10 @@ from .conftest import ALLEN as ALLEN_TOKEN
 from .conftest import DENIS as DENIS_TOKEN
 from .conftest import auth
 from .fake_drive import app_task_reply, app_task_reply_files, now_iso
-from .hosted_support import DENIS_SUB, id_token, mcp, tool_result
+from .hosted_support import DENIS_SUB, id_token, mcp, tool_error, tool_result
 from .test_hosted_attachments import tools_list
-from .test_hosted_files import AT, KEY, PUBLIC, item, owner_reader
+from .test_hosted_files import AT, KEY, PUBLIC, answered_by_files, item, owner_reader
+from .test_hosted_files_api import put_file
 from .test_hosted_voice import agent, agent_id, bearer
 
 DENIS = Identity("denis")
@@ -735,3 +744,191 @@ def test_task_webhook_body_has_no_file_urls_or_file_ids(hosted, google):
         "type": "task.replied", "task_id": 1, "event": body["event"]}
     # the agent's own read still carries the link
     assert "/media/v1/" in tool_result(mcp(hosted, token, "task_get", {"id": 1}))[REPLY_FILES][0]["url"]
+
+
+# ---------- finishing deletes the files (SPEC 8.3 «Finishing deletes at once») ----------
+
+def task_claim(store, file_id: str, task_id: int = 1, user: str = DENIS_SUB) -> str:
+    """A claim document of a task's secret file, put into the store by hand as the claim machine leaves a sent one
+    (SPEC 8.3 «Secret file»: no ask_id). Returns its key."""
+    key = task_claim_key(user, task_id, file_id)
+    store.put(CLAIMS_COLLECTION, key, {"user": user, "task_id": task_id, "state": "done"})
+    return key
+
+
+def hosted_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("hosted:")]
+
+
+@pytest.mark.parametrize("tool", ["task_done", "task_drop"])
+def test_finish_deletes_the_files_and_reopen_brings_none_back(hosted, google, tool):
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "task_create", {"title": "Chase the supplier"}))
+    stored = two_files(drive)
+    file_ids = [f["file_id"] for f in stored]
+    assert all(file_id in drive.files for file_id in file_ids)
+    task_claim(hosted.store, file_ids[1])
+    finished = tool_result(mcp(hosted, token, tool, {"id": 1, "resolution": "Shipped"}))
+    assert finished["status"] == {"task_done": "done", "task_drop": "dropped"}[tool]
+    assert [(f["id"], f["deleted_reason"], f["downloaded_at"]) for f in finished[REPLY_FILES]] == [
+        (1, "finished", None), (2, "finished", None)]
+    assert all("file_id" not in f and f["deleted_at"] == drive.task_doc(1)["finished_at"]
+               for f in finished[REPLY_FILES])
+    assert all(file_id not in drive.files for file_id in file_ids)
+    assert [(f["file_id"], f["deleted_reason"]) for f in drive.task_doc(1)[REPLY_FILES]] == [(None, "finished")] * 2
+    assert hosted.store.all(CLAIMS_COLLECTION) == {}
+    # reopening brings no file back: the items stay deleted, the list still names them
+    deletes = len(drive.calls("DELETE"))
+    reopened = tool_result(mcp(hosted, token, "task_reopen", {"id": 1}))
+    assert reopened["status"] == "active" and reopened[REPLY_FILES] == finished[REPLY_FILES]
+    task = tasks_of(hosted).get(1)
+    assert [(f["id"], f["file_id"], f["deleted_reason"]) for f in task[REPLY_FILES]] == [
+        (1, None, "finished"), (2, None, "finished")]
+    assert task["reply"]["files"] == [1, 2]
+    assert len(drive.calls("DELETE")) == deletes
+    assert not [f for f in drive.files.values() if f["name"].startswith("tfile-")]
+    owned = tool_result(mcp(hosted, token, "task_get", {"id": 1}))[REPLY_FILES]
+    assert [list(f) for f in owned] == [TEN] * 2 and "/media/v1/" not in json.dumps(owned)  # nothing to link
+
+
+def test_a_failing_delete_leaves_the_finish_standing(hosted, google, caplog):
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "task_create", {"title": "Chase the supplier"}))
+    failing, deleted = [f["file_id"] for f in two_files(drive)]
+    drive.fail_next("DELETE", f"/drive/v3/files/{failing}", 500)  # the first delete fails: logged, the rest goes on
+    with caplog.at_level(logging.DEBUG):
+        done = tool_result(mcp(hosted, token, "task_done", {"id": 1}))
+    assert done["status"] == "done" and drive.task_doc(1)["status"] == "done"  # the finish stands
+    assert [(f["file_id"], f["deleted_reason"]) for f in drive.task_doc(1)[REPLY_FILES]] == [(None, "finished")] * 2
+    assert failing in drive.files and deleted not in drive.files  # left to the sweep
+    (warning,) = [r for r in caplog.records if failing in r.getMessage() and r.getMessage().startswith("hosted:")]
+    assert warning.levelno == logging.WARNING
+    assert "task #1" in warning.getMessage() and "item 1" in warning.getMessage()
+    assert "HTTP 500" not in " ".join(hosted_lines(caplog))
+    everything = " ".join(r.getMessage() for r in caplog.records)
+    assert "report1" not in everything and "keys.txt" not in everything
+
+
+def test_a_failing_claim_cleanup_does_not_fail_the_finish(hosted, google, caplog, monkeypatch):
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    for title in ("Chase the supplier", "Book the van"):
+        tool_result(mcp(hosted, token, "task_create", {"title": title}))
+    file_ids = [f["file_id"] for f in two_files(drive)]
+    key = task_claim(hosted.store, file_ids[1])
+
+    def boom(self, user, task_id):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(FileClaims, "delete_for_task", boom)
+    with caplog.at_level(logging.DEBUG):
+        assert tool_result(mcp(hosted, token, "task_done", {"id": 1}))["status"] == "done"
+        assert hosted.post("/api/tasks/2/drop", headers=bearer(token)).json()["status"] == "dropped"
+    assert drive.task_doc(1)["status"] == "done" and drive.task_doc(2)["status"] == "dropped"
+    assert all(file_id not in drive.files for file_id in file_ids)  # the files went before the claims
+    assert list(hosted.store.all(CLAIMS_COLLECTION)) == [key]  # left to the sweep
+    lines = hosted_lines(caplog)
+    assert [line for line in lines if "claims of task #" in line] == [
+        "hosted: could not delete the claims of task #1 (left to the sweep): RuntimeError",
+        "hosted: could not delete the claims of task #2 (left to the sweep): RuntimeError"]
+    assert "store down" not in " ".join(lines)
+
+
+def test_finish_deletes_only_files_drive_marks_as_this_tasks(hosted, google, caplog):
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    for title in ("Chase the supplier", "Book the van"):
+        tool_result(mcp(hosted, token, "task_create", {"title": title}))
+    own = put_task_file(drive, 1, 1)
+    not_its = {
+        "an ask's": put_file(drive, 1, 2),  # afile-1-2-…: ask #1's marks, the same number
+        "ask_id besides": put_task_file(drive, 1, 3, ask_id="1"),  # a file with ask_id is never a task's
+        "another task's": put_task_file(drive, 2, 4),  # tfile-2-4-…: task #2's
+        "another item's": put_task_file(drive, 1, 9),  # this task's, but its `file` names item 9
+        "another kind": put_task_file(drive, 1, 6, kind="voice"),
+    }
+    named = [own, *not_its.values()]
+    app_task_reply_files(drive, 1, [task_item(n, file_id=file_id) for n, file_id in enumerate(named, 1)])
+    with caplog.at_level(logging.DEBUG):
+        assert tool_result(mcp(hosted, token, "task_done", {"id": 1}))["status"] == "done"
+    assert own not in drive.files
+    lines = hosted_lines(caplog)
+    for n, (what, file_id) in enumerate(not_its.items(), 2):
+        assert file_id in drive.files, what
+        assert [line for line in lines if file_id in line] == [
+            f"hosted: file {file_id} named by task #1 item {n} is not its reply file: not deleted"], what
+    assert [(f["file_id"], f["deleted_reason"]) for f in drive.task_doc(1)[REPLY_FILES]] == [(None, "finished")] * 6
+    assert len(drive.calls("DELETE")) == 1
+
+
+def test_finishing_twice_is_409_and_deletes_nothing_more(hosted, google):
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "task_create", {"title": "Chase the supplier"}))
+    stored = two_files(drive)
+    assert hosted.post("/api/tasks/1/done", headers=bearer(token)).status_code == 200
+    task_claim(hosted.store, stored[1]["file_id"])  # a claim the store still holds: the sweep's from here on
+    deletes, claims, doc = len(drive.calls("DELETE")), hosted.store.all(CLAIMS_COLLECTION), drive.task_doc(1)
+    for path in ("/api/tasks/1/done", "/api/tasks/1/drop"):
+        again = hosted.post(path, headers=bearer(token))
+        assert (again.status_code, again.json()) == (409, {"detail": "task #1 is already done"}), path
+    for tool in ("task_done", "task_drop"):
+        assert "task #1 is already done" in tool_error(mcp(hosted, token, tool, {"id": 1}))
+    assert len(drive.calls("DELETE")) == deletes and hosted.store.all(CLAIMS_COLLECTION) == claims
+    assert drive.task_doc(1) == doc
+
+
+def test_task_claim_key_is_not_an_asks():
+    key = task_claim_key("u1", 1, "fid-1")
+    assert key != claim_key("u1", 1, "fid-1")
+    assert re.fullmatch("[0-9a-f]{64}", key) and re.fullmatch("[0-9a-f]{64}", claim_key("u1", 1, "fid-1"))
+    assert key == hashlib.sha256(json.dumps(["u1", "task", 1, "fid-1"]).encode("utf-8")).hexdigest()
+    assert len({key, task_claim_key("u2", 1, "fid-1"), task_claim_key("u1", 2, "fid-1"),
+                task_claim_key("u1", 1, "fid-2")}) == 4
+
+
+def test_ask_and_task_with_the_same_number_keep_their_own_files_and_claims(hosted, google):
+    """Ask #1 and task #1 (two sequences): finishing one deletes nothing of the other, Drive files and claims alike."""
+    token = agent(hosted, google)
+    drive = google.drive(DENIS_SUB)
+    tool_result(mcp(hosted, token, "ask_create", {"title": "Ship?"}))
+    tool_result(mcp(hosted, token, "task_create", {"title": "Chase the supplier"}))
+    ask_file = put_file(drive, 1, 1)
+    answered_by_files(drive, 1, [item(1, file_id=ask_file, secret=True, bytes=10)])
+    ask_claim = claim_key(DENIS_SUB, 1, ask_file)
+    hosted.store.put(CLAIMS_COLLECTION, ask_claim, {"user": DENIS_SUB, "ask_id": 1, "state": "done"})
+    task_file = put_task_file(drive, 1, 1, secret=True)
+    app_task_reply_files(drive, 1, [task_item(1, file_id=task_file, secret=True, bytes=10)])
+    task_key = task_claim(hosted.store, task_file)
+    tool_result(mcp(hosted, token, "ask_close", {"id": 1}))
+    assert ask_file not in drive.files and task_file in drive.files
+    assert list(hosted.store.all(CLAIMS_COLLECTION)) == [task_key]
+    assert tasks_of(hosted).get(1)[REPLY_FILES][0]["file_id"] == task_file
+    # the same ask answered again, with another file and claim: finishing task #1 leaves them
+    hosted.post("/api/asks/1/reopen", headers=bearer(token)).raise_for_status()
+    assert list(hosted.store.all(CLAIMS_COLLECTION)) == [task_key]
+    again = put_file(drive, 1, 2)
+    answered_by_files(drive, 1, [item(2, file_id=again, secret=True, bytes=10)])
+    again_claim = claim_key(DENIS_SUB, 1, again)
+    hosted.store.put(CLAIMS_COLLECTION, again_claim, {"user": DENIS_SUB, "ask_id": 1, "state": "done"})
+    tool_result(mcp(hosted, token, "task_done", {"id": 1}))
+    assert task_file not in drive.files and again in drive.files
+    assert list(hosted.store.all(CLAIMS_COLLECTION)) == [again_claim]
+    assert drive.doc(1)["answer_files"][0]["file_id"] == again
+    # FileClaims: each side deletes only documents that name it
+    store = MemoryStore()
+    claims = FileClaims(store)
+    asks = {"user": "u1", "ask_id": 1, "state": "done"}
+    tasks = {"user": "u1", "task_id": 1, "state": "done"}
+    elsewhere = {"user": "u2", "task_id": 1, "state": "done"}  # another user's task #1
+    for key, doc in (("a", asks), ("t", tasks), ("e", elsewhere)):
+        store.put(CLAIMS_COLLECTION, key, doc)
+    claims.delete_for_ask("u1", 1)
+    assert store.all(CLAIMS_COLLECTION) == {"t": tasks, "e": elsewhere}
+    store.put(CLAIMS_COLLECTION, "a", asks)
+    claims.delete_for_task("u1", 1)
+    assert store.all(CLAIMS_COLLECTION) == {"a": asks, "e": elsewhere}
+    claims.delete_for_task("u1", 2)
+    assert store.all(CLAIMS_COLLECTION) == {"a": asks, "e": elsewhere}
