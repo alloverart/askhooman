@@ -49,6 +49,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from ..db import utc_now
 from ..mcp_tools import IDENTITY_SCOPE_KEY
 from ..rules import Conflict, Invalid, NotFound
+from ..task_rules import reply_file_ids
 from .accounts import Accounts, HostedIdentity, NameTaken, agent_json
 from .config import HostedSettings
 from .crypto import CryptoError
@@ -59,7 +60,7 @@ from .ratelimit import RateLimiter
 from .records import DrivePool, HostedAsks, HostedTasks
 from .stats import admin_stats, internal_check
 from .sweep import purge_answer_files
-from .voice import VoiceLinks, for_reader
+from .voice import VoiceLinks, for_reader, for_task_reader
 from .webhooks import WebhookSender, check_webhook_url
 
 log = logging.getLogger("asks.hosted.app_api")
@@ -433,14 +434,15 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
         fed: feed events}."""
         records = pool.records(user.sub)
         if body.task_id is not None:
-            task = HostedTasks(records).get(body.task_id)
+            task = HostedTasks(records).get(body.task_id)  # the bridge's own read; each agent gets its view below
             replies = [e for e in task.pop("events") if e.get("kind") == "replied"]
             if not replies:
                 raise Conflict(f"task #{task['id']} has no reply")
             last = replies[-1]
             reply = last.get("payload") if isinstance(last.get("payload"), dict) else {}
             payload = {"type": "task.replied", "task": task,
-                       "reply": {"text": reply.get("text"), "preset": reply.get("preset")},
+                       "reply": {"text": reply.get("text"), "preset": reply.get("preset"),
+                                 "files": reply_file_ids(reply)},
                        "event": {"id": last.get("id"), "at": last.get("at")}, "sent_at": utc_now()}
             owner, record = task["agent"], {"task_id": task["id"]}
         else:
@@ -466,8 +468,12 @@ def add_app_api(app: FastAPI, settings: HostedSettings, accounts: Accounts, pool
             if not secret:
                 continue
             body = payload
-            if "ask" in payload and voice_links is not None:  # the owner's view: a voice answer carries its link
-                owner_view = HostedIdentity("agent", agent["slug"], user=user.sub, agent_id=agent["id"])
+            owner_view = HostedIdentity("agent", agent["slug"], user=user.sub, agent_id=agent["id"])
+            if "task" in payload:
+                # the owner's view (SPEC 8.3): no file id and no file url (the agent reads tasks_mine / task_get for
+                # links), a secret file only as {id, reply_id, secret}
+                body = {**payload, "task": for_task_reader(payload["task"], owner_view, file_urls=False)}
+            elif "ask" in payload and voice_links is not None:  # the owner's view: a voice answer carries its link
                 # the webhook carries no file url (the agent reads asks_mine / ask_get) and a secret file only as {id, secret}
                 body = {**payload, "ask": for_reader(payload["ask"], voice_links, owner_view, file_urls=False)}
             delivery = uuid.uuid4().hex

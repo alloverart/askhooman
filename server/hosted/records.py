@@ -22,6 +22,13 @@ writes the media files): read as a list of objects and `[]` on older files. A cr
 user's apps write it; every read checks it (voice.clean_voice: null when bad, another answer's or on an open ask),
 every write of the bridge drops such a one, and an agent's close or reopen deletes the recording after the ask is
 written (HostedAsks). HOSTED_ASK is the ask Kind with both fields.
+
+Hosted tasks carry one more field than single-tenant ones: `reply_files` (SPEC 8.1 "Files in task replies"), written
+by the user's apps with their `replied` event. Every read checks it against the file's own events
+(files.clean_reply_files), every write of the bridge drops what that check drops, and a new task is written with [].
+HOSTED_TASK is the task Kind with it. An agent gets every task through the reader's view (voice.for_task_reader,
+SPEC 8.3): no Drive file id, and a link to a normal file only for the agent that owns the task (HostedTasks). An
+agent's done or drop deletes the files and their claims after the task is written (HostedTasks).
 """
 
 import copy
@@ -61,6 +68,7 @@ from ..rules import (
 from ..task_rules import (
     FINISHED,
     OPEN,
+    REPLY_FILES,
     default_limit,
     new_task_record,
     plan_finish,
@@ -76,8 +84,8 @@ from ..task_rules import (
 )
 from ..task_rules import STATUS_FILTERS as TASK_FILTERS
 from ..tokens import Identity
-from .files import FileClaims, FileLinks, clean_files
-from .voice import VoiceLinks, clean_voice, for_reader
+from .files import FileClaims, FileLinks, TaskFileLinks, clean_files, clean_reply_files
+from .voice import VoiceLinks, clean_voice, for_reader, for_task_reader
 
 log = logging.getLogger("asks.hosted.records")
 
@@ -92,14 +100,21 @@ LOCK_STRIPES = 64
 ASK_STATUSES = ("open", "answered", "closed")
 TASK_STATUSES = OPEN + FINISHED
 ATTACHMENTS = "attachments"
-# the hosted bridge's ask
+# the hosted bridge's ask and task
 HOSTED_ASK = dataclasses.replace(ASK, fields=(*ASK.fields, ANSWER_VOICE, ANSWER_FILES, ATTACHMENTS))
+HOSTED_TASK = dataclasses.replace(TASK, fields=(*TASK.fields, REPLY_FILES))
 
 
 def new_hosted_record(who: Identity, ask_id: int, fields: dict, now: str) -> dict:
     """A fresh open ask as the hosted REST returns it: rules.new_record plus `answer_voice` (null) and `answer_files` ([]: only an answer from
     the apps sets them) and `attachments` (empty until the media service adds the files)."""
     return {**new_record(who, ask_id, fields, now), ANSWER_VOICE: None, ANSWER_FILES: [], ATTACHMENTS: []}
+
+
+def new_hosted_task_record(who: Identity, task_id: int, fields: dict, now: str) -> dict:
+    """A fresh task as the hosted REST returns it: task_rules.new_task_record plus `reply_files` ([]: only a reply
+    from the apps adds to it)."""
+    return {**new_task_record(who, task_id, fields, now), REPLY_FILES: []}
 
 
 class BadFile(Unavailable):
@@ -322,14 +337,20 @@ class DriveCollection:
             record[ANSWER_VOICE] = clean_voice(record[ANSWER_VOICE], record.get("answered_at"), record.get("status"))
         if ANSWER_FILES in record:  # the same for the files: checked, this answer's, [] on an open ask
             record[ANSWER_FILES] = clean_files(record[ANSWER_FILES], record.get("answered_at"), record.get("status"))
+        if REPLY_FILES in record:  # a task's: checked against the file's own replies; the status keeps them all
+            record[REPLY_FILES] = clean_reply_files(record[REPLY_FILES], doc.get("events"))
         return record
 
     def _drop_bad_answer(self, doc: dict) -> None:
+        """What a read drops leaves the file on the bridge's writes: a voice answer or answer files that read as
+        null / [] here, a task's reply files that clean_reply_files drops. An absent or empty list stays as it is."""
         if ANSWER_VOICE in self.kind.fields and doc.get(ANSWER_VOICE) is not None \
                 and clean_voice(doc[ANSWER_VOICE], doc.get("answered_at"), doc.get("status")) is None:
             doc[ANSWER_VOICE] = None
         if ANSWER_FILES in self.kind.fields and doc.get(ANSWER_FILES) not in (None, []):
             doc[ANSWER_FILES] = clean_files(doc[ANSWER_FILES], doc.get("answered_at"), doc.get("status"))
+        if REPLY_FILES in self.kind.fields and doc.get(REPLY_FILES) not in (None, []):
+            doc[REPLY_FILES] = clean_reply_files(doc[REPLY_FILES], doc.get("events"))
 
     def _missing(self, item_id) -> NotFound:
         return NotFound(f"no {self.kind.name} #{item_id}")
@@ -479,7 +500,8 @@ class DriveCollection:
 
     def _write(self, who: Identity, item_id: int, meta: dict, doc: dict, change: Change) -> dict:
         # answer_voice (and answer_files) that read as null (bad, another answer's, or on an open ask: an older app kept it) is dropped,
-        # checked on the file as read and again as written: a close must not make one left on an open ask valid again
+        # checked on the file as read and again as written: a close must not make one left on an open ask valid again;
+        # a task's reply_files keep only what a read keeps
         self._drop_bad_answer(doc)
         doc.update(change.updates)
         self._drop_bad_answer(doc)
@@ -641,44 +663,115 @@ class HostedAsks:
 
 
 class HostedTasks:
-    """TaskService's interface over one user's Drive."""
+    """TaskService's interface over one user's Drive. A task carries `reply_files`, as checked on read (SPEC 8.1).
+    With a `reader` (an agent's calls) every task returned is as that agent gets it (voice.for_task_reader, SPEC 8.3):
+    no Drive file id, and the owner's normal files with a link (`file_links`) only from get and from list with
+    file_urls (task_get, REST GET /api/tasks/{id}, tasks_mine). Without one (the bridge's own reads: the webhook, the
+    file routes, the sweep) the task is as checked. `claims` holds the claims of secret files (files.FileClaims). A
+    done or a drop deletes the Drive files the task's replies had, then its claims (SPEC 8.3)."""
 
-    def __init__(self, records: UserRecords):
-        self.items = DriveCollection(records, TASK, TASK_FILTERS, TASK_STATUSES, task_order, ("links",),
+    def __init__(self, records: UserRecords, reader: Identity | None = None, file_links: TaskFileLinks | None = None,
+                 claims: FileClaims | None = None):
+        self.items = DriveCollection(records, HOSTED_TASK, TASK_FILTERS, TASK_STATUSES, task_order, ("links",),
                                      {"active": 0, "waiting": 0, "done": 1, "dropped": 1},
                                      decorate=lambda record, events: {**record, **task_state(events)})
+        self.reader = reader
+        self.file_links = file_links
+        self.claims = claims
+
+    def _out(self, task: dict, file_urls: bool = False) -> dict:
+        """The task as the reader gets it; its normal files carry links only with `file_urls` (task_get, tasks_mine):
+        not in the everyone's view and not in what a write returns (SPEC 8.3)."""
+        if self.reader is None:
+            return task
+        return for_task_reader(task, self.reader, file_links=self.file_links if file_urls else None)
 
     def get(self, task_id: int, with_events: bool = True) -> dict:
-        return self.items.get(task_id, with_events)
+        return self._out(self.items.get(task_id, with_events), True)
 
-    def list(self, status: str = "open", agent: str | None = None, limit: int | None = None) -> dict:
-        return self.items.list(status, agent, default_limit(status, limit))
+    def list(self, status: str = "open", agent: str | None = None, limit: int | None = None,
+             file_urls: bool = False) -> dict:
+        """The tasks; a file link only with `file_urls` (tasks_mine), not in the everyone's view (SPEC 8.3)."""
+        found = self.items.list(status, agent, default_limit(status, limit))
+        return {**found, "tasks": [self._out(task, file_urls) for task in found["tasks"]]}
 
     def create(self, who: Identity, data: dict) -> dict:
-        return self.items.create(who, plan_task_create(who, data), new_task_record)
+        return self._out(self.items.create(who, plan_task_create(who, data), new_hosted_task_record))
 
     def update(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_update(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_update(who, data, load, utc_now())))
 
     def done(self, who: Identity, task_id: int, resolution=None) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_finish(who, "done", resolution, load, utc_now()))
+        return self._finishing(who, task_id, lambda load: plan_finish(who, "done", resolution, load, utc_now()))
 
     def drop(self, who: Identity, task_id: int, resolution=None) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_finish(who, "dropped", resolution, load, utc_now()))
+        return self._finishing(who, task_id, lambda load: plan_finish(who, "dropped", resolution, load, utc_now()))
 
     def reopen(self, who: Identity, task_id: int) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_reopen(who, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_reopen(who, load, utc_now())))
 
     def reply(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_reply(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_reply(who, data, load, utc_now())))
 
     def answer(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_answer(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_answer(who, data, load, utc_now())))
 
     def ask(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_ask(who, data, load, utc_now()))
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_ask(who, data, load, utc_now())))
 
     def unask(self, who: Identity, task_id: int, data: dict) -> dict:
-        return self.items.mutate(who, task_id, lambda load: plan_task_unask(who, data, load, utc_now()),
-                                 with_events=True)
+        return self._out(self.items.mutate(who, task_id, lambda load: plan_task_unask(who, data, load, utc_now()),
+                                           with_events=True))
+
+    def _finishing(self, who: Identity, task_id: int, plan) -> dict:
+        """A done or a drop, which ends the files of the task's replies (SPEC 8.3 «Finishing deletes at once»): the
+        write stamps every item that has a Drive file `finished` (plan_finish), then the bridge deletes those files
+        and the task's claims, best effort, as HostedAsks._ending does for an answer. Reopening brings none back."""
+        ended: dict = {}
+
+        def planned(load):
+            current, change = plan(load)
+            ended["files"] = current.get(REPLY_FILES) or []  # as checked on read: what the write stamped
+            return current, change
+
+        task = self.items.mutate(who, task_id, planned)
+        for item in ended.get("files", []):
+            if item.get("file_id") is not None:
+                self._delete_reply_file(task_id, item["id"], item["file_id"], "finished")
+        try:
+            self._drop_claims(task_id)
+        except Exception as exc:  # the task is written: a claim left behind is the sweep's
+            log.warning("hosted: could not delete the claims of task #%s (left to the sweep): %s", task_id,
+                        type(exc).__name__)
+        return self._out(task)
+
+    def _drop_claims(self, task_id: int) -> None:
+        """The seam of the claim documents of the task's secret files (SPEC 8.3 «Secret file»): called after every
+        done or drop by the agent, once the task is written."""
+        if self.claims is not None:
+            self.claims.delete_for_task(self.items.records.sub, task_id)
+
+    def _delete_reply_file(self, task_id: int, item_id: int, file_id: str, reason: str) -> bool:
+        """One file of the task's replies, best effort: deleted only when Drive says it is a file of this task
+        (appProperties kind "file", task_id and file = the item id, and no ask_id: a file of an ask is never a task's,
+        whatever an item names). A failure is logged with ids only (never a name, a message that could carry a link,
+        or content) and the file is left to the sweep: what is written stands. True if the file is gone from Drive
+        (deleted now, or already gone), False if it is still there (not this task's, or a failure). Never raises."""
+        records = self.items.records
+        try:
+            meta = records.call(records.drive.get_meta, file_id)
+            if meta is None:
+                return True  # already gone
+            props = meta.get("appProperties") or {}
+            if (props.get("kind") != "file" or props.get("task_id") != str(task_id)
+                    or props.get("file") != str(item_id) or "ask_id" in props):
+                log.warning("hosted: file %s named by task #%s item %s is not its reply file: not deleted", file_id,
+                            task_id, item_id)
+                return False
+            records.call(records.drive.delete, file_id)
+            return True
+        except Exception as exc:  # nothing may fail what is already written
+            log.warning("hosted: could not delete reply file %s of task #%s item %s on %s (left to the sweep): %s",
+                        file_id, task_id, item_id, reason, type(exc).__name__)
+            return False
 

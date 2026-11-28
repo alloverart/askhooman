@@ -1,4 +1,5 @@
-"""Files in answers on hosted asks (SPEC section 7.2 "Data model"): what the ask's `answer_files` may be.
+"""Files in answers on hosted asks (SPEC section 7.2 "Data model") and in replies on hosted tasks (8.1 "Data model"):
+what the ask's `answer_files` and the task's `reply_files` may be.
 
 The user's apps upload each file to the user's Drive appDataFolder (afile-<ask id>-<n>-<unix ms>, appProperties ask_id
 and kind "file") and write `answer_files` with the answer, in the same write. No MCP tool or REST body sets it. The
@@ -17,6 +18,14 @@ reads as [], on a `closed` one it is shown as stored (the route gives no downloa
     uploaded_at, answered_at (the ask's), downloaded_at, blocked_at, deleted_at: ISO-8601 stamps, the last three or null
     deleted_reason null, or sent, closed, reopened, expired, replaced
 
+A reply's file is the same item with reply_id and replied_at (the id and `at` of the `replied` event that carried it)
+in place of answered_at, and deleted_reason null, sent, finished or expired (REPLY_ITEM_KEYS). The apps upload it as
+tfile-<task id>-<n>-<unix ms> (appProperties task_id and kind "file") and add it to `reply_files` in the write of their
+reply; clean_reply_files reads the list back against the task file's own events. A reply is a new message, not a
+changed answer: the files of several replies coexist (at most MAX_FILES a reply, MAX_TASK_FILES a task), none goes
+stale, and the task's status never empties the list. The owner agent's links to them are TaskFileLinks (SPEC 8.3),
+sealed under a context of their own.
+
 Nothing here touches Drive or logs anything of a file.
 """
 
@@ -26,10 +35,13 @@ import re
 import secrets
 import time
 import unicodedata
+from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..rules import Invalid
+from ..task_rules import REPLY_FILES
 from .crypto import CryptoError
 from .store import DELETE, UNCHANGED, Store
 from .voice import FILE_ID, LINK_TTL, MEDIA_PATH, STAMP_MAX, TOKEN_MAX, _iso
@@ -45,9 +57,15 @@ FILE_ORPHAN = 24 * 3600  # seconds: the same for a normal file
 REQUEST_TIMEOUT = 900  # seconds a download may take
 CLOCK_SLACK = 600  # seconds a client's clock may differ from Drive's before Drive's createdTime decides (SPEC 7.6)
 
+MAX_TASK_FILES = 30  # the most items a task's reply_files holds (SPEC 8.1): files add up over a task's life
+
 ITEM_KEYS = ("id", "name", "mime", "bytes", "file_id", "secret", "uploaded_at", "answered_at", "downloaded_at",
              "blocked_at", "deleted_at", "deleted_reason")
 DELETED_REASONS = ("sent", "closed", "reopened", "expired", "replaced")
+# A reply's item (SPEC 8.1): an answer's, with reply_id and replied_at in place of answered_at, and its own reasons
+REPLY_ITEM_KEYS = ("id", "name", "mime", "bytes", "file_id", "secret", "uploaded_at", "reply_id", "replied_at",
+                   "downloaded_at", "blocked_at", "deleted_at", "deleted_reason")
+REPLY_DELETED_REASONS = ("sent", "finished", "expired")
 NAME_MAX = 200
 OCTET_STREAM = "application/octet-stream"
 MIME = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
@@ -57,6 +75,10 @@ DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"L
 FIELD = "answer_files"
 LINK_CONTEXT = "file"  # the AEAD context of a file link's token: a voice token (context "media") never opens as one
 CLAIMS = {"user": str, "agent": str, "ask_id": int, "answered_at": str, "file_id": str, "n": int, "exp": int}
+# A reply's file (SPEC 8.3): a third context, so an answer's file token or a voice token never opens as one (nor
+# the reverse)
+TASK_LINK_CONTEXT = "taskfile"
+TASK_CLAIMS = {"user": str, "agent": str, "task_id": int, "reply_id": int, "file_id": str, "n": int, "exp": int}
 
 
 # ---------- names ----------
@@ -87,13 +109,14 @@ def clean_name(raw: str) -> str:
     return name or "file"
 
 
-def download_name(ask_id: int, n: int, name: str) -> tuple[str, str]:
+def download_name(holder_id: int, n: int, name: str, holder: str = "ask") -> tuple[str, str]:
     """(the ASCII `filename`, the RFC 5987 `filename*` value) of a download's Content-Disposition. The first is
-    ask-<id>-file-<n>[.<ext>], <ext> the cleaned name's last extension when it is 1-10 ASCII letters or digits
-    (lower-cased); the second is UTF-8''<percent-encoded cleaned name>. The caller quotes the first."""
+    <holder>-<id>-file-<n>[.<ext>] (ask-3-file-1.pdf for an answer's file, task-3-file-1.pdf for a reply's), <ext> the
+    cleaned name's last extension when it is 1-10 ASCII letters or digits (lower-cased); the second is
+    UTF-8''<percent-encoded cleaned name>. The caller quotes the first."""
     name = clean_name(name)
     ext = _extension(name)[1:]
-    ascii_name = f"ask-{ask_id}-file-{n}" + (f".{ext.lower()}" if EXTENSION.fullmatch(ext) else "")
+    ascii_name = f"{holder}-{holder_id}-file-{n}" + (f".{ext.lower()}" if EXTENSION.fullmatch(ext) else "")
     return ascii_name, "UTF-8''" + quote(name, safe="")
 
 
@@ -107,13 +130,14 @@ def _stamp(value) -> bool:
     return isinstance(value, str) and 0 < len(value) <= STAMP_MAX
 
 
-def _item(value, answered_at, index: int) -> dict:
-    """One well-formed item in ITEM_KEYS order with its name cleaned and its mime normalised; Invalid, with the
-    field's path, for anything else."""
-    path = f"{FIELD}[{index}]"
+def _checked(value, keys: tuple, reasons: tuple, path: str, own: Callable[[dict], None]) -> dict:
+    """The checks an answer's item and a reply's item share (SPEC 7.2, 8.1): every key of `keys` there; id, name,
+    secret, bytes, mime, file_id with deleted_at, deleted_reason (one of `reasons`), uploaded_at, downloaded_at,
+    blocked_at. `own(value)` checks the kind's own keys after uploaded_at (raising Invalid). Returns the item in `keys`
+    order with its name cleaned and its mime normalised; Invalid, with the field's path, for anything else."""
     if not isinstance(value, dict):
         raise Invalid(f"{path} must be an object")
-    for key in ITEM_KEYS:
+    for key in keys:
         if key not in value:
             raise Invalid(f"{path}.{key} is missing")
     if not _count(value["id"], 1, 2**53):
@@ -141,17 +165,41 @@ def _item(value, answered_at, index: int) -> dict:
     elif deleted_at is not None:
         raise Invalid(f"{path}.file_id must be null when deleted_at is set")
     reason = value["deleted_reason"]
-    if reason is not None and (deleted_at is None or reason not in DELETED_REASONS):
-        raise Invalid(f"{path}.deleted_reason must be null or one of {', '.join(DELETED_REASONS)}, with deleted_at set")
-    for key in ("uploaded_at", "answered_at"):
-        if not _stamp(value[key]):
-            raise Invalid(f"{path}.{key} must be an ISO-8601 timestamp")
-    if value["answered_at"] != answered_at:
-        raise Invalid(f"{path}.answered_at must be the ask's answered_at")
+    if reason is not None and (deleted_at is None or reason not in reasons):
+        raise Invalid(f"{path}.deleted_reason must be null or one of {', '.join(reasons)}, with deleted_at set")
+    if not _stamp(value["uploaded_at"]):
+        raise Invalid(f"{path}.uploaded_at must be an ISO-8601 timestamp")
+    own(value)
     for key in ("downloaded_at", "blocked_at"):
         if value[key] is not None and not _stamp(value[key]):
             raise Invalid(f"{path}.{key} must be an ISO-8601 timestamp or null")
-    return {**{key: value[key] for key in ITEM_KEYS}, "name": clean_name(value["name"]), "mime": mime}
+    return {**{key: value[key] for key in keys}, "name": clean_name(value["name"]), "mime": mime}
+
+
+def _item(value, answered_at, index: int) -> dict:
+    """One well-formed item of an answer in ITEM_KEYS order with its name cleaned and its mime normalised; Invalid,
+    with the field's path, for anything else (an answered_at that is not the ask's included)."""
+    path = f"{FIELD}[{index}]"
+
+    def own(value):
+        if not _stamp(value["answered_at"]):
+            raise Invalid(f"{path}.answered_at must be an ISO-8601 timestamp")
+        if value["answered_at"] != answered_at:
+            raise Invalid(f"{path}.answered_at must be the ask's answered_at")
+    return _checked(value, ITEM_KEYS, DELETED_REASONS, path, own)
+
+
+def _reply_item(value, index: int) -> dict:
+    """One well-formed item of a task's reply_files in REPLY_ITEM_KEYS order, cleaned as _item cleans an answer's;
+    Invalid, with the field's path, for anything else. Which reply it names is clean_reply_files' check."""
+    path = f"{REPLY_FILES}[{index}]"
+
+    def own(value):
+        if not _count(value["reply_id"], 1, 2**53):
+            raise Invalid(f"{path}.reply_id must be a positive integer")
+        if not _stamp(value["replied_at"]):
+            raise Invalid(f"{path}.replied_at must be an ISO-8601 timestamp")
+    return _checked(value, REPLY_ITEM_KEYS, REPLY_DELETED_REASONS, path, own)
 
 
 def validate_files(value, answered_at: str) -> list[dict]:
@@ -192,6 +240,48 @@ def clean_files(value, answered_at, status) -> list[dict]:
     return items
 
 
+def is_user_reply(event) -> bool:
+    """A `replied` event of the user (actor denis) with an integer id and an `at`: the only events an item of
+    reply_files can name (clean_reply_files), so the only ones whose files can name a pruned item (files_api); junk
+    is no event."""
+    return (isinstance(event, dict) and event.get("kind") == "replied" and event.get("actor") == "denis"
+            and isinstance(event.get("id"), int) and not isinstance(event.get("id"), bool)
+            and isinstance(event.get("at"), str))
+
+
+def _replies(events) -> set[tuple[int, str]]:
+    """(id, at) of every `replied` event of the user among a task's events (is_user_reply)."""
+    if not isinstance(events, list):
+        return set()
+    return {(e["id"], e["at"]) for e in events if is_user_reply(e)}
+
+
+def clean_reply_files(value, events) -> list[dict]:
+    """A task's reply_files as the bridge reads it (SPEC 8.1 «Which items count»), checked against the task file's own
+    `events`: [] for anything that isn't a list (an older task has none), and per item: dropped when it is malformed,
+    when its (reply_id, replied_at) is not the (id, at) of a `replied` event of the user, when it repeats an id, when
+    it would be the seventh kept of its reply (MAX_FILES), or after MAX_TASK_FILES kept ones. A reply is never
+    replaced, so no later reply makes an item stale, and the task's status never empties the list: on a finished task
+    it is as stored (the route gives no download then)."""
+    if not isinstance(value, list):
+        return []
+    replies = _replies(events)
+    items, seen, per_reply = [], set(), Counter()
+    for index, raw in enumerate(value):
+        try:
+            one = _reply_item(raw, index)
+        except Invalid:
+            continue
+        if (one["reply_id"], one["replied_at"]) not in replies:
+            continue
+        if one["id"] in seen or per_reply[one["reply_id"]] >= MAX_FILES or len(items) >= MAX_TASK_FILES:
+            continue
+        seen.add(one["id"])
+        per_reply[one["reply_id"]] += 1
+        items.append(one)
+    return items
+
+
 # ---------- lifetimes (SPEC 7.6: bounded by Drive's createdTime, never by a client's clock alone) ----------
 
 def created_epoch(meta: dict) -> float | None:
@@ -218,43 +308,69 @@ def lifetime_end(since: float, created: float | None, ttl: float) -> float:
 
 # ---------- the owner agent's link ----------
 
-class FileLinks:
-    """Links to the normal files of an answer for the agent that asked (SPEC 7.4): made on each read, opened by
-    GET /media/v1/<token>. A separate context and claim set from the voice links (voice.VoiceLinks), so a voice token
-    and a file token open nothing of each other's. `sealer` is the bridge's Keyring (encrypt/decrypt with a context)."""
+class _SealedLinks:
+    """What the links to an answer's files and to a reply's files share: a token sealing the subclass's `claims` under
+    its own AEAD `context`, made on each read with an exp LINK_TTL on, opened strictly. `sealer` is the bridge's
+    Keyring (encrypt/decrypt with a context)."""
+
+    context: str
+    claims: dict
 
     def __init__(self, sealer, base_url: str, clock=time.time):
         self.sealer = sealer
         self.base_url = base_url
         self.clock = clock
 
-    def url_for(self, user: str, agent: str, ask_id: int, answered_at: str, file_id: str, n: int) -> tuple[str, str]:
-        """(url, url_expires_at) of a new link to file `n` of the answer made at `answered_at`, valid LINK_TTL."""
+    def _url(self, claims: dict) -> tuple[str, str]:
+        """(url, url_expires_at) of a new link to the file `claims` name, valid LINK_TTL."""
         exp = int(self.clock()) + LINK_TTL
-        claims = {"user": user, "agent": agent, "ask_id": ask_id, "answered_at": answered_at, "file_id": file_id,
-                  "n": n, "exp": exp}
-        token = self.sealer.encrypt(json.dumps(claims, separators=(",", ":")), LINK_CONTEXT)
+        token = self.sealer.encrypt(json.dumps({**claims, "exp": exp}, separators=(",", ":")), self.context)
         return f"{self.base_url}{MEDIA_PATH}{token}", _iso(exp)
 
     def open(self, token) -> dict | None:
-        """The seven claims of a token this bridge sealed as a file link and that has not expired; None for anything
-        else (not a token, tampered, a voice or other token, a key no longer configured, expired, a claim missing,
-        extra or of the wrong type)."""
+        """The seven claims of a token this bridge sealed as this kind of link and that has not expired; None for
+        anything else (not a token, tampered, a voice token or another kind's, a key no longer configured, expired, a
+        claim missing, extra or of the wrong type, n below 1)."""
         if not isinstance(token, str) or len(token) > TOKEN_MAX:
             return None
         try:
-            claims = json.loads(self.sealer.decrypt(token, LINK_CONTEXT))
+            claims = json.loads(self.sealer.decrypt(token, self.context))
         except (CryptoError, ValueError):
             return None
-        if not isinstance(claims, dict) or set(claims) != set(CLAIMS):
+        if not isinstance(claims, dict) or set(claims) != set(self.claims):
             return None
-        for key, kind in CLAIMS.items():
+        for key, kind in self.claims.items():
             value = claims[key]
             if not isinstance(value, kind) or isinstance(value, bool) or value in ("", 0):
                 return None
         if claims["n"] < 1 or claims["exp"] <= self.clock():
             return None
         return claims
+
+
+class FileLinks(_SealedLinks):
+    """Links to the normal files of an answer for the agent that asked (SPEC 7.4): made on each read, opened by
+    GET /media/v1/<token>. A separate context and claim set from the voice links (voice.VoiceLinks), so a voice token
+    and a file token open nothing of each other's."""
+
+    context, claims = LINK_CONTEXT, CLAIMS
+
+    def url_for(self, user: str, agent: str, ask_id: int, answered_at: str, file_id: str, n: int) -> tuple[str, str]:
+        """(url, url_expires_at) of a new link to file `n` of the answer made at `answered_at`, valid LINK_TTL."""
+        return self._url({"user": user, "agent": agent, "ask_id": ask_id, "answered_at": answered_at,
+                          "file_id": file_id, "n": n})
+
+
+class TaskFileLinks(_SealedLinks):
+    """Links to the normal files of a task's replies for the agent that owns the task (SPEC 8.3), as FileLinks are for
+    an answer's: context `taskfile` and its own claim set, so an ask's link opens nothing of a task and the reverse."""
+
+    context, claims = TASK_LINK_CONTEXT, TASK_CLAIMS
+
+    def url_for(self, user: str, agent: str, task_id: int, reply_id: int, file_id: str, n: int) -> tuple[str, str]:
+        """(url, url_expires_at) of a new link to file `n` of the reply `reply_id` on task `task_id`, valid LINK_TTL."""
+        return self._url({"user": user, "agent": agent, "task_id": task_id, "reply_id": reply_id, "file_id": file_id,
+                          "n": n})
 
 
 # ---------- the claim of a secret file (SPEC 7.4 «Secret file») ----------
@@ -271,26 +387,42 @@ def claim_key(user: str, ask_id: int, file_id: str) -> str:
     return hashlib.sha256(json.dumps([user, ask_id, file_id]).encode("utf-8")).hexdigest()
 
 
+def task_claim_key(user: str, task_id: int, file_id: str) -> str:
+    """The id of the claim document of a reply's secret file (SPEC 8.3 «Secret file»): the digest of [user, "task",
+    task_id, file_id], a shape no ask's key has, so task #3's claim is never ask #3's with the same Drive file."""
+    return hashlib.sha256(json.dumps([user, "task", task_id, file_id]).encode("utf-8")).hexdigest()
+
+
+HOLDERS = ("ask", "task")  # what a claim's document names its holder by: ask_id or task_id
+
+
+def _holder_field(holder: str) -> str:
+    if holder not in HOLDERS:
+        raise ValueError(f"a claim is held for an ask or a task, not {holder!r}")
+    return f"{holder}_id"
+
+
 class FileClaims:
     """Claims of secret files in the metadata store, collection `fileclaims`, changed only in store transactions (a
     Firestore transaction in production, a lock in MemoryStore), so two requests at the same instant on two instances
-    cannot both take one. A document: {user, ask_id, state: "held" | "done", until, owner}. States: none (no document),
-    held until `until` by `owner`, done (the file has been sent; `expires_at` 90 days on)."""
+    cannot both take one. A document: {user, ask_id, state: "held" | "done", until, owner}; a reply's secret file has
+    one with task_id in place of ask_id (`holder` "task"), keyed by task_claim_key (SPEC 8.3). States: none (no
+    document), held until `until` by `owner`, done (the file has been sent; `expires_at` 90 days on)."""
 
     def __init__(self, store: Store):
         self.store = store
 
-    def take(self, key: str, user: str, ask_id: int, now: float) -> tuple[str, str | None]:
+    def take(self, key: str, user: str, holder_id: int, now: float, holder: str = "ask") -> tuple[str, str | None]:
         """none -> held, or an expired held -> held (taken over): ("taken", owner id of the new lease); a held claim
-        that has not expired: ("held", None); done: ("done", None)."""
-        owner = secrets.token_hex(8)
+        that has not expired: ("held", None); done: ("done", None). The document names its holder as `<holder>_id`."""
+        owner, field = secrets.token_hex(8), _holder_field(holder)
 
         def decide(doc):
             if doc is not None and doc.get("state") == "done":
                 return UNCHANGED, ("done", None)
             if doc is not None and doc.get("state") == "held" and doc.get("until", 0) > now:
                 return UNCHANGED, ("held", None)
-            return ({"user": user, "ask_id": ask_id, "state": "held", "until": now + LEASE, "owner": owner},
+            return ({"user": user, field: holder_id, "state": "held", "until": now + LEASE, "owner": owner},
                     ("taken", owner))
         return self.store.transact(CLAIMS_COLLECTION, key, decide)
 
@@ -302,20 +434,29 @@ class FileClaims:
             return UNCHANGED, None
         self.store.transact(CLAIMS_COLLECTION, key, decide)
 
-    def done(self, key: str, owner: str, user: str, ask_id: int, now: float | None = None) -> None:
-        """held -> done, only if the claim still exists, is held and is `owner`'s: a close, a reopen or a re-answer
-        that deleted it came first (no orphan is made), a takeover's lease is not overwritten. A done claim has
-        `expires_at` = now + DONE_TTL: by then the file is long gone, and the claim document goes with it."""
-        stamp = (time.time() if now is None else now) + DONE_TTL
+    def done(self, key: str, owner: str, user: str, holder_id: int, now: float | None = None,
+             holder: str = "ask") -> None:
+        """held -> done, only if the claim still exists, is held and is `owner`'s: a close, a reopen, a re-answer or
+        a finish that deleted it came first (no orphan is made), a takeover's lease is not overwritten. A done claim
+        has `expires_at` = now + DONE_TTL: by then the file is long gone, and the claim document goes with it. The
+        document names its holder as take's does."""
+        stamp, field = (time.time() if now is None else now) + DONE_TTL, _holder_field(holder)
 
         def decide(doc):
             if doc is not None and doc.get("state") == "held" and doc.get("owner") == owner:
-                return {"user": user, "ask_id": ask_id, "state": "done", "expires_at": stamp}, None
+                return {"user": user, field: holder_id, "state": "done", "expires_at": stamp}, None
             return UNCHANGED, None
         self.store.transact(CLAIMS_COLLECTION, key, decide)
 
     def delete_for_ask(self, user: str, ask_id: int) -> None:
         """The claims of one ask of one user (the ask was closed or reopened)."""
         for key, doc in self.store.find(CLAIMS_COLLECTION, "ask_id", ask_id):
+            if doc.get("user") == user:
+                self.store.delete(CLAIMS_COLLECTION, key)
+
+    def delete_for_task(self, user: str, task_id: int) -> None:
+        """The claims of one task of one user (the task was finished, SPEC 8.3): its documents name `task_id` and no
+        `ask_id`, so this finds none of an ask's, and delete_for_ask none of a task's."""
+        for key, doc in self.store.find(CLAIMS_COLLECTION, "task_id", task_id):
             if doc.get("user") == user:
                 self.store.delete(CLAIMS_COLLECTION, key)

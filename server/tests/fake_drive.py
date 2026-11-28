@@ -7,7 +7,8 @@ matches names that start with x, as Drive's prefix matching of name terms does (
 files.get alt=media streams the body in 64 KiB pieces (never one big copy) and honours `Range: bytes=N-` and
 `bytes=N-M` (206 with Content-Range; an end past the file is clamped to its last byte). Every request is recorded
 (`requests`, and `headers` for the request headers); `down` simulates an outage, `fail_next` refuses one chosen request.
-`app_action` plays the Swift app: a read-modify-write of a file as the human (SPEC "Who writes what").
+`app_action` plays the Swift app: a read-modify-write of a file as the human (SPEC "Who writes what");
+`app_task_reply` and `app_task_reply_files` play the apps' replies on a task, without and with files (SPEC 8.2).
 """
 
 import copy
@@ -21,6 +22,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from server.drive import DriveClient
+from server.task_rules import PRESETS
 
 CLIENT_ID = "1234-fake.apps.googleusercontent.com"
 CLIENT_SECRET = "GOCSPX-fake-client-secret"
@@ -364,6 +366,35 @@ def app_task_reply(fake: FakeDrive, task_id: int, text: str, preset: str | None 
     at = now_iso()
     doc["events"].append({"id": max(e["id"] for e in doc["events"]) + 1, "task_id": task_id, "at": at,
                           "actor": "denis", "kind": "replied", "payload": {"text": text, "preset": preset}})
+    doc["updated_at"] = at
+    doc["rev"] += 1
+    doc["writer"] = "app"
+    fake.write(file["id"], doc, {**file["appProperties"], "rev": str(doc["rev"])})
+    return doc
+
+
+def app_task_reply_files(fake: FakeDrive, task_id: int, items: list, text: str | None = None,
+                         preset: str | None = None, base: dict | None = None) -> dict:
+    """What the apps do for a reply with files on a hosted task (SPEC 8.2 step 3), the files being in Drive already:
+    a fresh download (or a stale copy `base`); E = the highest event id + 1 and T = now; the items of `reply_files`
+    that have `deleted_at` are dropped (pruning), every other one is kept untouched; each of `items` gets `reply_id`
+    E and `replied_at` T; the `replied` event {id: E, task_id, at: T, actor: "denis", payload: {text, preset, files}}
+    carries them as written. With no text the text is the preset's, or with neither "1 file attached" / "N files
+    attached". rev+1, writer "app", appProperties unchanged except rev. Returns the content written."""
+    file = fake.file(f"task-{task_id}.json")
+    doc = copy.deepcopy(base) if base is not None else json.loads(file["content"])
+    time.sleep(0.002)
+    at = now_iso()
+    event_id = max(e["id"] for e in doc["events"]) + 1
+    written = [{**item, "reply_id": event_id, "replied_at": at} for item in items]
+    if text is None:
+        text = PRESETS[preset] if preset is not None else (
+            "1 file attached" if len(written) == 1 else f"{len(written)} files attached")
+    stored = doc.get("reply_files") if isinstance(doc.get("reply_files"), list) else []
+    kept = [i for i in stored if not (isinstance(i, dict) and i.get("deleted_at") is not None)]
+    doc["reply_files"] = [*kept, *written]
+    doc["events"].append({"id": event_id, "task_id": task_id, "at": at, "actor": "denis", "kind": "replied",
+                          "payload": {"text": text, "preset": preset, "files": written}})
     doc["updated_at"] = at
     doc["rev"] += 1
     doc["writer"] = "app"

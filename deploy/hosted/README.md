@@ -76,7 +76,8 @@ gcloud beta run domain-mappings describe --domain=<PUBLIC_HOST> --region=$REGION
 ```
 
 ```bash
-# 8. The hourly sweep of answer files (SPEC 7.6): Cloud Scheduler calls POST /internal/sweep with an OIDC ID token of $SA.
+# 8. The hourly sweep of answer files (SPEC 7.6) and of the files of task replies (SPEC 8.5): Cloud Scheduler calls
+# POST /internal/sweep with an OIDC ID token of $SA.
 # The service stays public (--allow-unauthenticated, no roles/run.invoker): the route checks the token itself
 # (audience = ASKS_PUBLIC_URL, email = ASKS_SWEEP_SERVICE_ACCOUNT).
 gcloud scheduler jobs create http askhooman-sweep --location=$REGION --schedule="0 * * * *" --time-zone=UTC \
@@ -115,9 +116,9 @@ The browser opens Google sign-in, then the page "Claude Code wants to ask you qu
 
 A deployment made before files in answers (SPEC section 7) has no `ASKS_SWEEP_SERVICE_ACCOUNT` and no Cloud Scheduler job.
 It keeps running, but `POST /internal/sweep` refuses everyone, so nothing deletes a secret file that nobody fetched (24 h),
-the files of an ask the app closed, or orphans. The bridge says so at every start with a WARNING in its log:
-`ASKS_SWEEP_SERVICE_ACCOUNT is not set`. Both steps are needed (placeholders: your project, region, host and the
-runtime service account of step 3 above):
+the files of an ask the app closed, or orphans, and the same holds for the files of task replies (SPEC 8.5). The bridge
+says so at every start with a WARNING in its log: `ASKS_SWEEP_SERVICE_ACCOUNT is not set`. Both steps are needed
+(placeholders: your project, region, host and the runtime service account of step 3 above):
 
 ```bash
 PROJECT=<PROJECT>; REGION=<REGION>

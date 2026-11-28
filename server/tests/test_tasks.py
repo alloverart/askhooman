@@ -17,6 +17,7 @@ from .conftest import ALLEN, DENIS, HAMILTON, auth
 TASK_KEYS = {
     "id", "agent", "title", "context", "status", "waiting_on", "next_check", "links", "ref", "resolution",
     "created_at", "updated_at", "finished_at", "reply", "reply_pending", "question", "question_open",
+    "reply_files",  # always [] here: files in task replies are hosted only (SPEC 8.1)
 }
 
 
@@ -468,7 +469,7 @@ def test_rest_reply_and_answer_round_trip(client):
     r = reply(client, task["id"], text="any news?", preset="status")
     assert r.status_code == 200, r.text
     assert r.json()["reply"] == {"id": r.json()["reply"]["id"], "at": r.json()["reply"]["at"],
-                                 "text": "any news?", "preset": "status"}
+                                 "text": "any news?", "preset": "status", "files": []}
     assert r.json()["reply_pending"] is True and r.json()["status"] == "waiting"
     listed = client.get("/api/tasks", headers=auth(ALLEN)).json()["tasks"]
     assert listed[0]["id"] == task["id"] and listed[0]["reply_pending"] is True

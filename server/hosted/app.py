@@ -42,7 +42,7 @@ from .clients import CimdResolver
 from .config import HostedSettings
 from .crypto import Keyring
 from .feed import EventFeed, add_feed_route
-from .files_api import add_file_routes, is_content_path, secret_file_tool
+from .files_api import add_file_routes, is_content_path, secret_file_tool, task_secret_file_tool
 from .google import GoogleError, GoogleOAuth
 from .looks import AGENT_COLORS, own_look
 from .media_api import MEDIA_SLOTS, MediaGuard, MediaService, Slots, add_media_routes
@@ -56,7 +56,7 @@ from .stats import internal_check
 from .store import MemoryStore
 from .sweep import sweep
 from .uploads import UPLOAD_PATH, UPLOAD_PREFIX, UploadGrant, UploadGrants
-from .files import FileClaims, FileLinks
+from .files import FileClaims, FileLinks, TaskFileLinks
 from .voice import VoiceLinks
 from .voice_api import add_voice_route
 from .webhooks import WebhookSender
@@ -194,10 +194,13 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     # Files in answers (SPEC 7.4): the same for a normal file, sealed under its own context.
     file_links = FileLinks(keyring, settings.public_url)
     file_claims = FileClaims(store)
+    # Files in task replies (SPEC 8.3): the owner agent's links, under a context of their own.
+    task_file_links = TaskFileLinks(keyring, settings.public_url)
 
     def services(who: HostedIdentity):
         records = pool.records(who.user)
-        return HostedAsks(records, voice_links, who, file_links, file_claims), HostedTasks(records)
+        return (HostedAsks(records, voice_links, who, file_links, file_claims),
+                HostedTasks(records, who, task_file_links, file_claims))
 
     # Pictures and video in asks (SPEC v5 step 4): one service and one guard (the `media` bucket, the slots) for
     # the REST routes and the MCP tools alike.
@@ -220,8 +223,9 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
         lambda who: ping_own_webhook(accounts, webhooks, limiter, who))
     def hosted_mcp(chatgpt: bool):
         """The MCP server for every client but ChatGPT, or ChatGPT's: the same tools on the same services, without
-        secret files (SPEC 7.8 «ChatGPT: no secret files»)."""
-        secret_file = None if chatgpt else SecretFileTool(lambda who, ask_id, n: secret_fetch(who, ask_id, n))
+        secret files (SPEC 7.8 «ChatGPT: no secret files», 8.7 for a task's)."""
+        secret_file = None if chatgpt else SecretFileTool(lambda who, ask_id, n: secret_fetch(who, ask_id, n),
+                                                          lambda who, task_id, n: task_secret_fetch(who, task_id, n))
         server = build_mcp(services=services, hosted=True, look=look, feed=FeedTool(wait_for_user),
                            webhook=own_webhook, media=MediaTool(media.create, media.attach, media.upload, media.detach),
                            secret_file=secret_file, chatgpt=chatgpt)
@@ -274,8 +278,10 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
                     google.verify_id_token(token, settings.app_client_ids)
                 except Exception:  # GoogleError, or Google's certs unreachable: not a Google ID token as far as we
                     pass  # can tell; the agent check below says what is wrong with it
-                else:
-                    raise HTTPException(403, "this file is for the agent that asked: fetch it with its own token")
+                else:  # the user's own token: an answer's file is the asking agent's, a reply's the task's agent's
+                    raise HTTPException(403, "this file is for the agent whose task it is: fetch it with its own token"
+                                        if path.startswith("/api/tasks/") else
+                                        "this file is for the agent that asked: fetch it with its own token")
             return resource_auth.identify(headers.get("authorization"), ip, headers.get("host"))
         if token is None:
             raise HTTPException(401, "sign in with Google", headers={"WWW-Authenticate": "Bearer"})
@@ -384,6 +390,7 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
     app.state.voice_links = voice_links
     app.state.file_links = file_links
     app.state.file_claims = file_claims
+    app.state.task_file_links = task_file_links
     app.state.auth_server = auth_server
     app.state.mcp = mcp
     app.state.chatgpt_mcp = chatgpt_mcp
@@ -395,8 +402,9 @@ def create_hosted_app(settings: HostedSettings | None = None, *, store=None, htt
 
     add_api_routes(app, services, ask_create=media.create)
     add_media_routes(app, media)
-    file_download = add_file_routes(app, file_links, accounts, pool, limiter, file_claims)
+    file_download = add_file_routes(app, file_links, accounts, pool, limiter, file_claims, task_links=task_file_links)
     secret_fetch = secret_file_tool(app, accounts, pool, limiter, file_claims)  # ask_secret_file (built before app)
+    task_secret_fetch = task_secret_file_tool(app, accounts, pool, limiter, file_claims)  # task_secret_file
     add_voice_route(app, voice_links, accounts, pool, limiter, media.guard.slots, file_download)
     add_app_api(app, settings, accounts, pool, webhooks, limiter, google, feed, voice_links)
     add_feed_route(app, feed, accounts)

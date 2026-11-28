@@ -27,6 +27,10 @@ made anew on every read; GET /media/v1/<token> (voice_api.py) sends the recordin
 else gets url null, and transcript null too, in answer_voice and in the history (the voice, previous_voice and
 answer_voice of event payloads): the user edits the heard text before sending, so only the agent that asked sees it.
 
+A task's reply files (SPEC 8.3) go through the same kind of view (for_task_reader): no Drive file id for anyone, in
+reply_files and in the files of the history (whose names are cleaned again and whose junk is dropped); a link
+(files.TaskFileLinks) only for the agent that owns the task.
+
 Nothing here touches Drive or logs anything of a voice answer.
 """
 
@@ -36,6 +40,7 @@ import time
 from datetime import datetime, timezone
 
 from ..rules import ANSWER_VOICE, AskError, _text
+from ..task_rules import OPEN, REPLY_FILES
 from .crypto import CryptoError, Keyring
 
 VOICE_KEYS = ("file_id", "mime", "bytes", "duration_ms", "lang", "transcript_source", "transcript", "answered_at",
@@ -148,15 +153,18 @@ FILE_PARTS = ("files", "previous_files", "answer_files")  # where event payloads
 
 AGENT_FILE_KEYS = ("id", "name", "mime", "bytes", "secret", "downloaded_at", "deleted_at", "deleted_reason",
                    "blocked_at")  # SPEC 7.4: what an agent sees of a file; file_id, uploaded_at, answered_at stay stored
+# SPEC 8.3: what an agent sees of a reply's file, 7.4's keys and reply_id; file_id, uploaded_at, replied_at stay stored
+AGENT_TASK_FILE_KEYS = ("id", "reply_id", "name", "mime", "bytes", "secret", "downloaded_at", "deleted_at",
+                        "deleted_reason", "blocked_at")
 
 
-def _agent_items(items, named: bool = True):
-    """Files as an agent sees them (SPEC 7.4): only AGENT_FILE_KEYS, so the Drive file id never leaves the bridge;
+def _agent_items(items, named: bool = True, keys: tuple = AGENT_FILE_KEYS):
+    """Files as an agent sees them (SPEC 7.4, 8.3): only `keys`, so the Drive file id never leaves the bridge;
     another agent gets no name and no mime, as the type says what the file is."""
     shown = []
     for item in items:
         if isinstance(item, dict):
-            item = {key: item[key] for key in AGENT_FILE_KEYS if key in item}
+            item = {key: item[key] for key in keys if key in item}
             if not named:
                 item = {**item, "name": None, "mime": None}
         shown.append(item)
@@ -175,6 +183,19 @@ def _unheard(event, owner: bool = False):
     return {**event, "payload": {**payload, **hidden}} if hidden else event
 
 
+def _owns(reader, record: dict) -> bool:
+    """Whether `reader` is the agent the ask or task is of: an agent HostedIdentity with the record's slug, its user
+    and its agent id."""
+    return bool(getattr(reader, "role", None) == "agent" and reader.agent == record.get("agent")
+                and getattr(reader, "user", "") and getattr(reader, "agent_id", ""))
+
+
+def _linkable(raw) -> bool:
+    """A stored item the owner gets a link to: a normal file that exists and is not blocked."""
+    return (isinstance(raw, dict) and raw.get("secret") is False and raw.get("file_id") is not None
+            and raw.get("blocked_at") is None)
+
+
 def _file_view(ask: dict, items: list, reader, owner: bool, file_urls: bool, file_links) -> list:
     """answer_files as `reader` gets it (_agent_items). The owner, with `file_urls` and a `file_links`, on an answered
     ask: a normal file that exists and is not blocked also gets `url` and `url_expires_at`. A secret file never has a
@@ -189,8 +210,7 @@ def _file_view(ask: dict, items: list, reader, owner: bool, file_urls: bool, fil
     if file_links is None or ask.get("status") != "answered":
         return shown
     for raw, item in zip(items, shown):
-        if (isinstance(raw, dict) and raw.get("secret") is False and raw.get("file_id") is not None
-                and raw.get("blocked_at") is None):
+        if _linkable(raw):
             item["url"], item["url_expires_at"] = file_links.url_for(reader.user, reader.agent_id, ask["id"],
                                                                      ask["answered_at"], raw["file_id"], raw["id"])
     return shown
@@ -203,8 +223,7 @@ def for_reader(ask: dict, links: VoiceLinks, reader, file_urls: bool = True, fil
     (files.FileLinks, only when `file_links` is given and `file_urls` is true; the webhook passes file_urls=False and
     gets no url and a secret file as {id, secret: true}). For everyone else: url null, and transcript null in
     answer_voice and in the history, no name and no mime in the files."""
-    owner = bool(getattr(reader, "role", None) == "agent" and reader.agent == ask.get("agent")
-                 and getattr(reader, "user", "") and getattr(reader, "agent_id", ""))
+    owner = _owns(reader, ask)
     shown = ask
     voice = ask.get(ANSWER_VOICE)
     if isinstance(voice, dict):
@@ -219,4 +238,81 @@ def for_reader(ask: dict, links: VoiceLinks, reader, file_urls: bool = True, fil
         shown = {**shown, "answer_files": _file_view(ask, ask["answer_files"], reader, owner, file_urls, file_links)}
     if isinstance(ask.get("events"), list):
         shown = {**shown, "events": [_unheard(event, owner) for event in ask["events"]]}
+    return shown
+
+
+# ---------- a task's reply files (SPEC 8.3) ----------
+
+def _task_items(items: list, named: bool) -> list:
+    """A task's files as an agent sees them: _agent_items with AGENT_TASK_FILE_KEYS, and what is not an object is
+    dropped (a hand-edited history can hold anything; nothing of it reaches an agent as stored)."""
+    return _agent_items([item for item in items if isinstance(item, dict)], named, AGENT_TASK_FILE_KEYS)
+
+
+def _event_files(files: list) -> list:
+    """The `files` of a task event's payload read again, as reply_files is on every read (SPEC 7.2, 8.3): for a pruned
+    file this snapshot is the only source of its name. An entry that is not an object, or whose id is not an int (a
+    bool is none: task_rules.reply_file_ids), is dropped; a name is cleaned (files.clean_name), and one that is not a
+    string reads as null."""
+    from .files import clean_name  # files.py imports this module, so not at the top
+
+    kept = []
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), int) or isinstance(item.get("id"), bool):
+            continue
+        if "name" in item:
+            item = {**item, "name": clean_name(item["name"]) if isinstance(item["name"], str) else None}
+        kept.append(item)
+    return kept
+
+
+def _task_event(event, owner: bool):
+    """An event of a task as an agent sees it: a payload that is not an object as null; the `files` of one that is,
+    whatever the event's kind, as _event_files then _task_items (a `files` that is not a list as []); the rest as
+    stored."""
+    if not isinstance(event, dict):
+        return event
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return {**event, "payload": None} if "payload" in event else event
+    if "files" not in payload:
+        return event
+    files = payload["files"] if isinstance(payload["files"], list) else []
+    return {**event, "payload": {**payload, "files": _task_items(_event_files(files), owner)}}
+
+
+def _reply_file_view(task: dict, reader, owner: bool, file_urls: bool, file_links) -> list:
+    """reply_files as `reader` gets it (_task_items), as _file_view does for an answer: the owner, with `file_urls`
+    and a `file_links`, on an open task, also gets `url` and `url_expires_at` on a normal file that exists and is not
+    blocked; a secret file never has one. Without `file_urls` (the webhook) no item has a url and a secret file is
+    only {id, reply_id, secret: true}."""
+    items = [item for item in task[REPLY_FILES] if isinstance(item, dict)]
+    shown = _task_items(items, owner)
+    if not owner:
+        return shown
+    if not file_urls:
+        return [{"id": item.get("id"), "reply_id": item.get("reply_id"), "secret": True}
+                if item.get("secret") is True else item for item in shown]
+    if file_links is None or task.get("status") not in OPEN:
+        return shown
+    for raw, item in zip(items, shown):
+        if _linkable(raw):
+            item["url"], item["url_expires_at"] = file_links.url_for(reader.user, reader.agent_id, task["id"],
+                                                                     raw["reply_id"], raw["file_id"], raw["id"])
+    return shown
+
+
+def for_task_reader(task: dict, reader, file_urls: bool = True, file_links=None) -> dict:
+    """The task as `reader` gets it (SPEC 8.3). reply_files and the `files` of every event go through the view for
+    everyone (AGENT_TASK_FILE_KEYS; an event's also as _task_event reads them), so a Drive file id never leaves the
+    bridge. The agent that owns the task (decided as in for_reader) sees name and mime, and a link on each normal file
+    of an open task (files.TaskFileLinks, only when `file_links` is given and `file_urls` is true; the webhook passes
+    file_urls=False and gets no url and a secret file as {id, reply_id, secret: true}). Everyone else: name and mime
+    null, no url. `reply` is ids only, the same for every reader, and stays as it is."""
+    owner = _owns(reader, task)
+    shown = task
+    if isinstance(task.get(REPLY_FILES), list):
+        shown = {**shown, REPLY_FILES: _reply_file_view(task, reader, owner, file_urls, file_links)}
+    if isinstance(task.get("events"), list):
+        shown = {**shown, "events": [_task_event(event, owner) for event in task["events"]]}
     return shown

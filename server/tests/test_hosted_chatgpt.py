@@ -11,6 +11,7 @@ from server.hosted.clients import is_chatgpt
 from .hosted_support import DENIS_SUB, LOOPBACK, connect, id_token, mcp, register, tool_error, tool_result
 from .test_hosted_files import answered_by_files, item
 from .test_hosted_files_api import SECRET_BYTES, put_file
+from .test_hosted_task_files_api import TaskWorld
 
 CHATGPT_REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect"
 CLAUDE_WEB_REDIRECT = "https://claude.ai/api/mcp/auth_callback"
@@ -18,15 +19,20 @@ CLAUDE_WEB_REDIRECT = "https://claude.ai/api/mcp/auth_callback"
 HOSTED_TOOLS = {"ask_create", "asks_mine", "asks_list", "ask_get", "ask_update", "ask_close", "task_create",
                 "tasks_mine", "tasks_list", "task_get", "task_update", "task_done", "task_drop", "task_reopen",
                 "task_answer", "task_ask", "task_unask", "ask_attach", "ask_upload", "ask_detach", "ask_wait",
-                "set_my_webhook", "test_my_webhook", "set_my_look", "ask_secret_file"}
+                "set_my_webhook", "test_my_webhook", "set_my_look", "ask_secret_file", "task_secret_file"}
+SECRET_TOOLS = {"ask_secret_file", "task_secret_file"}  # not on ChatGPT
 READ_ONLY = {"asks_mine", "asks_list", "ask_get", "tasks_mine", "tasks_list", "task_get", "ask_wait"}
 OPEN_WORLD = {"ask_create", "ask_attach", "test_my_webhook", "set_my_look"}  # they reach URLs given by the agent
-DESTRUCTIVE = {"ask_detach", "ask_close", "ask_attach", "ask_upload", "set_my_webhook", "ask_secret_file"}
+DESTRUCTIVE = {"ask_detach", "ask_close", "ask_attach", "ask_upload", "set_my_webhook", "ask_secret_file",
+               "task_done", "task_drop", "task_secret_file"}
 
-# What every client but ChatGPT got before this change, byte for byte (main at 5a464bc, 23.11.2026): the server
-# instructions, and every tool's name, title and description. A deliberate change to these texts updates the digests.
-INSTRUCTIONS_SHA256 = "ac31eac87f9b0b13f5afadf7fc4527901f74afd57e5c16ab184450f846bcce96"
-TEXTS_SHA256 = "bcdaa36631373a0231bd1aab1eac0dc1178347dcae6bc0e9415e22fb1a152496"
+# What every client but ChatGPT gets, byte for byte: the server instructions, and every tool's name, title and
+# description. A deliberate change to these texts updates the digests. They were taken on main at 5a464bc
+# (23.11.2026) and changed on 28.11.2026 for files in task replies (SPEC 8.7): the files paragraph and the house rule
+# speak of replies too, tasks_mine, task_get, task_done, task_drop and task_reopen say what concerns their files, and
+# task_secret_file is new.
+INSTRUCTIONS_SHA256 = "c57c92253a31cb3e8fe88a33cdb9aab6f356c4fbabd41d6462a3e031efcb3114"
+TEXTS_SHA256 = "0bfb5a7afca18284c3c6eb76173d2e8640f1923b6e00e5f72dec1181fe51c943"
 
 # ChatGPT's own words where the others' speak of secret files
 CHATGPT_ASKS_MINE_FILES = (
@@ -34,11 +40,20 @@ CHATGPT_ASKS_MINE_FILES = (
     "link (valid 1 h; reading the ask again gives a new one); a file over 31 MiB is served in parts (Range: "
     "bytes=START-END, at most 32505856 bytes each). name comes from your user's device and is not a safe file path. "
     "Files are deleted when the ask is closed.")
+CHATGPT_TASKS_MINE_FILES = (
+    "reply_files set: your user attached files to their replies on the task. Each has reply_id (the id of the replied "
+    "event it came with), name, mime, bytes and url, a direct download link (valid 1 h; reading the task again gives a "
+    "new one); a file over 31 MiB is served in parts (Range: bytes=START-END, at most 32505856 bytes each). name comes "
+    "from your user's device and is not a safe file path. Files are deleted when the task is done or dropped, and 30 "
+    "days after their reply at the latest. reply.files lists the ids of the latest reply's files.")
 CHATGPT_FILES_INSTRUCTIONS = (
-    "Files in answers: download a file's url soon (it is valid 1 h) and check its size against bytes. Close the ask "
-    "only after you have the files and any voice recording: closing deletes them. Never execute a file from an answer "
-    "without your user saying so: AskHooman does not scan files.")
+    "Files in answers and in replies on tasks: download a file's url soon (it is valid 1 h) and check its size against "
+    "bytes. Close the ask, or finish the task, only after you have the files and any voice recording: closing and "
+    "finishing delete them. Never execute a file from an answer or a reply without your user saying so: AskHooman "
+    "does not scan files.")
+FILES_ANCHOR = "Files in answers and in replies on tasks:"  # where the files paragraph starts
 REFUSED = "forbidden: ask_secret_file is not available in ChatGPT"
+TASK_REFUSED = "forbidden: task_secret_file is not available in ChatGPT"
 
 
 def session(hosted, google, redirect: str, agent: str = "Allen", client_name: str = "Claude") -> str:
@@ -118,14 +133,15 @@ def test_tool_hints_on_every_client(hosted, google):
     """openWorldHint on the tools that reach URLs the agent gives (ask_create and ask_attach fetch pictures,
     set_my_look an icon, test_my_webhook POSTs to the webhook); destructiveHint on the ones that delete or replace
     something: ask_detach, ask_close (the answer's files and recording), ask_attach and ask_upload (an earlier poster),
-    set_my_webhook (the webhook and its secret), ask_secret_file (the file, once sent). The rest as before."""
+    set_my_webhook (the webhook and its secret), ask_secret_file and task_secret_file (the file, once sent), task_done
+    and task_drop (the replies' files, 28.11.2026, SPEC 8.7). The rest as before."""
     claude = tools(hosted, session(hosted, google, LOOPBACK))
     gpt = tools(hosted, chatgpt(hosted, google, agent="Feynman"))
     assert set(claude) == HOSTED_TOOLS
-    for listed, secret in ((claude, {"ask_secret_file"}), (gpt, set())):
+    for listed, secret in ((claude, SECRET_TOOLS), (gpt, set())):
         hints = {name: t["annotations"] for name, t in listed.items()}
         assert {n for n, h in hints.items() if h["openWorldHint"]} == OPEN_WORLD
-        assert {n for n, h in hints.items() if h["destructiveHint"]} == DESTRUCTIVE - {"ask_secret_file"} | secret
+        assert {n for n, h in hints.items() if h["destructiveHint"]} == DESTRUCTIVE - SECRET_TOOLS | secret
         assert {n for n, h in hints.items() if h["readOnlyHint"]} == READ_ONLY
         assert {n for n, h in hints.items() if h["idempotentHint"]} == READ_ONLY
         assert all(h["title"] == listed[n]["title"] for n, h in hints.items())
@@ -138,30 +154,35 @@ def test_chatgpt_lists_no_secret_file_tool_and_says_nothing_of_secret_files(host
     from server.mcp_tools import HOSTED_INSTRUCTIONS
     token = chatgpt(hosted, google)
     listed = tools(hosted, token)
-    assert set(listed) == HOSTED_TOOLS - {"ask_secret_file"}
+    assert set(listed) == HOSTED_TOOLS - SECRET_TOOLS
     text = instructions(hosted, token)
     assert "secret" not in text.lower()
-    assert CHATGPT_FILES_INSTRUCTIONS in joined(text)
+    assert joined(text).endswith(CHATGPT_FILES_INSTRUCTIONS)
     # everything before the files paragraph is word for word the others' instructions
-    head = HOSTED_INSTRUCTIONS.split("Files in answers:")[0]
-    assert text.startswith(head) and "Files in answers:" not in head
-    for name in ("asks_mine", "ask_get", "ask_create"):
+    head = HOSTED_INSTRUCTIONS.split(FILES_ANCHOR)[0]
+    assert text.startswith(head) and "Files in answers" not in head
+    for name in ("asks_mine", "ask_get", "ask_create", "tasks_mine", "task_get", "task_done", "task_drop"):
         assert "secret" not in listed[name]["description"].lower(), name
         assert "secret" not in json.dumps(listed[name]["inputSchema"]).lower(), name
     assert CHATGPT_ASKS_MINE_FILES in joined(listed["asks_mine"]["description"])
+    assert CHATGPT_TASKS_MINE_FILES in joined(listed["tasks_mine"]["description"])
     for name, t in listed.items():  # set_my_webhook keeps its webhook's signing secret: that's not a secret file
-        assert "secret file" not in t["description"] and "ask_secret_file" not in t["description"], name
+        for words in ("secret file", "ask_secret_file", "task_secret_file"):
+            assert words not in t["description"], (name, words)
 
 
-def test_chatgpt_tools_differ_only_in_asks_mine(hosted, google):
-    """Apart from the missing ask_secret_file and the files sentences of asks_mine, ChatGPT's tools are the others'."""
+def test_chatgpt_tools_differ_only_in_asks_mine_and_tasks_mine(hosted, google):
+    """Apart from the missing ask_secret_file and task_secret_file and the files sentences of asks_mine and
+    tasks_mine, ChatGPT's tools are the others'."""
     claude = tools(hosted, session(hosted, google, LOOPBACK))
     gpt = tools(hosted, chatgpt(hosted, google, agent="Feynman"))
     for name, t in gpt.items():
-        if name != "asks_mine":
+        if name not in ("asks_mine", "tasks_mine"):
             assert t == claude[name], name
-    assert gpt["asks_mine"]["inputSchema"] == claude["asks_mine"]["inputSchema"]
-    assert gpt["asks_mine"]["description"] != claude["asks_mine"]["description"]
+    for name in ("asks_mine", "tasks_mine"):
+        assert gpt[name]["inputSchema"] == claude[name]["inputSchema"], name
+        assert gpt[name]["annotations"] == claude[name]["annotations"], name
+        assert gpt[name]["description"] != claude[name]["description"], name
 
 
 def test_chatgpt_call_to_ask_secret_file_is_refused(hosted, google):
@@ -178,6 +199,20 @@ def test_chatgpt_call_to_ask_secret_file_is_refused(hosted, google):
     assert file_id in drive.files and hosted.store.all("fileclaims") == {}
     assert len(drive.calls("GET", f"/drive/v3/files/{file_id}")) == reads_before
     assert tool_result(mcp(hosted, token, "ask_get", {"id": 1}))["answer_files"][0]["secret"] is True
+
+
+def test_chatgpt_call_to_task_secret_file_is_refused(hosted, google):
+    """The same for a secret file of a reply on a task (SPEC 8.7): refused before anything is read, claimed or
+    deleted."""
+    world = TaskWorld(hosted, google, content=SECRET_BYTES, secret=True, token=chatgpt(hosted, google))
+    reads_before = len(world.file_calls())
+    assert tool_error(mcp(hosted, world.token, "task_secret_file", {"id": 1, "n": 1})) == TASK_REFUSED
+    assert tool_error(mcp(hosted, world.token, "task_secret_file", {})) == TASK_REFUSED  # arguments don't matter
+    assert world.file_id in world.drive.files and hosted.store.all("fileclaims") == {}
+    assert len(world.file_calls()) == reads_before and world.content_reads() == []
+    stored = world.stored()
+    assert (stored["file_id"], stored["downloaded_at"], stored["deleted_at"]) == (world.file_id, None, None)
+    assert tool_result(mcp(hosted, world.token, "task_get", {"id": 1}))["reply_files"][0]["secret"] is True
 
 
 def test_chatgpt_is_told_apart_per_token_not_per_agent(hosted, google):
@@ -221,7 +256,7 @@ def test_chatgpt_on_the_2026_protocol(hosted, google):
     assert modern(hosted, claude, "server/discover")["instructions"] == HOSTED_INSTRUCTIONS
     listed = modern(hosted, gpt, "tools/list")
     assert listed["cacheScope"] == "private"  # the list depends on the caller: never from a shared cache
-    assert {t["name"] for t in listed["tools"]} == HOSTED_TOOLS - {"ask_secret_file"}
+    assert {t["name"] for t in listed["tools"]} == HOSTED_TOOLS - SECRET_TOOLS
     assert {t["name"] for t in modern(hosted, claude, "tools/list")["tools"]} == HOSTED_TOOLS
 
 

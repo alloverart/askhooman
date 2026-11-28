@@ -56,7 +56,9 @@ class TaskService:
                 task["events"] = [event_from_row(r, "task_id") for r in rows]
         return task
 
-    def list(self, status: str = "open", agent: str | None = None, limit: int | None = None) -> dict:
+    def list(self, status: str = "open", agent: str | None = None, limit: int | None = None,
+             file_urls: bool = False) -> dict:
+        # file_urls: the hosted bridge's links to reply files (tasks_mine); no files here, so nothing to add
         limit = default_limit(status, limit)
         statuses, agent = check_list_args(STATUS_FILTERS, status, agent, limit)
 

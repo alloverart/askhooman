@@ -18,6 +18,7 @@ from server.notify import answer_text, close_text, reopen_text
 
 from .conftest import ALLEN, DENIS, auth
 from .fake_drive import CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN, FakeDrive, app_action, app_task_reply, make_client
+from .test_hosted_task_files import task_item
 
 
 @pytest.fixture
@@ -602,13 +603,16 @@ def get_task(client, task_id) -> dict:
 def assert_task_mirrored(client, fake, task_id, rev=None, kept=()) -> dict:
     """The file holds exactly what REST returns (task + events), plus rev/schema/kind/writer (and `kept`
     top-level fields someone else added), minus the derived fields (reply / reply_pending, question /
-    question_open), which are never stored."""
+    question_open), which are never stored, and minus `reply_files`, a REST field the single-tenant mirror doesn't
+    write (SPEC 8.1, hosted only): always [] here, and a file that has one keeps it like any field the bridge doesn't
+    know."""
     derived = ("reply", "reply_pending", "question", "question_open")
     task = get_task(client, task_id)
     file = fake.file(f"task-{task_id}.json")
     doc = json.loads(file["content"])
     assert not set(derived) & set(doc) and set(derived) <= set(task)
     task = {k: v for k, v in task.items() if k not in derived}
+    assert task.pop("reply_files") == []
     assert {k: v for k, v in doc.items() if k not in ("rev", "schema", "kind", "writer", *kept)} == task
     assert (doc["schema"], doc["kind"], doc["writer"]) == (1, "task", "bridge")
     assert file["appProperties"] == {"task_id": str(task_id), "status": task["status"], "agent": task["agent"],
@@ -787,6 +791,22 @@ def test_app_task_reply_on_a_task_finished_meanwhile_is_skipped(dclient, fake, s
     assert after["status"] == "done" and [e["kind"] for e in after["events"]] == ["created", "done"]
     doc = assert_task_mirrored(dclient, fake, task["id"])   # rewritten from SQLite
     assert doc["status"] == "done"
+
+
+def test_the_mirror_keeps_reply_files_as_an_unknown_field(dclient, fake):
+    """Files in task replies are hosted only (SPEC 8.1): the mirror writes no reply_files, keeps one it finds in a
+    task file as a field it doesn't know, and REST shows [] whatever the file holds."""
+    task = create_task(dclient)
+    sync(dclient)
+    assert "reply_files" not in fake.task_doc(task["id"])
+    file = fake.file(f"task-{task['id']}.json")
+    fake.write(file["id"], {**json.loads(file["content"]), "reply_files": [task_item()]}, {})
+    sync(dclient)
+    dclient.patch(f"/api/tasks/{task['id']}", json={"ref": "TG 1"}, headers=auth(ALLEN))
+    sync(dclient)
+    doc = assert_task_mirrored(dclient, fake, task["id"], rev=2, kept=("reply_files",))
+    assert doc["ref"] == "TG 1" and doc["reply_files"] == [task_item()]
+    assert get_task(dclient, task["id"])["reply_files"] == []
 
 
 # ---------- stream_media (SPEC 7.4: a normal file streams in 1 MiB chunks) ----------
