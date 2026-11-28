@@ -1586,19 +1586,19 @@ Headers as 7.2 with `Content-Disposition: attachment; filename="task-<id>-file-<
 - *Built:* what a write returns carries the owner's full metadata of each item (a secret one with its ten keys), and no
   `url`; only the webhook has a secret file in the form `{id, reply_id, secret: true}`.
 - *Built:* `GET /media/v1/<token>` hands a token that is not a recording's to one function in
-  `server/hosted/files_api.py`, which tries the answer's opener and then the task's; the route in `voice_api.py` does
-  the same as before (only its comments changed).
+  `server/hosted/files_api.py`, which tries the answer's opener and then the task's; the route in `voice_api.py` hands a token it cannot open as a recording's to that one function, as it did before for
+  an answer's file.
 - *Built:* the 409 of a task's file over 31 MiB names its own command: «… (askhooman task files does this)», where an
   answer's says `askhooman files`.
 - *Built:* the 403s of the task's bearer route: the user's own ID token on `GET /api/tasks/{id}/files/{n}/content` is
   «this file is for the agent whose task it is: fetch it with its own token», and a caller that is not an agent is
   «only the agent whose task it is can fetch its replies' files».
-- *Built:* a secret file that was sent answers 410 «the file was deleted after it was sent» on both routes, and
-  `task_secret_file` answers «already sent — if you did not receive it, ask your user to send it again», whether its
-  item is still in `reply_files` (`deleted_reason: sent`, or a secret item with `downloaded_at`) or was pruned (the
-  snapshot says `secret` and the history holds its `file_downloaded`, or a `file_deleted` with reason `sent`, which is
-  what the sweep writes when it records a send), so the words do not change when the user's next reply prunes the
-  item; any other pruned or deleted file is 410 «the file was deleted». An ask's deleted item still answers «the file
+- *Built:* a secret file that was sent answers 410 «the file was deleted after it was sent» on the bearer route (the link route
+  never serves a secret file: 404), and `task_secret_file` answers «already sent — if you did not receive it, ask your
+  user to send it again», whether its item is still in `reply_files` (`deleted_reason: sent`, or a secret item with
+  `downloaded_at`) or was pruned (the snapshot says `secret` and the history holds its `file_downloaded`, or a
+  `file_deleted` with reason `sent`, which is what the sweep writes when it records a send), so the words do not
+  change when the user's next reply prunes the item; any other pruned or deleted file is 410 «the file was deleted». An ask's deleted item still answers «the file
   was deleted» on its routes, as before.
 - *Built:* the guard of the task's side also needs that the file's appProperties carry **no `ask_id`**: a `tfile-` with
   both marks is nobody's (not sent, not deleted at a finish, not swept, not purged). The ask's side is as it was (an
@@ -1802,8 +1802,8 @@ test's word list, `server/tests/test_mcp.py:472-474`). Hosted only, as section 7
 - **No MCP tool for normal files**, as in 7.8.
 - *Built:* `askhooman task files` waits out a 429 at most 6 times a file (`PART_WAITS`, counted per file, as for a file
   in parts); a secret file's 429 is waited out, but its 404 is final, since it has no link to renew; `--reply N` that
-  matches no file prints `no files of reply N` and exits 0 without creating `--out`; `--json` prints the result
-  objects of `askhooman files` (`id, path, bytes, status`), `[]` when there is nothing to save.
+  matches no file prints `no files of reply N` (with `--json`, `[]`) and exits 0 without creating `--out`; `--json`
+  prints the result objects of `askhooman files` (`id, path, bytes, status`), `[]` when there is nothing to save.
 - *Built:* `task show` prints, under each reply's history line, one line per file id of that event: `file <id>: <name>
   · <bytes> bytes · <state>`. The state is read from the item in `reply_files` with that id and that `reply_id`:
   `deleted (<reason>)`, `blocked by Google`, `downloaded` or `not downloaded yet`, each after `secret, ` for a secret
